@@ -438,6 +438,8 @@ def main() -> None:
         # outside a live runtime; swallow and continue so local execution still works.
         pass
 
+    # Ensure the hero title has sufficient breathing room while keeping the layout
+    # nearly full-width on large monitors.
     st.markdown(
         """
         <style>
@@ -449,7 +451,7 @@ def main() -> None:
             overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
-            padding: 1.25rem 1.5rem 1.5rem !important;
+            padding: 2.5rem 1.75rem 1.5rem !important;
             margin: 0 !important;
             width: 100% !important;
             max-width: 100% !important;
@@ -462,10 +464,10 @@ def main() -> None:
         }
         [data-testid="stAppViewContainer"] .main .block-container,
         .block-container {
-            padding: 0 1.5rem !important;
+            padding: 0 2rem !important;
             margin: 0 auto !important;
             width: 100% !important;
-            max-width: calc(100vw - 3rem) !important;
+            max-width: calc(100vw - 4rem) !important;
         }
         [data-testid="stVerticalBlock"],
         [data-testid="stHorizontalBlock"] {
