@@ -664,12 +664,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     prod_start_year = int(prod_horizon.get("start_year", timeline.start_year))
     prod_end_year = int(prod_horizon.get("end_year", timeline.end_year))
 
-    if "production_annual" in cfg and isinstance(cfg["production_annual"], pd.DataFrame) and not cfg["production_annual"].empty:
-        prod_annual = cfg["production_annual"].copy()
-    else:
+    def _default_production_table() -> pd.DataFrame:
         base = DEFAULTS["production"]
         feedstock = base["annual_feedstock_ton"]
-        prod_annual = pd.DataFrame(
+        return pd.DataFrame(
             [
                 {
                     "product": "ethanol",
@@ -713,6 +711,30 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 },
             ]
         )
+
+    if "production_annual" in cfg and isinstance(cfg["production_annual"], pd.DataFrame) and not cfg["production_annual"].empty:
+        prod_annual = cfg["production_annual"].copy()
+    else:
+        prod_annual = _default_production_table()
+
+    required_columns = {"product", "annual_volume"}
+    if not required_columns.issubset(prod_annual.columns):
+        prod_annual = _default_production_table()
+
+    for col, default_val in {
+        "availability": DEFAULTS["production"]["plant_availability"],
+        "loss_factor": DEFAULTS["production"]["loss_factor"],
+        "startup_ramp": "0.7;0.9;1.0",
+    }.items():
+        if col not in prod_annual.columns:
+            prod_annual[col] = default_val
+
+    prod_annual["product"] = prod_annual["product"].astype(str).str.strip()
+    prod_annual = prod_annual[prod_annual["product"].str.lower() != "nan"]
+    prod_annual = prod_annual[prod_annual["product"] != ""]
+
+    if prod_annual.empty:
+        prod_annual = _default_production_table()
 
     prod_annual["annual_volume"] = pd.to_numeric(prod_annual["annual_volume"], errors="coerce").fillna(0.0)
     annual_rows: List[Dict[str, object]] = []
