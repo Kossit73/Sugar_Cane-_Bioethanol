@@ -37,6 +37,7 @@ def _streamlit_runtime_exists() -> bool:
 MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
+        DEFAULTS,
         FEEDSTOCK_SCENARIOS,
         PRODUCTS,
         InputTables,
@@ -312,6 +313,98 @@ def main() -> None:
             st.subheader("Annual cash flows")
             cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
             st.bar_chart(cash_chart)
+
+        cfg_display = results["config"]
+        projection_df = pd.DataFrame([cfg_display.get("projection_horizon", {})])
+        production_horizon_df = pd.DataFrame([cfg_display.get("production_horizon", {})])
+        global_inputs_df = pd.DataFrame([cfg_display.get("global_inputs", {})])
+
+        capex_lines_df = cfg_display.get("capex_lines")
+        if not isinstance(capex_lines_df, pd.DataFrame) or capex_lines_df.empty:
+            capex_lines_df = pd.DataFrame(
+                [
+                    {
+                        "item_name": "Plant",
+                        "category": "plant",
+                        "amount": 35_000_000.0,
+                        "currency": "USD",
+                        "start_date": f"{cfg_display.get('projection_horizon', DEFAULTS['horizon'])['start_year']}-01",
+                        "end_date": f"{cfg_display.get('projection_horizon', DEFAULTS['horizon'])['start_year']}-12",
+                        "life_years": 15,
+                        "depr_method": "straight",
+                        "depr_rate_override": float("nan"),
+                        "vat_rate": 0.0,
+                        "vat_recovery_lag_months": 0,
+                        "capitalized": True,
+                        "is_farm_capex": False,
+                    }
+                ]
+            )
+
+        prices_cfg = cfg_display.get("prices", {})
+        pricing_df = pd.DataFrame.from_dict(prices_cfg, orient="index").reset_index().rename(columns={"index": "product"})
+
+        production_annual_df = results["production_annual"].pivot_table(
+            index="year",
+            columns="product",
+            values="volume",
+            aggfunc="sum",
+        ).reset_index().fillna(0.0)
+
+        opex_cfg = cfg_display.get("opex", {})
+        opex_rows = []
+        for key, value in opex_cfg.items():
+            if isinstance(value, dict):
+                for sub_key, sub_val in value.items():
+                    opex_rows.append({"category": key, "item": sub_key, "value": sub_val})
+            else:
+                opex_rows.append({"category": "global", "item": key, "value": value})
+        opex_df = pd.DataFrame(opex_rows)
+        if opex_df.empty:
+            opex_df = pd.DataFrame(columns=["category", "item", "value"])
+
+        working_capital_df = results["working_capital"].copy()
+        debt_df = results["debt_schedule"].copy()
+
+        tax_cfg = cfg_display.get("tax", {})
+        tax_rows = [
+            {"parameter": key, "value": (value if not isinstance(value, dict) else str(value))}
+            for key, value in tax_cfg.items()
+        ]
+        tax_df = pd.DataFrame(tax_rows)
+
+        inflation_df = cfg_display.get("inflation_index")
+        if not isinstance(inflation_df, pd.DataFrame):
+            inflation_df = DEFAULTS["inflation_index"].copy()
+
+        risk_df = cfg_display.get("risk_params")
+        if not isinstance(risk_df, pd.DataFrame):
+            risk_df = DEFAULTS["risk_params"].copy()
+
+        input_sections = {
+            "Projection Horizon": (projection_df, "projection_horizon"),
+            "Production Horizon": (production_horizon_df, "production_horizon"),
+            "Global Inputs": (global_inputs_df, "global_inputs"),
+            "CAPEX": (capex_lines_df, "capex"),
+            "Product Pricing": (pricing_df, "product_pricing"),
+            "Production Volumes": (production_annual_df, "production_volumes"),
+            "Operating Costs": (opex_df, "operating_costs"),
+            "Working Capital": (working_capital_df, "working_capital"),
+            "Debt": (debt_df, "debt"),
+            "Tax": (tax_df, "tax"),
+            "Inflation": (inflation_df, "inflation"),
+            "Risk": (risk_df, "risk"),
+        }
+
+        st.subheader("Input tables overview")
+        overview_tabs = st.tabs(list(input_sections.keys()))
+        for (label, (df_to_show, key_suffix)), tab in zip(input_sections.items(), overview_tabs):
+            with tab:
+                display_df = df_to_show if isinstance(df_to_show, pd.DataFrame) else pd.DataFrame(df_to_show)
+                if label == "CAPEX" and "date" in display_df.columns:
+                    display_df = display_df.copy()
+                    display_df["date"] = pd.to_datetime(display_df["date"])
+                _render_dataframe(display_df, label, key=f"landing_{key_suffix}")
 
     statement_map = {"P&L": "pnl", "Cash Flow": "cashflow", "Balance Sheet": "balancesheet"}
     with tabs[1]:
