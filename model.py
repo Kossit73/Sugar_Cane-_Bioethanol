@@ -884,7 +884,19 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     else:
         monthly_df = _monthly_from_annual(annual_df)
 
-    monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)].sort_values(["date", "product"]).reset_index(drop=True)
+    # In some edge cases (for example, when the Streamlit editor returns an empty
+    # column block), the copied monthly dataframe can lose the required
+    # ``product`` field even after the guards above. If that happens, rebuild the
+    # monthly schedule from the validated annual table so downstream joins never
+    # raise ``KeyError: 'product'``.
+    if "product" not in monthly_df.columns:
+        monthly_df = _monthly_from_annual(annual_df)
+
+    monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)]
+    if "product" in monthly_df.columns:
+        monthly_df = monthly_df.sort_values(["date", "product"]).reset_index(drop=True)
+    else:  # pragma: no cover - extremely defensive fallback
+        monthly_df = monthly_df.sort_values(["date"]).reset_index(drop=True)
 
     return monthly_df, annual_df
 ###############################################################################
