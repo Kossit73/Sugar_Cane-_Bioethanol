@@ -20,14 +20,23 @@ import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
 
-# Streamlit requires page config to be set before other st.* calls; do so at import time.
-try:  # pragma: no cover - harmless when running via `python streamlit_app.py`
-    st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
-except (StreamlitAPIException, RuntimeError):
-    # If not running inside `streamlit run`, the API raises; tolerate so the module
-    # remains importable for linting/py_compile or other tooling contexts.
-    pass
 
+def _streamlit_runtime_exists() -> bool:
+    """Return True when executed inside an active Streamlit runtime."""
+    try:  # Streamlit >= 1.35 exposes runtime.exists()
+        from streamlit.runtime import exists as runtime_exists  # type: ignore import
+
+        return bool(runtime_exists())
+    except Exception:  # pragma: no cover - fallback for older versions
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx  # type: ignore
+
+            return get_script_run_ctx() is not None
+        except Exception:
+            return False
+
+
+MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
         FEEDSTOCK_SCENARIOS,
@@ -41,12 +50,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         sensitivity_tornado,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
-    st.error(
-        "Required dependency missing when importing the finance engine: "
-        f"{exc}. Install the project requirements (numpy, pandas, etc.) and "
-        "restart the app."
-    )
-    st.stop()
+    MODEL_IMPORT_ERROR = exc
 
 
 def _load_tables_from_upload(uploaded_file: io.BytesIO | None) -> tuple[InputTables, Dict[str, object]]:
@@ -102,6 +106,20 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
 
 
 def main() -> None:
+    try:
+        if _streamlit_runtime_exists():
+            st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
+    except (StreamlitAPIException, RuntimeError):  # pragma: no cover - defensive guard
+        pass
+
+    if MODEL_IMPORT_ERROR is not None:
+        st.error(
+            "Required dependency missing when importing the finance engine: "
+            f"{MODEL_IMPORT_ERROR}. Install the project requirements (numpy, pandas, etc.) "
+            "and restart the app."
+        )
+        st.stop()
+
     st.title("Sugarcane Bioethanol Project Finance Model")
     st.markdown(
         "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
