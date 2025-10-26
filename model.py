@@ -491,6 +491,21 @@ class InputTables:
             self.tables[table_name] = pd.DataFrame(columns=list(schema.columns.keys()))
             return
 
+        # Align incoming column labels to the schema using normalized keys so that
+        # edits made via UI data editors (which may alter capitalisation or add
+        # whitespace) still map back to the canonical column names. This guards
+        # against downstream KeyError issues such as missing the required
+        # ``product`` column in production schedules.
+        rename_map: Dict[str, str] = {}
+        for col in list(df_copy.columns):
+            if not isinstance(col, str):
+                continue
+            normalised = normalize_key(col)
+            if normalised in schema.columns and col != normalised:
+                rename_map[col] = normalised
+        if rename_map:
+            df_copy = df_copy.rename(columns=rename_map)
+
         for col in schema.columns:
             if col not in df_copy.columns:
                 default_value = schema.defaults.get(col, np.nan)
