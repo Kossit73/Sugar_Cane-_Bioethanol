@@ -18,6 +18,15 @@ from typing import Dict
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
+
+# Streamlit requires page config to be set before other st.* calls; do so at import time.
+try:  # pragma: no cover - harmless when running via `python streamlit_app.py`
+    st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
+except (StreamlitAPIException, RuntimeError):
+    # If not running inside `streamlit run`, the API raises; tolerate so the module
+    # remains importable for linting/py_compile or other tooling contexts.
+    pass
 
 try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
@@ -93,7 +102,6 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
 
 
 def main() -> None:
-    st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
     st.title("Sugarcane Bioethanol Project Finance Model")
     st.markdown(
         "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
