@@ -451,30 +451,30 @@ def main() -> None:
             overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
-            padding: 3.5rem 2vw 2.25rem !important;
             margin: 0 !important;
+            padding: 3.5rem 0 2.5rem !important;
             width: 100% !important;
             max-width: 100% !important;
         }
         [data-testid="stAppViewContainer"] > .main {
-            padding: 0 !important;
-            margin: 0 !important;
+            margin: 0 auto !important;
             width: 100% !important;
             max-width: 100% !important;
         }
         [data-testid="stAppViewContainer"] .main .block-container,
         .block-container {
-            padding: 0 2vw 2.25rem !important;
-            margin: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            margin: 0 auto !important;
+            width: 100% !important;
+            max-width: none !important;
+            padding-left: clamp(20px, 3vw, 48px) !important;
+            padding-right: clamp(20px, 3vw, 48px) !important;
         }
         [data-testid="stVerticalBlock"],
         [data-testid="stHorizontalBlock"] {
-            padding-left: 0 !important;
-            padding-right: 0 !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
+            padding-left: 0 !important;
+            padding-right: 0 !important;
             width: 100% !important;
             max-width: 100% !important;
         }
