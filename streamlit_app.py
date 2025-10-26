@@ -127,25 +127,46 @@ def main() -> None:
         "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
         "electricity, and animal feed project finance model. Upload an Excel "
         "assumptions workbook or rely on defaults, tweak critical drivers in the "
-        "sidebar, and review the resulting statements, dashboards, sensitivities, "
+        "control tabs above, and review the resulting statements, dashboards, sensitivities, "
         "and scenarios."
     )
 
-    st.sidebar.header("Model Controls")
-    uploaded_file = st.sidebar.file_uploader("Upload assumptions workbook", type=["xlsx", "xlsm", "xls"], key="workbook")
+    st.subheader("Model Controls")
+
+    control_tabs = st.tabs(
+        [
+            "Workbook",
+            "Projection",
+            "Financial",
+            "Production",
+            "Pricing",
+            "Risk & Scenarios",
+        ]
+    )
+
+    uploaded_file: io.BytesIO | None = None
+    with control_tabs[0]:
+        uploaded_file = st.file_uploader(
+            "Upload assumptions workbook",
+            type=["xlsx", "xlsm", "xls"],
+            key="workbook",
+            help="Drop your Excel assumptions workbook here to override defaults.",
+        )
 
     tables, assumptions = _load_tables_from_upload(uploaded_file)
     cfg = build_config(assumptions, tables)
 
     horizon = cfg["projection_horizon"]
-    with st.sidebar.expander("Projection horizon", expanded=False):
+    with control_tabs[1]:
+        st.markdown("### Projection horizon")
         start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
         end_year = st.number_input("End year", value=int(horizon["end_year"]), min_value=int(start_year), step=1)
         start_month = st.number_input("Start month", min_value=1, max_value=12, value=int(horizon.get("start_month", 1)))
         horizon.update({"start_year": int(start_year), "end_year": int(end_year), "start_month": int(start_month)})
 
     global_inputs = cfg["global_inputs"]
-    with st.sidebar.expander("Financial assumptions", expanded=False):
+    with control_tabs[2]:
+        st.markdown("### Financial assumptions")
         discount_rate = st.number_input(
             "Discount rate (WACC)",
             min_value=0.0,
@@ -180,7 +201,8 @@ def main() -> None:
         st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
 
     production_cfg = cfg.setdefault("production", {})
-    with st.sidebar.expander("Production assumptions", expanded=False):
+    with control_tabs[3]:
+        st.markdown("### Production assumptions")
         feedstock = st.number_input(
             "Annual feedstock (t)",
             min_value=0.0,
@@ -209,9 +231,25 @@ def main() -> None:
                 "loss_factor": float(loss_factor),
             }
         )
+        scenario = st.selectbox(
+            "Feedstock sourcing scenario",
+            FEEDSTOCK_SCENARIOS,
+            index=FEEDSTOCK_SCENARIOS.index(production_cfg.get("feedstock_scenario", "HYBRID")),
+        )
+        production_cfg["feedstock_scenario"] = scenario
+        if scenario == "HYBRID":
+            farm_share = st.slider(
+                "Hybrid farm share",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(production_cfg.get("farm_share", 0.5)),
+                step=0.05,
+            )
+            production_cfg["farm_share"] = float(farm_share)
 
     pricing_cfg = cfg.setdefault("prices", {})
-    with st.sidebar.expander("Product pricing", expanded=False):
+    with control_tabs[4]:
+        st.markdown("### Product pricing")
         for product in PRODUCTS:
             params = pricing_cfg.setdefault(product, {})
             base_price = st.number_input(
@@ -230,31 +268,17 @@ def main() -> None:
                 format="%.4f",
             )
             params.update({"base_price": float(base_price), "price_escalation_pa": float(escalation)})
+    with control_tabs[5]:
+        st.markdown("### Risk and scenario options")
+        run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
+        run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
+        run_scenario_analysis = st.checkbox("Run scenario comparison", value=True)
 
-    scenario = st.sidebar.selectbox(
-        "Feedstock sourcing scenario",
-        FEEDSTOCK_SCENARIOS,
-        index=FEEDSTOCK_SCENARIOS.index(production_cfg.get("feedstock_scenario", "HYBRID")),
-    )
-    production_cfg["feedstock_scenario"] = scenario
-    if scenario == "HYBRID":
-        farm_share = st.sidebar.slider(
-            "Hybrid farm share",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(production_cfg.get("farm_share", 0.5)),
-            step=0.05,
-        )
-        production_cfg["farm_share"] = float(farm_share)
-
-    run_tornado = st.sidebar.checkbox("Compute sensitivity tornado", value=False)
-    run_monte_carlo = st.sidebar.checkbox("Run Monte Carlo", value=False)
-    monte_iterations = 1000
-    monte_seed = 42
-    if run_monte_carlo:
-        monte_iterations = st.sidebar.slider("Monte Carlo iterations", min_value=200, max_value=5000, value=1000, step=100)
-        monte_seed = st.sidebar.number_input("Monte Carlo random seed", value=42, step=1)
-    run_scenario_analysis = st.sidebar.checkbox("Run scenario comparison", value=True)
+        monte_iterations = 1000
+        monte_seed = 42
+        if run_monte_carlo:
+            monte_iterations = st.slider("Monte Carlo iterations", min_value=200, max_value=5000, value=1000, step=100)
+            monte_seed = st.number_input("Monte Carlo random seed", value=42, step=1)
 
     with st.spinner("Running base model..."):
         try:
@@ -332,7 +356,7 @@ def main() -> None:
                 tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
             _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
         else:
-            st.info("Enable 'Compute sensitivity tornado' in the sidebar to evaluate sensitivities.")
+            st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
 
         if run_monte_carlo:
             with st.spinner("Running Monte Carlo simulation..."):
@@ -340,7 +364,7 @@ def main() -> None:
             _render_dataframe(monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}), "Monte Carlo percentiles", key="monte_percentiles")
             _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
         else:
-            st.info("Enable 'Run Monte Carlo' in the sidebar to sample risk drivers.")
+            st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
 
     with tabs[4]:
         if run_scenario_analysis:
@@ -355,7 +379,7 @@ def main() -> None:
             scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
             _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
         else:
-            st.info("Enable 'Run scenario comparison' in the sidebar to compare FARM/BUY/HYBRID structures.")
+            st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
 
     st.success("Model run complete.")
 
