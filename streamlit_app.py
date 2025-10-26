@@ -341,20 +341,48 @@ LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
     ("Projection Horizon", "projection_horizon", "Define the calendar start and end of the modeling period."),
     ("Production Horizon", "production_horizon", "Limit operating volumes to the active production window."),
     ("Global Inputs", "global_inputs", "Corporate tax, discount rate, and ownership split."),
-    ("Working Capital Days", "working_capital_days", "DSO, DIO, and DPO assumptions."),
-    ("Initial Investment (CAPEX)", "capex_lines", "Detailed plant and farm investment lines with depreciation lives."),
-    ("Revenue Inputs", "revenue_params", "Product pricing, escalation, and indexation."),
-    ("Production Annual", "production_annual", "Annual production volumes and availability by product."),
-    ("Production Monthly", "production_monthly", "Monthly production schedule by product."),
-    ("Direct Costs Monthly", "direct_costs_monthly", "Feedstock and variable operating expenses."),
-    ("Staff Costs Monthly", "staff_costs_monthly", "Headcount and payroll assumptions."),
-    ("Other Opex Monthly", "other_opex_monthly", "Insurance, services, and overhead costs."),
-    ("Accounts Receivable & Other Assets", "ar_other_assets", "Receivables and prepaid balances."),
-    ("Inventory & Accounts Payable", "inventory_ap", "Inventory positions and supplier payables."),
-    ("Loan Schedule", "debt_tranches", "Debt facilities with rates, tenors, and amortization."),
-    ("Tax Schedule", "tax_schedule", "Tax rate, incentives, and loss carryforwards."),
+    (
+        "Working Capital Assumptions",
+        "working_capital_days",
+        "DSO, DIO, and DPO assumptions controlling receivables, inventory, and payables timing.",
+    ),
+    (
+        "Initial Investment (CAPEX)",
+        "capex_lines",
+        "Detailed plant and farm investment lines with depreciation lives and VAT timing.",
+    ),
+    ("Product Pricing Inputs", "revenue_params", "Product pricing, escalation, and indexation."),
+    (
+        "Production Volumes (Annual)",
+        "production_annual",
+        "Annual production volumes, availability, and ramp-up assumptions by product.",
+    ),
+    (
+        "Production Volumes (Monthly)",
+        "production_monthly",
+        "Monthly production schedule by product within the operating window.",
+    ),
+    ("Operating Costs - Direct", "direct_costs_monthly", "Feedstock and variable operating expenses."),
+    ("Operating Costs - Staff", "staff_costs_monthly", "Headcount and payroll assumptions."),
+    (
+        "Operating Costs - Other Opex",
+        "other_opex_monthly",
+        "Insurance, services, energy, and overhead costs.",
+    ),
+    (
+        "Working Capital Balances - Receivables",
+        "ar_other_assets",
+        "Accounts receivable, prepaid expenses, and other current assets.",
+    ),
+    (
+        "Working Capital Balances - Inventory & Payables",
+        "inventory_ap",
+        "Inventory positions and supplier payables by month.",
+    ),
+    ("Debt Schedule", "debt_tranches", "Debt facilities with rates, tenors, amortisation, and IDC."),
+    ("Tax Schedule", "tax_schedule", "Tax rate, incentives, timing adjustments, and loss carryforwards."),
     ("Inflation Schedule", "inflation_index", "Inflation and FX indexation curves."),
-    ("Risk Schedule", "risk_params", "Drivers for sensitivities and Monte Carlo simulations."),
+    ("Risk Schedule", "risk_params", "Drivers for sensitivities, Monte Carlo, and scenario analysis."),
 ]
 
 
@@ -643,7 +671,7 @@ def main() -> None:
 
     landing_tab, summary_tab, financial_tab, production_tab, sensitivity_tab, scenario_tab = st.tabs(
         [
-            "Input Landing Tables",
+            "Input & Assumptions",
             "Summary",
             "Financial Statements",
             "Production & Pricing",
@@ -653,7 +681,7 @@ def main() -> None:
     )
 
     with landing_tab:
-        st.subheader("Input landing tables")
+        st.subheader("Input & assumptions tables")
         st.markdown(
             "Review, add, or remove records from each canonical input table. Updates apply across the model "
             "on the next run."
