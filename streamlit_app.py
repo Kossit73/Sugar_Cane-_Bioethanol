@@ -451,7 +451,7 @@ def main() -> None:
             overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
-            padding: 2.5rem 1.75rem 1.5rem !important;
+            padding: 3.25rem 3.5vw 2.25rem !important;
             margin: 0 !important;
             width: 100% !important;
             max-width: 100% !important;
@@ -464,10 +464,10 @@ def main() -> None:
         }
         [data-testid="stAppViewContainer"] .main .block-container,
         .block-container {
-            padding: 0 2rem !important;
+            padding: 0 3.5vw 2rem !important;
             margin: 0 auto !important;
             width: 100% !important;
-            max-width: calc(100vw - 4rem) !important;
+            max-width: calc(100vw - 7vw) !important;
         }
         [data-testid="stVerticalBlock"],
         [data-testid="stHorizontalBlock"] {
@@ -477,6 +477,14 @@ def main() -> None:
             margin-right: 0 !important;
             width: 100% !important;
             max-width: 100% !important;
+        }
+        h1, h1 span, .stMarkdown h1 {
+            font-size: clamp(2.2rem, 3vw, 2.8rem) !important;
+            line-height: 1.2 !important;
+            margin-top: 0 !important;
+            margin-bottom: 1.2rem !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
         }
         </style>
         """,
