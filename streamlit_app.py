@@ -125,12 +125,30 @@ def main() -> None:
     cfg = build_config(assumptions, tables)
 
     horizon = cfg["projection_horizon"]
+    production_horizon = cfg.get("production_horizon", {"start_year": horizon["start_year"], "end_year": horizon["end_year"]})
     with control_tabs[0]:
         st.markdown("### Projection horizon")
         start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
         end_year = st.number_input("End year", value=int(horizon["end_year"]), min_value=int(start_year), step=1)
         start_month = st.number_input("Start month", min_value=1, max_value=12, value=int(horizon.get("start_month", 1)))
         horizon.update({"start_year": int(start_year), "end_year": int(end_year), "start_month": int(start_month)})
+        st.markdown("### Production horizon")
+        prod_start_year = st.number_input(
+            "Production start year",
+            value=int(production_horizon.get("start_year", start_year)),
+            min_value=int(start_year),
+            step=1,
+        )
+        prod_end_year = st.number_input(
+            "Production end year",
+            value=int(production_horizon.get("end_year", end_year)),
+            min_value=int(prod_start_year),
+            max_value=int(end_year),
+            step=1,
+        )
+        production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
+        cfg["production_horizon"] = production_horizon
+        st.caption("Production volumes are set to zero outside the defined production horizon.")
 
     global_inputs = cfg["global_inputs"]
     with control_tabs[1]:

@@ -49,6 +49,7 @@ MONTHS_IN_YEAR = 12
 
 DEFAULTS = {
     "horizon": {"start_year": 2025, "end_year": 2035, "start_month": 1, "frequency": "monthly"},
+    "production_horizon": {"start_year": 2025, "end_year": 2035},
     "global": {
         "corp_tax_rate": 0.28,
         "investor_share": 0.6,
@@ -305,6 +306,14 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             lambda row: (_ for _ in ()).throw(ValueError("end_year must be >= start_year")) if int(row["end_year"]) < int(row["start_year"]) else None,
         ],
     ),
+    "production_horizon": TableSchema(
+        columns={"start_year": "int", "end_year": "int"},
+        defaults=dict(DEFAULTS["production_horizon"]),
+        validators=[
+            lambda row: (_ for _ in ()).throw(ValueError("production end_year must be >= start_year"))
+            if int(row["end_year"]) < int(row["start_year"]) else None,
+        ],
+    ),
     "global_inputs": TableSchema(
         columns={
             "corp_tax_rate": "float",
@@ -511,6 +520,7 @@ class InputTables:
 def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict[str, object]:
     cfg = {
         "projection_horizon": dict(DEFAULTS["horizon"]),
+        "production_horizon": dict(DEFAULTS["production_horizon"]),
         "global_inputs": dict(DEFAULTS["global"]),
         "prices": {k: dict(v) for k, v in DEFAULTS["prices"].items()},
         "production": dict(DEFAULTS["production"]),
@@ -527,6 +537,10 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             cfg["projection_horizon"][key] = int(float(value))
         elif key == "frequency":
             cfg["projection_horizon"]["frequency"] = str(value).lower()
+        elif key in {"production_start_year", "operations_start_year"}:
+            cfg["production_horizon"]["start_year"] = int(float(value))
+        elif key in {"production_end_year", "operations_end_year"}:
+            cfg["production_horizon"]["end_year"] = int(float(value))
         elif key in cfg["global_inputs"]:
             if isinstance(cfg["global_inputs"][key], str):
                 cfg["global_inputs"][key] = _coerce_str(value, cfg["global_inputs"][key])
@@ -566,6 +580,19 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             "start_month": int(horizon_row.get("start_month", cfg["projection_horizon"]["start_month"])),
             "frequency": horizon_row.get("frequency", cfg["projection_horizon"]["frequency"]),
         })
+
+    tables.ensure_table("production_horizon")
+    if not tables.tables["production_horizon"].empty:
+        prod_row = tables.tables["production_horizon"].iloc[0]
+        cfg["production_horizon"].update({
+            "start_year": int(prod_row.get("start_year", cfg["production_horizon"]["start_year"])),
+            "end_year": int(prod_row.get("end_year", cfg["production_horizon"]["end_year"])),
+        })
+
+    if cfg["production_horizon"]["start_year"] < cfg["projection_horizon"]["start_year"]:
+        cfg["production_horizon"]["start_year"] = cfg["projection_horizon"]["start_year"]
+    if cfg["production_horizon"]["end_year"] > cfg["projection_horizon"]["end_year"]:
+        cfg["production_horizon"]["end_year"] = cfg["projection_horizon"]["end_year"]
 
     if not tables.ensure_table("global_inputs").empty:
         global_row = tables.tables["global_inputs"].iloc[0]
@@ -633,6 +660,9 @@ def parse_ramp(ramp_value: object, years: int) -> List[float]:
 def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tuple[pd.DataFrame, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
     annual_years = timeline.annual_index()
+    prod_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
+    prod_start_year = int(prod_horizon.get("start_year", timeline.start_year))
+    prod_end_year = int(prod_horizon.get("end_year", timeline.end_year))
 
     if "production_annual" in cfg and isinstance(cfg["production_annual"], pd.DataFrame) and not cfg["production_annual"].empty:
         prod_annual = cfg["production_annual"].copy()
@@ -699,10 +729,15 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 }
             )
     annual_df = pd.DataFrame(annual_rows)
+    if not annual_df.empty:
+        annual_df.loc[(annual_df["year"] < prod_start_year) | (annual_df["year"] > prod_end_year), "volume"] = 0.0
 
     if "production_monthly" in cfg and isinstance(cfg["production_monthly"], pd.DataFrame) and not cfg["production_monthly"].empty:
         monthly_df = cfg["production_monthly"].copy()
         monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+        if not monthly_df.empty:
+            mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
+            monthly_df.loc[~mask, "volume"] = 0.0
     else:
         monthly_rows: List[Dict[str, object]] = []
         seasonality = np.ones(MONTHS_IN_YEAR) / MONTHS_IN_YEAR
@@ -711,11 +746,15 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 date = pd.Timestamp(year=row["year"], month=month, day=1)
                 if date not in monthly_index:
                     continue
+                if date.year < prod_start_year or date.year > prod_end_year:
+                    volume = 0.0
+                else:
+                    volume = row["volume"] * seasonality[month - 1]
                 monthly_rows.append(
                     {
                         "date": date,
                         "product": row["product"],
-                        "volume": row["volume"] * seasonality[month - 1],
+                        "volume": volume,
                         "availability_override": np.nan,
                         "maintenance_downtime": 0.0,
                         "loss_override": np.nan,
@@ -1214,6 +1253,7 @@ def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, obj
 
 def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFrame], production_monthly: pd.DataFrame, revenue_df: pd.DataFrame, valuation: Dict[str, object], out_dir: Optional[Path] = None) -> Dict[str, object]:
     horizon = cfg["projection_horizon"]
+    production_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
     global_inputs = cfg["global_inputs"]
     metrics = valuation["metrics"]
     monthly_pnl = statements["pnl"]
@@ -1222,10 +1262,23 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
     dashboard: Dict[str, object] = {}
     dashboard["assumptions_snapshot"] = pd.DataFrame(
         {
-            "Metric": ["Start", "End", "Tax Rate", "Investor Share", "Owner Share", "Terminal Growth", "Discount Rate", "Inflation"],
+            "Metric": [
+                "Projection Start",
+                "Projection End",
+                "Production Start",
+                "Production End",
+                "Tax Rate",
+                "Investor Share",
+                "Owner Share",
+                "Terminal Growth",
+                "Discount Rate",
+                "Inflation",
+            ],
             "Value": [
                 f"{horizon['start_year']}-{horizon['start_month']:02d}",
                 horizon["end_year"],
+                production_horizon.get("start_year", horizon["start_year"]),
+                production_horizon.get("end_year", horizon["end_year"]),
                 global_inputs["corp_tax_rate"],
                 global_inputs["investor_share"],
                 global_inputs["owner_share"],
