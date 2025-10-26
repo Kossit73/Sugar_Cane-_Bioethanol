@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import math
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict
@@ -384,5 +385,26 @@ def main() -> None:
     st.success("Model run complete.")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # pragma: no cover - manual invocation helper
+    if _streamlit_runtime_exists():
+        main()
+    else:
+        try:
+            from streamlit.web import bootstrap  # type: ignore[attr-defined]
+
+            bootstrap.run(__file__, "", [])
+        except ModuleNotFoundError as exc:
+            print(
+                "Streamlit is not installed in this environment. Install it with "
+                "'pip install streamlit' and re-run the app.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+        except Exception as exc:  # pragma: no cover - defensive feedback
+            print(
+                "Unable to start the Streamlit runtime automatically. "
+                "If the Streamlit CLI is unavailable, try installing Streamlit or "
+                "launching via 'python -m streamlit run streamlit_app.py'.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
