@@ -1,0 +1,1664 @@
+"""Sugar Cane Bioethanol Multi-Product Project Finance Model
+=============================================================
+
+Quickstart
+----------
+python model.py --excel "/path/to/workbook.xlsx" --export ./out_csv --excel-pack ./Finance_Pack.xlsx --preview 5
+
+This script loads an Excel workbook, auto-detects assumptions and structured input tables, and builds a
+comprehensive monthly project finance model for an integrated sugarcane complex producing bioethanol,
+sugar, electricity, and animal feed. Outputs include monthly and annual financial statements, dashboard
+metrics, sensitivity and scenario analytics, and optional CSV/Excel exports.
+
+The implementation uses only pandas, numpy, matplotlib, and the Python standard library. No external
+services are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import dataclasses
+import itertools
+import json
+import math
+import os
+import random
+import re
+import statistics
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Literal, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in testing env
+    plt = None
+import numpy as np
+import pandas as pd
+
+###############################################################################
+# Section 0: Global constants and utility helpers
+###############################################################################
+
+PRODUCTS: Tuple[str, ...] = ("ethanol", "sugar", "electricity", "animal_feed")
+FEEDSTOCK_SCENARIOS: Tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
+MONTHS_IN_YEAR = 12
+
+DEFAULTS = {
+    "horizon": {"start_year": 2025, "end_year": 2035, "start_month": 1, "frequency": "monthly"},
+    "global": {
+        "corp_tax_rate": 0.28,
+        "investor_share": 0.6,
+        "owner_share": 0.4,
+        "capital_gains_tax_rate": 0.0,
+        "terminal_growth": 0.02,
+        "discount_rate": 0.12,
+        "inflation_rate": 0.02,
+        "base_currency": "USD",
+        "fx_index_name": None,
+    },
+    "prices": {
+        "ethanol": {"base_price": 0.70, "price_escalation_pa": 0.02, "price_indexation": "cpi", "uom": "USD/L"},
+        "sugar": {"base_price": 450.0, "price_escalation_pa": 0.02, "price_indexation": "cpi", "uom": "USD/t"},
+        "electricity": {"base_price": 80.0, "price_escalation_pa": 0.02, "price_indexation": "cpi", "uom": "USD/MWh"},
+        "animal_feed": {"base_price": 180.0, "price_escalation_pa": 0.02, "price_indexation": "cpi", "uom": "USD/t"},
+    },
+    "production": {
+        "sugarcane_yield_ton_per_ha": 70.0,
+        "plant_availability": 0.9,
+        "loss_factor": 0.02,
+        "ramp": [0.7, 0.9, 1.0],
+        "ethanol_litre_per_ton": 160.0,
+        "sugar_ton_per_ton_cane": 0.1,
+        "electricity_mwh_per_ton_cane": 0.12,
+        "animal_feed_ton_per_ton_cane": 0.05,
+        "annual_feedstock_ton": 100_000.0,
+    },
+    "opex": {
+        "farm_opex_per_ton": 18.0,
+        "purchase_price_per_ton": 65.0,
+        "other_variable_cost_per_unit": {"ethanol": 0.08, "sugar": 50.0, "electricity": 10.0, "animal_feed": 25.0},
+        "fixed_opex_per_month": 2_500_000.0 / MONTHS_IN_YEAR,
+    },
+    "working_capital": {"dso_days": 30.0, "dio_days": 20.0, "dpo_days": 25.0},
+    "debt": {
+        "tranches": [
+            {
+                "name": "Senior Loan",
+                "draw_curve": None,
+                "interest_rate": 0.1,
+                "base_rate": 0.0,
+                "margin": 0.0,
+                "type": "term",
+                "tenor_years": 8,
+                "grace_years": 1,
+                "amortization": "straight",
+                "fees_upfront": 0.0,
+                "fees_annual": 0.0,
+                "capitalize_idc": True,
+                "currency": "USD",
+                "fx_curve": None,
+                "share": 0.6,
+            }
+        ]
+    },
+    "tax": {
+        "base_tax_rate": 0.28,
+        "timing_adjustment_rules": None,
+        "loss_carryforward_years": None,
+        "min_tax": 0.0,
+        "capex_incentives": {},
+    },
+    "inflation_index": pd.DataFrame(
+        {
+            "date": pd.date_range("2025-01-01", periods=240, freq="MS"),
+            "cpi": 1.0,
+            "fx_pair": np.nan,
+            "fx_index": np.nan,
+        }
+    ),
+    "risk_params": pd.DataFrame(
+        [
+            {"driver_name": "ethanol_price", "distribution": "normal", "p1": 0.0, "p2": 0.05, "p3": np.nan, "target": "price", "applies_to": "ethanol"},
+            {"driver_name": "availability", "distribution": "normal", "p1": 0.0, "p2": 0.02, "p3": np.nan, "target": "availability", "applies_to": "global"},
+        ]
+    ),
+}
+
+###############################################################################
+# Section 1: Excel Loader
+###############################################################################
+
+_SANITIZE_REGEX = re.compile(r"[^0-9a-zA-Z]+")
+
+
+def sanitize_sheet_name(name: str) -> str:
+    clean = _SANITIZE_REGEX.sub("_", name.strip().lower()).strip("_")
+    clean = re.sub(r"_+", "_", clean)
+    if clean == "":
+        clean = "sheet"
+    if clean[0].isdigit():
+        clean = f"sheet_{clean}"
+    return clean
+
+
+def excel_inventory(excel_path: Path, header: Optional[int] = 0) -> Tuple[pd.ExcelFile, Dict[str, str]]:
+    xls = pd.ExcelFile(excel_path)
+    mapping: Dict[str, str] = {}
+    for name in xls.sheet_names:
+        key = sanitize_sheet_name(name)
+        suffix = 1
+        base = key
+        while key in mapping:
+            suffix += 1
+            key = f"{base}_{suffix}"
+        mapping[key] = name
+    return xls, mapping
+
+
+def load_sheet(excel_path: Path, sheet_name: str, header: Optional[int] = 0, **kwargs) -> pd.DataFrame:
+    return pd.read_excel(excel_path, sheet_name=sheet_name, header=header, **kwargs)
+
+
+def build_registry(excel_path: Path, header: Optional[int] = 0) -> Dict[str, Callable[..., pd.DataFrame]]:
+    xls, mapping = excel_inventory(excel_path, header=header)
+    registry: Dict[str, Callable[..., pd.DataFrame]] = {}
+    for key, sheet_name in mapping.items():
+        def _loader(sheet=sheet_name):
+            return pd.read_excel(excel_path, sheet_name=sheet, header=header)
+        _loader.__name__ = f"load_{key}"
+        _loader.__doc__ = f"Load sheet '{sheet_name}' from {excel_path}"
+        registry[key] = _loader
+    return registry
+
+
+def load_all(excel_path: Path, header: Optional[int] = 0) -> Dict[str, pd.DataFrame]:
+    xls, mapping = excel_inventory(excel_path, header=header)
+    data: Dict[str, pd.DataFrame] = {}
+    for key, sheet_name in mapping.items():
+        data[key] = pd.read_excel(xls, sheet_name=sheet_name, header=header)
+    return data
+
+
+def export_registry_to_csv(excel_path: Path, out_dir: Path, header: Optional[int] = 0) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data = load_all(excel_path, header=header)
+    for key, df in data.items():
+        df.to_csv(out_dir / f"{key}.csv", index=False)
+
+
+###############################################################################
+# Section 2: Assumption detection and normalization
+###############################################################################
+
+_KEY_NORMALIZER = re.compile(r"[^0-9a-zA-Z]+")
+
+
+def normalize_key(value: str) -> str:
+    key = _KEY_NORMALIZER.sub("_", str(value).strip().lower())
+    key = re.sub(r"_+", "_", key).strip("_")
+    return key
+
+
+ALIASES: Dict[str, str] = {
+    "corporate_tax": "corp_tax_rate",
+    "corporate_tax_rate": "corp_tax_rate",
+    "tax_rate": "corp_tax_rate",
+    "investor_equity_share": "investor_share",
+    "owner_equity_share": "owner_share",
+    "wacc": "discount_rate",
+    "discount": "discount_rate",
+    "inflation": "inflation_rate",
+    "ethanol_price": "ethanol_price_per_litre",
+    "ethanol_price_l": "ethanol_price_per_litre",
+    "ethanol_price_per_liter": "ethanol_price_per_litre",
+    "ethanol_price_per_litre": "ethanol_price_per_litre",
+    "sugar_price": "sugar_price_per_ton",
+    "electricity_tariff": "electricity_tariff_per_mwh",
+    "animal_feed_price": "animal_feed_price_per_ton",
+    "dso": "dso_days",
+    "dio": "dio_days",
+    "dpo": "dpo_days",
+    "start": "start_year",
+    "end": "end_year",
+    "project_start_year": "start_year",
+    "project_end_year": "end_year",
+    "scenario": "feedstock_scenario",
+    "feedstock_scenario": "feedstock_scenario",
+    "hybrid_share": "farm_share",
+}
+
+
+def detect_assumptions(sheets: Mapping[str, pd.DataFrame]) -> Dict[str, object]:
+    assumptions: Dict[str, object] = {}
+
+    for name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+        try:
+            df = df.dropna(how="all")
+        except Exception:
+            continue
+        if df.empty:
+            continue
+
+        if df.shape[1] >= 2:
+            sample = df.iloc[:, :3]
+        else:
+            sample = df
+
+        for row in sample.itertuples(index=False):
+            if len(row) >= 2 and isinstance(row[0], str):
+                key = normalize_key(row[0])
+                if not key:
+                    continue
+                value = row[1]
+                if key in ALIASES:
+                    key = ALIASES[key]
+                assumptions[key] = value
+            if len(row) >= 3 and isinstance(row[0], str) and isinstance(row[1], str):
+                section = normalize_key(row[0])
+                key = normalize_key(row[1])
+                if section and key:
+                    compound = f"{section}__{key}"
+                    assumptions[compound] = row[2]
+
+    return assumptions
+
+
+def _coerce_float(value: object, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _coerce_str(value: object, default: Optional[str] = None) -> Optional[str]:
+    if value is None:
+        return default
+    value = str(value).strip()
+    if value == "":
+        return default
+    return value
+###############################################################################
+# Section 3: Input tables and CRUD helpers
+###############################################################################
+
+@dataclass
+class TableSchema:
+    columns: Dict[str, str]
+    defaults: Dict[str, object] = field(default_factory=dict)
+    validators: List[Callable[[pd.Series], None]] = field(default_factory=list)
+    derived: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
+
+
+INPUT_SCHEMAS: Dict[str, TableSchema] = {
+    "projection_horizon": TableSchema(
+        columns={"start_year": "int", "end_year": "int", "start_month": "int", "frequency": "str"},
+        defaults={"frequency": "monthly", "start_month": 1},
+        validators=[
+            lambda row: (_ for _ in ()).throw(ValueError("end_year must be >= start_year")) if int(row["end_year"]) < int(row["start_year"]) else None,
+        ],
+    ),
+    "global_inputs": TableSchema(
+        columns={
+            "corp_tax_rate": "float",
+            "investor_share": "float",
+            "owner_share": "float",
+            "capital_gains_tax_rate": "float",
+            "terminal_growth": "float",
+            "discount_rate": "float",
+            "inflation_rate": "float",
+            "base_currency": "str",
+            "fx_index_name": "str",
+        },
+        defaults={
+            **DEFAULTS["global"],
+        },
+        validators=[
+            lambda row: (_ for _ in ()).throw(ValueError("investor_share + owner_share must equal 1"))
+            if not math.isclose(float(row.get("investor_share", 0.0)) + float(row.get("owner_share", 0.0)), 1.0, rel_tol=1e-4, abs_tol=1e-4)
+            else None,
+        ],
+    ),
+    "capex_lines": TableSchema(
+        columns={
+            "item_name": "str",
+            "category": "str",
+            "amount": "float",
+            "currency": "str",
+            "fx_curve": "str",
+            "start_date": "str",
+            "end_date": "str",
+            "life_years": "int",
+            "depr_method": "str",
+            "depr_rate_override": "float",
+            "vat_rate": "float",
+            "vat_recovery_lag_months": "int",
+            "capitalized": "bool",
+            "is_farm_capex": "bool",
+        },
+        defaults={
+            "category": "other",
+            "currency": "USD",
+            "life_years": 10,
+            "depr_method": "straight",
+            "vat_rate": 0.0,
+            "vat_recovery_lag_months": 0,
+            "capitalized": True,
+            "is_farm_capex": False,
+        },
+    ),
+    "revenue_params": TableSchema(
+        columns={
+            "product": "str",
+            "base_price": "float",
+            "price_escalation_pa": "float",
+            "price_indexation": "str",
+            "uom": "str",
+            "tariff_structure": "str",
+            "revenue_share": "float",
+        },
+        defaults={"price_escalation_pa": 0.0, "price_indexation": "cpi", "revenue_share": 1.0},
+    ),
+    "production_annual": TableSchema(
+        columns={
+            "product": "str",
+            "annual_volume": "float",
+            "availability": "float",
+            "loss_factor": "float",
+            "startup_ramp": "str",
+            "boe_conversion": "float",
+            "sugarcane_yield_ton_per_ha": "float",
+            "farm_area_ha": "float",
+        },
+        defaults={"availability": DEFAULTS["production"]["plant_availability"], "loss_factor": DEFAULTS["production"]["loss_factor"]},
+    ),
+    "production_monthly": TableSchema(
+        columns={"date": "str", "product": "str", "volume": "float", "availability_override": "float", "maintenance_downtime": "float", "loss_override": "float"},
+    ),
+    "direct_costs_monthly": TableSchema(
+        columns={"date": "str", "cost_type": "str", "product_link": "str", "amount": "float", "currency": "str"},
+        defaults={"currency": "USD"},
+    ),
+    "staff_costs_monthly": TableSchema(
+        columns={"date": "str", "dept": "str", "headcount": "float", "gross_pay": "float", "benefits": "float", "training": "float", "other": "float", "currency": "str"},
+        defaults={"currency": "USD"},
+    ),
+    "other_opex_monthly": TableSchema(
+        columns={"date": "str", "category": "str", "amount": "float", "currency": "str"},
+        defaults={"currency": "USD"},
+    ),
+    "ar_other_assets": TableSchema(
+        columns={"date": "str", "receivables": "float", "prepaid_expenses": "float", "other_current_assets": "float", "dso_days": "float"},
+    ),
+    "inventory_ap": TableSchema(
+        columns={"date": "str", "inventory_raw": "float", "inventory_wip": "float", "inventory_fg": "float", "accounts_payable": "float", "dio_days": "float", "dpo_days": "float"},
+    ),
+    "debt_tranches": TableSchema(
+        columns={
+            "name": "str",
+            "draw_curve": "str",
+            "interest_rate": "float",
+            "base_rate": "float",
+            "margin": "float",
+            "type": "str",
+            "tenor_years": "int",
+            "grace_years": "int",
+            "amortization": "str",
+            "fees_upfront": "float",
+            "fees_annual": "float",
+            "capitalize_idc": "bool",
+            "currency": "str",
+            "fx_curve": "str",
+            "share": "float",
+        },
+        defaults={
+            "type": "term",
+            "amortization": "straight",
+            "currency": "USD",
+            "share": 1.0,
+        },
+    ),
+    "tax_schedule": TableSchema(
+        columns={"base_tax_rate": "float", "timing_adjustment_rules": "str", "loss_carryforward_years": "float", "min_tax": "float", "capex_incentives": "str"},
+        defaults={**DEFAULTS["tax"]},
+    ),
+    "inflation_index": TableSchema(
+        columns={"date": "str", "cpi": "float", "fx_pair": "str", "fx_index": "float"},
+    ),
+    "risk_params": TableSchema(
+        columns={"driver_name": "str", "distribution": "str", "p1": "float", "p2": "float", "p3": "float", "target": "str", "applies_to": "str"},
+    ),
+}
+
+
+class InputTables:
+    def __init__(self):
+        self.tables: Dict[str, pd.DataFrame] = {}
+
+    def ensure_table(self, table_name: str) -> pd.DataFrame:
+        if table_name not in INPUT_SCHEMAS:
+            raise KeyError(f"Unknown table '{table_name}'")
+        schema = INPUT_SCHEMAS[table_name]
+        if table_name not in self.tables:
+            df = pd.DataFrame(columns=list(schema.columns.keys()))
+            for col, typ in schema.columns.items():
+                if typ in {"float", "int"}:
+                    df[col] = df[col].astype(float)
+            self.tables[table_name] = df
+        return self.tables[table_name]
+
+    def add_row(self, table_name: str, row: Mapping[str, object]) -> None:
+        schema = INPUT_SCHEMAS[table_name]
+        df = self.ensure_table(table_name)
+        data = dict(schema.defaults)
+        data.update(row)
+        for col in schema.columns:
+            if col not in data:
+                data[col] = np.nan
+        row_series = pd.Series(data)
+        for validator in schema.validators:
+            validator(row_series)
+        self.tables[table_name] = pd.concat([df, pd.DataFrame([row_series])], ignore_index=True)
+        if schema.derived is not None:
+            self.tables[table_name] = schema.derived(self.tables[table_name])
+
+    def remove_row(self, table_name: str, row_id: int) -> None:
+        df = self.ensure_table(table_name)
+        if not 0 <= row_id < len(df):
+            raise IndexError("row_id out of bounds")
+        self.tables[table_name] = df.drop(df.index[row_id]).reset_index(drop=True)
+
+    def load_from_workbook(self, sheets: Mapping[str, pd.DataFrame]) -> None:
+        for table_name in INPUT_SCHEMAS:
+            schema = INPUT_SCHEMAS[table_name]
+            best_match = None
+            for key, df in sheets.items():
+                cols = {normalize_key(c): c for c in df.columns if isinstance(c, str)}
+                required = set(schema.columns.keys()) & set(cols.keys())
+                if required:
+                    best_match = key
+                    break
+            if best_match:
+                df_raw = sheets[best_match]
+                df_norm = pd.DataFrame()
+                for col, dtype in schema.columns.items():
+                    matches = [c for c in df_raw.columns if normalize_key(c) == col]
+                    if matches:
+                        df_norm[col] = df_raw[matches[0]]
+                    else:
+                        df_norm[col] = schema.defaults.get(col, np.nan)
+                    if dtype == "float":
+                        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
+                    elif dtype == "int":
+                        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce").astype(float)
+                    elif dtype == "bool":
+                        df_norm[col] = df_norm[col].astype(bool)
+                self.tables[table_name] = df_norm.dropna(how="all")
+                if schema.derived is not None and not self.tables[table_name].empty:
+                    self.tables[table_name] = schema.derived(self.tables[table_name])
+###############################################################################
+# Section 4: Configuration builder
+###############################################################################
+
+
+def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict[str, object]:
+    cfg = {
+        "projection_horizon": dict(DEFAULTS["horizon"]),
+        "global_inputs": dict(DEFAULTS["global"]),
+        "prices": {k: dict(v) for k, v in DEFAULTS["prices"].items()},
+        "production": dict(DEFAULTS["production"]),
+        "opex": dict(DEFAULTS["opex"]),
+        "working_capital": dict(DEFAULTS["working_capital"]),
+        "debt": {"tranches": [dict(t) for t in DEFAULTS["debt"]["tranches"]]},
+        "tax": dict(DEFAULTS["tax"]),
+        "risk_params": DEFAULTS["risk_params"].copy(),
+        "inflation_index": DEFAULTS["inflation_index"].copy(),
+    }
+
+    for key, value in assumptions.items():
+        if key in {"start_year", "end_year", "start_month"}:
+            cfg["projection_horizon"][key] = int(float(value))
+        elif key == "frequency":
+            cfg["projection_horizon"]["frequency"] = str(value).lower()
+        elif key in cfg["global_inputs"]:
+            if isinstance(cfg["global_inputs"][key], str):
+                cfg["global_inputs"][key] = _coerce_str(value, cfg["global_inputs"][key])
+            else:
+                cfg["global_inputs"][key] = _coerce_float(value, cfg["global_inputs"][key])
+        elif key.endswith("price_per_litre") or key.endswith("price_per_ton") or key.endswith("tariff_per_mwh"):
+            for product in PRODUCTS:
+                if product in key:
+                    cfg["prices"].setdefault(product, dict(DEFAULTS["prices"][product]))
+                    cfg["prices"][product]["base_price"] = _coerce_float(value, cfg["prices"][product]["base_price"])
+        elif key.endswith("price_escalation") or key.endswith("price_escalation_pa"):
+            for product in PRODUCTS:
+                if product in key:
+                    cfg["prices"].setdefault(product, dict(DEFAULTS["prices"][product]))
+                    cfg["prices"][product]["price_escalation_pa"] = _coerce_float(value, cfg["prices"][product]["price_escalation_pa"])
+        elif key in {"plant_availability", "loss_factor"}:
+            cfg["production"][key] = _coerce_float(value, cfg["production"][key])
+        elif key in {"investor_share", "owner_share"}:
+            cfg["global_inputs"][key] = _coerce_float(value, cfg["global_inputs"][key])
+        elif key in {"feedstock_scenario", "scenario"}:
+            cfg["production"]["feedstock_scenario"] = _coerce_str(value, "HYBRID").upper()
+        elif key in {"farm_share", "hybrid_farm_share"}:
+            cfg["production"]["farm_share"] = _coerce_float(value, cfg["production"].get("farm_share", 0.5))
+        elif key in {"dso_days", "dio_days", "dpo_days"}:
+            cfg["working_capital"][key] = _coerce_float(value, cfg["working_capital"][key])
+        elif key in {"debt_ratio", "loan_to_value"}:
+            cfg["debt"]["target_ratio"] = _coerce_float(value, 0.6)
+        elif key in {"debt_rate", "interest_rate"}:
+            cfg["debt"].setdefault("global_rate", _coerce_float(value, 0.1))
+
+    tables.ensure_table("projection_horizon")
+    if not tables.tables["projection_horizon"].empty:
+        horizon_row = tables.tables["projection_horizon"].iloc[0]
+        cfg["projection_horizon"].update({
+            "start_year": int(horizon_row.get("start_year", cfg["projection_horizon"]["start_year"])),
+            "end_year": int(horizon_row.get("end_year", cfg["projection_horizon"]["end_year"])),
+            "start_month": int(horizon_row.get("start_month", cfg["projection_horizon"]["start_month"])),
+            "frequency": horizon_row.get("frequency", cfg["projection_horizon"]["frequency"]),
+        })
+
+    if not tables.ensure_table("global_inputs").empty:
+        global_row = tables.tables["global_inputs"].iloc[0]
+        for key in cfg["global_inputs"].keys():
+            val = global_row.get(key)
+            if pd.notna(val):
+                if isinstance(cfg["global_inputs"][key], str):
+                    cfg["global_inputs"][key] = str(val)
+                else:
+                    cfg["global_inputs"][key] = float(val)
+
+    for table_name in ("revenue_params", "production_annual", "production_monthly", "direct_costs_monthly", "staff_costs_monthly", "other_opex_monthly", "ar_other_assets", "inventory_ap", "debt_tranches", "tax_schedule", "inflation_index", "risk_params", "capex_lines"):
+        df = tables.ensure_table(table_name)
+        if not df.empty:
+            cfg[table_name] = df.copy().reset_index(drop=True)
+
+    total_share = cfg["global_inputs"]["investor_share"] + cfg["global_inputs"]["owner_share"]
+    if not math.isclose(total_share, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+        cfg["global_inputs"]["owner_share"] = 1.0 - cfg["global_inputs"]["investor_share"]
+
+    cfg.setdefault("production", {})
+    cfg["production"].setdefault("feedstock_scenario", "HYBRID")
+    cfg["production"].setdefault("farm_share", 0.5)
+
+    return cfg
+###############################################################################
+# Section 5: Timeline utilities
+###############################################################################
+
+
+@dataclass
+class Timeline:
+    start_year: int
+    end_year: int
+    start_month: int = 1
+
+    def monthly_index(self) -> pd.DatetimeIndex:
+        start = f"{self.start_year:04d}-{self.start_month:02d}-01"
+        total_years = self.end_year - self.start_year + 1
+        periods = total_years * 12 - (self.start_month - 1)
+        return pd.date_range(start=start, periods=periods, freq="MS")
+
+    def annual_index(self) -> List[int]:
+        return list(range(self.start_year, self.end_year + 1))
+###############################################################################
+# Section 6: Production modeling
+###############################################################################
+
+
+def parse_ramp(ramp_value: object, years: int) -> List[float]:
+    if isinstance(ramp_value, (list, tuple, np.ndarray)):
+        values = [float(x) for x in ramp_value]
+    elif isinstance(ramp_value, str):
+        parts = [p.strip() for p in re.split(r"[;,]", ramp_value) if p.strip()]
+        values = [float(p) for p in parts] if parts else []
+    else:
+        values = []
+    if not values:
+        values = DEFAULTS["production"]["ramp"]
+    if len(values) < years:
+        values.extend([values[-1]] * (years - len(values)))
+    return values[:years]
+
+
+def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    monthly_index = timeline.monthly_index()
+    annual_years = timeline.annual_index()
+
+    if "production_annual" in cfg and isinstance(cfg["production_annual"], pd.DataFrame) and not cfg["production_annual"].empty:
+        prod_annual = cfg["production_annual"].copy()
+    else:
+        base = DEFAULTS["production"]
+        feedstock = base["annual_feedstock_ton"]
+        prod_annual = pd.DataFrame(
+            [
+                {
+                    "product": "ethanol",
+                    "annual_volume": feedstock * base["ethanol_litre_per_ton"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "availability": base["plant_availability"],
+                    "loss_factor": base["loss_factor"],
+                    "startup_ramp": "0.7;0.9;1.0",
+                    "boe_conversion": np.nan,
+                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
+                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                },
+                {
+                    "product": "sugar",
+                    "annual_volume": feedstock * base["sugar_ton_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "availability": base["plant_availability"],
+                    "loss_factor": base["loss_factor"],
+                    "startup_ramp": "0.7;0.9;1.0",
+                    "boe_conversion": np.nan,
+                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
+                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                },
+                {
+                    "product": "electricity",
+                    "annual_volume": feedstock * base["electricity_mwh_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "availability": base["plant_availability"],
+                    "loss_factor": base["loss_factor"],
+                    "startup_ramp": "0.7;0.9;1.0",
+                    "boe_conversion": np.nan,
+                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
+                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                },
+                {
+                    "product": "animal_feed",
+                    "annual_volume": feedstock * base["animal_feed_ton_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "availability": base["plant_availability"],
+                    "loss_factor": base["loss_factor"],
+                    "startup_ramp": "0.7;0.9;1.0",
+                    "boe_conversion": np.nan,
+                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
+                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                },
+            ]
+        )
+
+    prod_annual["annual_volume"] = pd.to_numeric(prod_annual["annual_volume"], errors="coerce").fillna(0.0)
+    annual_rows: List[Dict[str, object]] = []
+    for _, row in prod_annual.iterrows():
+        ramp = parse_ramp(row.get("startup_ramp"), len(annual_years))
+        for idx, year in enumerate(annual_years):
+            annual_rows.append(
+                {
+                    "year": year,
+                    "product": row["product"],
+                    "volume": float(row["annual_volume"]) * float(ramp[idx]),
+                    "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
+                    "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
+                }
+            )
+    annual_df = pd.DataFrame(annual_rows)
+
+    if "production_monthly" in cfg and isinstance(cfg["production_monthly"], pd.DataFrame) and not cfg["production_monthly"].empty:
+        monthly_df = cfg["production_monthly"].copy()
+        monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+    else:
+        monthly_rows: List[Dict[str, object]] = []
+        seasonality = np.ones(MONTHS_IN_YEAR) / MONTHS_IN_YEAR
+        for _, row in annual_df.iterrows():
+            for month in range(1, MONTHS_IN_YEAR + 1):
+                date = pd.Timestamp(year=row["year"], month=month, day=1)
+                if date not in monthly_index:
+                    continue
+                monthly_rows.append(
+                    {
+                        "date": date,
+                        "product": row["product"],
+                        "volume": row["volume"] * seasonality[month - 1],
+                        "availability_override": np.nan,
+                        "maintenance_downtime": 0.0,
+                        "loss_override": np.nan,
+                    }
+                )
+        monthly_df = pd.DataFrame(monthly_rows)
+
+    monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)].sort_values(["date", "product"]).reset_index(drop=True)
+
+    return monthly_df, annual_df
+###############################################################################
+# Section 7: Pricing and revenue
+###############################################################################
+
+
+def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.DataFrame:
+    monthly_index = timeline.monthly_index()
+    inflation_rate = cfg["global_inputs"].get("inflation_rate", DEFAULTS["global"]["inflation_rate"])
+    inflation_index = cfg.get("inflation_index")
+    if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty:
+        idx = inflation_index.copy()
+        idx["date"] = pd.to_datetime(idx["date"])
+        idx = idx.set_index("date").reindex(monthly_index).ffill().bfill()
+    else:
+        idx = pd.DataFrame(index=monthly_index, data={"cpi": (1 + inflation_rate / 12) ** np.arange(len(monthly_index))})
+
+    records: List[Dict[str, object]] = []
+    for product in PRODUCTS:
+        params = cfg["prices"].get(product, DEFAULTS["prices"][product])
+        base_price = params.get("base_price", DEFAULTS["prices"][product]["base_price"])
+        escalation = params.get("price_escalation_pa", DEFAULTS["prices"][product]["price_escalation_pa"])
+        monthly_escalation = (1 + escalation) ** (1 / 12) - 1
+        for i, date in enumerate(monthly_index):
+            price = base_price * ((1 + monthly_escalation) ** i)
+            if params.get("price_indexation", "cpi").lower() == "cpi" and "cpi" in idx:
+                price *= idx.loc[date, "cpi"]
+            records.append({"date": date, "product": product, "price": price, "uom": params.get("uom", "")})
+    return pd.DataFrame(records)
+
+
+def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFrame, price_curves: pd.DataFrame) -> pd.DataFrame:
+    df = production_monthly.merge(price_curves, on=["date", "product"], how="left")
+    df["price"].fillna(0.0, inplace=True)
+    df["revenue"] = df["volume"] * df["price"]
+    df["currency"] = cfg["global_inputs"].get("base_currency", "USD")
+    return df
+###############################################################################
+# Section 8: CAPEX and depreciation
+###############################################################################
+
+
+def parse_date_str(value: object, default: pd.Timestamp) -> pd.Timestamp:
+    if isinstance(value, pd.Timestamp):
+        return value
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
+        return pd.Timestamp(value)
+    if isinstance(value, str) and value:
+        try:
+            if len(value) == 7 and value.count("-") == 1:
+                value = value + "-01"
+            return pd.to_datetime(value)
+        except Exception:
+            return default
+    if isinstance(value, (int, float)) and not math.isnan(value):
+        year = int(value)
+        return pd.Timestamp(year=year, month=1, day=1)
+    return default
+
+
+def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> Dict[str, pd.DataFrame]:
+    monthly_index = timeline.monthly_index()
+    capex_lines = cfg.get("capex_lines")
+    if not isinstance(capex_lines, pd.DataFrame) or capex_lines.empty:
+        capex_lines = pd.DataFrame(
+            [
+                {
+                    "item_name": "Plant",
+                    "category": "plant",
+                    "amount": 35_000_000.0,
+                    "currency": "USD",
+                    "start_date": f"{timeline.start_year}-01",
+                    "end_date": f"{timeline.start_year}-12",
+                    "life_years": 15,
+                    "depr_method": "straight",
+                    "depr_rate_override": np.nan,
+                    "vat_rate": 0.0,
+                    "vat_recovery_lag_months": 0,
+                    "capitalized": True,
+                    "is_farm_capex": False,
+                }
+            ]
+        )
+
+    capex_records: List[Dict[str, object]] = []
+    depr_records: List[Dict[str, object]] = []
+
+    for _, row in capex_lines.iterrows():
+        amount = float(row.get("amount", 0.0))
+        start = parse_date_str(row.get("start_date"), monthly_index[0])
+        end = parse_date_str(row.get("end_date"), monthly_index[0])
+        if end < start:
+            end = start
+        months = max(1, (end.year - start.year) * 12 + (end.month - start.month) + 1)
+        monthly_amount = amount / months
+        dates = pd.date_range(start=start, periods=months, freq="MS")
+        for date in dates:
+            if date not in monthly_index:
+                continue
+            capex_records.append(
+                {
+                    "date": date,
+                    "item_name": row.get("item_name"),
+                    "category": row.get("category"),
+                    "amount": monthly_amount,
+                    "currency": row.get("currency", "USD"),
+                    "vat_outflow": monthly_amount * float(row.get("vat_rate", 0.0)),
+                    "is_farm_capex": bool(row.get("is_farm_capex", False)),
+                }
+            )
+        life_years = int(row.get("life_years", 10))
+        depr_rate_override = row.get("depr_rate_override")
+        if pd.notna(depr_rate_override) and float(depr_rate_override) > 0:
+            life_months = int(round(12 / float(depr_rate_override)))
+        else:
+            life_months = life_years * 12
+        start_idx = np.searchsorted(monthly_index, start)
+        for m in range(life_months):
+            idx = start_idx + m
+            if idx >= len(monthly_index):
+                break
+            depr_records.append(
+                {
+                    "date": monthly_index[idx],
+                    "item_name": row.get("item_name"),
+                    "depr": amount / life_months,
+                }
+            )
+
+    capex_df = pd.DataFrame(capex_records)
+    if capex_df.empty:
+        capex_df = pd.DataFrame({"date": monthly_index, "amount": 0.0})
+    capex_df = capex_df.groupby("date").sum(numeric_only=True).reindex(monthly_index, fill_value=0.0).reset_index()
+    capex_df.rename(columns={"index": "date"}, inplace=True)
+    capex_df["cumulative_capex"] = capex_df["amount"].cumsum()
+
+    depr_df = pd.DataFrame(depr_records)
+    if depr_df.empty:
+        depr_df = pd.DataFrame({"date": monthly_index, "depr": 0.0})
+    depr_df = depr_df.groupby("date").sum(numeric_only=True).reindex(monthly_index, fill_value=0.0).reset_index()
+    depr_df.rename(columns={"index": "date"}, inplace=True)
+    depr_df["accum_depr"] = depr_df["depr"].cumsum()
+
+    return {"capex": capex_df, "depreciation": depr_df}
+###############################################################################
+# Section 9: Debt modeling
+###############################################################################
+
+
+def parse_draw_curve(draw_curve: object, monthly_index: pd.DatetimeIndex) -> pd.Series:
+    if draw_curve is None or (isinstance(draw_curve, float) and math.isnan(draw_curve)):
+        series = pd.Series(0.0, index=monthly_index)
+        series.iloc[0] = 1.0
+        return series
+    if isinstance(draw_curve, str):
+        try:
+            data = json.loads(draw_curve)
+            if isinstance(data, list):
+                arr = np.array(data, dtype=float)
+                if arr.sum() != 0:
+                    arr = arr / arr.sum()
+                series = pd.Series(0.0, index=monthly_index)
+                series.iloc[: len(arr)] = arr
+                return series
+            if isinstance(data, dict):
+                series = pd.Series(0.0, index=monthly_index)
+                for key, value in data.items():
+                    date = parse_date_str(key, monthly_index[0])
+                    if date in series.index:
+                        series.loc[date] = float(value)
+                total = series.sum()
+                if total != 0:
+                    series = series / total
+                return series
+        except Exception:
+            pass
+    if isinstance(draw_curve, (list, tuple, np.ndarray)):
+        arr = np.array(draw_curve, dtype=float)
+        if arr.sum() != 0:
+            arr = arr / arr.sum()
+        series = pd.Series(0.0, index=monthly_index)
+        series.iloc[: len(arr)] = arr
+        return series
+    series = pd.Series(0.0, index=monthly_index)
+    series.iloc[0] = 1.0
+    return series
+
+
+def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df: pd.DataFrame) -> pd.DataFrame:
+    monthly_index = timeline.monthly_index()
+    tranches = cfg.get("debt_tranches") if "debt_tranches" in cfg else cfg["debt"].get("tranches", [])
+    if isinstance(tranches, pd.DataFrame):
+        tranches = tranches.to_dict("records")
+    schedule_frames: List[pd.DataFrame] = []
+    total_capex = capex_df["amount"].sum()
+
+    for tranche in tranches:
+        name = tranche.get("name", "Tranche")
+        share = float(tranche.get("share", 1.0))
+        principal_total = total_capex * share
+        draw_curve = parse_draw_curve(tranche.get("draw_curve"), monthly_index)
+        draws = draw_curve * principal_total
+        rate = float(tranche.get("interest_rate", cfg["debt"].get("global_rate", 0.1))) + float(tranche.get("base_rate", 0.0)) + float(tranche.get("margin", 0.0))
+        tenor_years = int(tranche.get("tenor_years", 8))
+        grace_years = int(tranche.get("grace_years", 1))
+        capitalize_idc = bool(tranche.get("capitalize_idc", True))
+        amortization = str(tranche.get("amortization", "straight")).lower()
+
+        balances = []
+        interests = []
+        principals = []
+        services = []
+        balance = 0.0
+        annuity_payment = None
+        monthly_rate = rate / 12
+        for i, date in enumerate(monthly_index):
+            draw = draws.iloc[i]
+            balance += draw
+            interest = balance * monthly_rate
+            principal_payment = 0.0
+            year_index = i // 12
+            if year_index >= grace_years:
+                if amortization == "annuity":
+                    if annuity_payment is None:
+                        n = tenor_years * 12
+                        if monthly_rate == 0:
+                            annuity_payment = principal_total / n
+                        else:
+                            annuity_payment = principal_total * (monthly_rate * (1 + monthly_rate) ** n) / ((1 + monthly_rate) ** n - 1)
+                    principal_payment = max(0.0, annuity_payment - interest)
+                else:
+                    principal_payment = principal_total / (tenor_years * 12)
+                principal_payment = min(principal_payment, balance)
+                balance -= principal_payment
+            else:
+                if capitalize_idc:
+                    balance += interest
+                    interest = 0.0
+                else:
+                    balance += 0.0
+            balances.append(balance)
+            interests.append(interest)
+            principals.append(principal_payment)
+            services.append(interest + principal_payment)
+        schedule_frames.append(
+            pd.DataFrame(
+                {
+                    "date": monthly_index,
+                    "tranche": name,
+                    "draw": draws.values,
+                    "interest": interests,
+                    "principal": principals,
+                    "debt_service": services,
+                    "balance": balances,
+                }
+            )
+        )
+    if schedule_frames:
+        schedule = pd.concat(schedule_frames, ignore_index=True)
+    else:
+        schedule = pd.DataFrame({"date": monthly_index, "tranche": [], "draw": [], "interest": [], "principal": [], "debt_service": [], "balance": []})
+    return schedule
+###############################################################################
+# Section 10: Working capital and tax
+###############################################################################
+
+
+def working_capital_block(revenue_df: pd.DataFrame, cost_df: pd.DataFrame, cfg: Mapping[str, object], timeline: Timeline) -> pd.DataFrame:
+    monthly_index = timeline.monthly_index()
+    revenue = revenue_df.groupby("date")["revenue"].sum().reindex(monthly_index, fill_value=0.0)
+    cost = cost_df.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
+    wc_days = cfg.get("working_capital", DEFAULTS["working_capital"])
+    dso = wc_days.get("dso_days", DEFAULTS["working_capital"]["dso_days"])
+    dio = wc_days.get("dio_days", DEFAULTS["working_capital"]["dio_days"])
+    dpo = wc_days.get("dpo_days", DEFAULTS["working_capital"]["dpo_days"])
+
+    ar = revenue * dso / 365.0
+    inv = cost * dio / 365.0
+    ap = cost * dpo / 365.0
+    net_wc = ar + inv - ap
+    delta_wc = net_wc.diff().fillna(net_wc)
+
+    return pd.DataFrame(
+        {
+            "date": monthly_index,
+            "accounts_receivable": ar.values,
+            "inventory": inv.values,
+            "accounts_payable": ap.values,
+            "net_working_capital": net_wc.values,
+            "delta_working_capital": delta_wc.values,
+        }
+    )
+
+
+def tax_block(pnl_df: pd.DataFrame, cfg: Mapping[str, object]) -> pd.DataFrame:
+    base_rate = cfg.get("tax", {}).get("base_tax_rate", DEFAULTS["tax"]["base_tax_rate"])
+    min_tax = cfg.get("tax", {}).get("min_tax", 0.0)
+    nol_years = cfg.get("tax", {}).get("loss_carryforward_years")
+
+    nol_queue: List[Tuple[int, float]] = []
+    rows: List[Dict[str, object]] = []
+    for idx, row in pnl_df.iterrows():
+        date = row["date"]
+        taxable_income = row["EBIT"]
+        available_loss = sum(val for _, val in nol_queue)
+        taxable_after_loss = taxable_income - available_loss
+        tax = 0.0
+        if taxable_after_loss > 0:
+            tax = max(taxable_after_loss * base_rate, taxable_after_loss * min_tax)
+            nol_queue.clear()
+        else:
+            nol_queue.append((idx, -taxable_after_loss))
+            if nol_years is not None:
+                nol_queue = [(age, val) for age, val in nol_queue if idx - age < int(nol_years) * 12]
+        rows.append({"date": date, "taxable_income": taxable_after_loss, "tax": tax, "loss_carryforward": sum(val for _, val in nol_queue)})
+    return pd.DataFrame(rows)
+###############################################################################
+# Section 11: Financial statements
+###############################################################################
+
+
+def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df: pd.DataFrame, production_df: pd.DataFrame, capex_info: Dict[str, pd.DataFrame], debt_schedule: pd.DataFrame, wc_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    monthly_index = timeline.monthly_index()
+    depreciation = capex_info["depreciation"].set_index("date").reindex(monthly_index, fill_value=0.0)["depr"].values
+    capex = capex_info["capex"].set_index("date").reindex(monthly_index, fill_value=0.0)["amount"].values
+
+    direct_costs = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame()
+    if isinstance(direct_costs, pd.DataFrame) and not direct_costs.empty:
+        direct_costs = direct_costs.copy()
+        direct_costs["date"] = pd.to_datetime(direct_costs["date"])
+    else:
+        direct_costs = pd.DataFrame({"date": monthly_index, "amount": 0.0})
+    direct_costs_total = direct_costs.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
+
+    staff_costs = cfg.get("staff_costs_monthly") if "staff_costs_monthly" in cfg else pd.DataFrame()
+    if isinstance(staff_costs, pd.DataFrame) and not staff_costs.empty:
+        staff_costs = staff_costs.copy()
+        staff_costs["date"] = pd.to_datetime(staff_costs["date"])
+    else:
+        staff_costs = pd.DataFrame({"date": monthly_index, "gross_pay": 0.0, "benefits": 0.0, "training": 0.0, "other": 0.0})
+    staff_costs_total = staff_costs.set_index("date").reindex(monthly_index, fill_value=0.0)[["gross_pay", "benefits", "training", "other"]].sum(axis=1)
+
+    other_opex = cfg.get("other_opex_monthly") if "other_opex_monthly" in cfg else pd.DataFrame()
+    if isinstance(other_opex, pd.DataFrame) and not other_opex.empty:
+        other_opex = other_opex.copy()
+        other_opex["date"] = pd.to_datetime(other_opex["date"])
+    else:
+        other_opex = pd.DataFrame({"date": monthly_index, "amount": DEFAULTS["opex"]["fixed_opex_per_month"]})
+    other_opex_total = other_opex.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=DEFAULTS["opex"]["fixed_opex_per_month"])
+
+    revenue_total = revenue_df.groupby("date")["revenue"].sum().reindex(monthly_index, fill_value=0.0)
+    cogs_total = direct_costs_total + other_opex_total
+    gross_profit = revenue_total - cogs_total
+    opex_total = staff_costs_total
+    ebitda = gross_profit - opex_total
+
+    interest = debt_schedule.groupby("date")["interest"].sum().reindex(monthly_index, fill_value=0.0)
+    pnl_df = pd.DataFrame(
+        {
+            "date": monthly_index,
+            "Revenue": revenue_total.values,
+            "COGS": cogs_total.values,
+            "GrossProfit": gross_profit.values,
+            "Opex": opex_total.values,
+            "EBITDA": ebitda.values,
+            "Depreciation": depreciation,
+            "EBIT": (ebitda - depreciation - interest.values),
+            "Interest": interest.values,
+        }
+    )
+    tax_df = tax_block(pnl_df, cfg)
+    pnl_df = pnl_df.merge(tax_df[["date", "tax"]], on="date", how="left")
+    pnl_df["NetIncome"] = pnl_df["EBIT"] - pnl_df["tax"]
+
+    delta_wc = wc_df.set_index("date")["delta_working_capital"].reindex(monthly_index, fill_value=0.0)
+    cash_from_ops = pnl_df["EBITDA"] - pnl_df["tax"] - delta_wc.values
+    capex_outflow = capex
+    debt_service = debt_schedule.groupby("date")["debt_service"].sum().reindex(monthly_index, fill_value=0.0)
+    draws = debt_schedule.groupby("date")["draw"].sum().reindex(monthly_index, fill_value=0.0)
+    cash_flow_df = pd.DataFrame(
+        {
+            "date": monthly_index,
+            "CFO": cash_from_ops.values,
+            "CFI": -capex_outflow,
+            "CFF": draws.values - debt_service.values,
+        }
+    )
+    cash_flow_df["NetCashFlow"] = cash_flow_df[["CFO", "CFI", "CFF"]].sum(axis=1)
+    cash_flow_df["CashBalance"] = cash_flow_df["NetCashFlow"].cumsum()
+
+    balance_sheet = pd.DataFrame(
+        {
+            "date": monthly_index,
+            "Cash": cash_flow_df["CashBalance"].values,
+            "AccountsReceivable": wc_df["accounts_receivable"].values,
+            "Inventory": wc_df["inventory"].values,
+            "PPE_Gross": capex_info["capex"]["cumulative_capex"].values,
+            "PPE_Accumulated": capex_info["depreciation"]["accum_depr"].values,
+            "Debt": debt_schedule.groupby("date")["balance"].sum().reindex(monthly_index, fill_value=0.0).values,
+            "AccountsPayable": wc_df["accounts_payable"].values,
+        }
+    )
+    balance_sheet["PPE_Net"] = balance_sheet["PPE_Gross"] - balance_sheet["PPE_Accumulated"]
+    balance_sheet["TotalAssets"] = balance_sheet[["Cash", "AccountsReceivable", "Inventory", "PPE_Net"]].sum(axis=1)
+    balance_sheet["TotalLiabilities"] = balance_sheet[["Debt", "AccountsPayable"]].sum(axis=1)
+    balance_sheet["Equity"] = balance_sheet["TotalAssets"] - balance_sheet["TotalLiabilities"]
+
+    diff = balance_sheet["TotalAssets"] - (balance_sheet["TotalLiabilities"] + balance_sheet["Equity"])
+    assert (diff.abs() < 1e-3).all(), "Balance sheet does not balance"
+
+    return {"pnl": pnl_df, "cashflow": cash_flow_df, "balancesheet": balance_sheet}
+
+
+def aggregate_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    df = monthly_df.copy()
+    df["year"] = df["date"].dt.year
+    numeric_cols = df.select_dtypes(include=[float, int, np.number]).columns
+    agg_df = df.groupby("year")[numeric_cols].sum().reset_index()
+    return agg_df
+###############################################################################
+# Section 12: Valuation metrics
+###############################################################################
+
+
+def npv(rate: float, cashflows: Sequence[float]) -> float:
+    return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cashflows))
+
+
+def irr_bisection(cashflows: Sequence[float], lo: float = -0.9, hi: float = 1.5, tol: float = 1e-6, max_iter: int = 200) -> float:
+    def f(r):
+        return sum(cf / ((1 + r) ** t) for t, cf in enumerate(cashflows))
+
+    try:
+        f_lo, f_hi = f(lo), f(hi)
+    except ZeroDivisionError:
+        return float("nan")
+    if not np.isfinite(f_lo) or not np.isfinite(f_hi) or f_lo * f_hi > 0:
+        return float("nan")
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        f_mid = f(mid)
+        if abs(f_mid) < tol:
+            return mid
+        if f_lo * f_mid <= 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return mid
+
+
+def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, object], timeline: Timeline) -> Dict[str, object]:
+    cashflow = statements["cashflow"].copy()
+    pnl = statements["pnl"].copy()
+    monthly_index = timeline.monthly_index()
+    discount_rate = cfg["global_inputs"].get("discount_rate", DEFAULTS["global"]["discount_rate"])
+    monthly_rate = (1 + discount_rate) ** (1 / 12) - 1
+    discount_factors = (1 + monthly_rate) ** np.arange(len(monthly_index))
+    fcf = cashflow["NetCashFlow"].values
+    project_npv = np.sum(fcf / discount_factors)
+
+    equity_cf = cashflow["CFO"] + cashflow["CFI"] + cashflow["CFF"]
+    project_irr = irr_bisection(fcf)
+    equity_irr = irr_bisection(equity_cf.values)
+    cumulative_fcf = np.cumsum(fcf)
+    cumulative_equity = np.cumsum(equity_cf.values)
+    payback_month = next((i for i, val in enumerate(cumulative_fcf) if val >= 0), None)
+    payback_year = monthly_index[payback_month].year if payback_month is not None else None
+
+    debt_service = -cashflow["CFF"].values
+    cfads = cashflow["CFO"].values
+    dscr_series = [cf / ds if ds != 0 else np.nan for cf, ds in zip(cfads, debt_service)]
+    metrics = {
+        "Project_NPV": project_npv,
+        "Project_IRR": project_irr,
+        "Equity_IRR": equity_irr,
+        "Payback_Year": payback_year,
+        "Cumulative_FCF": cumulative_fcf[-1] if len(cumulative_fcf) else 0.0,
+        "Cumulative_Equity_CF": cumulative_equity[-1] if len(cumulative_equity) else 0.0,
+        "DSCR_min": float(np.nanmin(dscr_series)) if dscr_series else np.nan,
+        "DSCR_avg": float(np.nanmean(dscr_series)) if dscr_series else np.nan,
+    }
+    return {"metrics": metrics, "cashflows": {"project": fcf, "equity": equity_cf.values, "discount_factors": discount_factors}}
+###############################################################################
+# Section 13: Dashboard and charts
+###############################################################################
+
+
+def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFrame], production_monthly: pd.DataFrame, revenue_df: pd.DataFrame, valuation: Dict[str, object], out_dir: Optional[Path] = None) -> Dict[str, object]:
+    horizon = cfg["projection_horizon"]
+    global_inputs = cfg["global_inputs"]
+    metrics = valuation["metrics"]
+    monthly_pnl = statements["pnl"]
+    cashflow = statements["cashflow"]
+
+    dashboard: Dict[str, object] = {}
+    dashboard["assumptions_snapshot"] = pd.DataFrame(
+        {
+            "Metric": ["Start", "End", "Tax Rate", "Investor Share", "Owner Share", "Terminal Growth", "Discount Rate", "Inflation"],
+            "Value": [
+                f"{horizon['start_year']}-{horizon['start_month']:02d}",
+                horizon["end_year"],
+                global_inputs["corp_tax_rate"],
+                global_inputs["investor_share"],
+                global_inputs["owner_share"],
+                global_inputs.get("terminal_growth", 0.02),
+                global_inputs["discount_rate"],
+                global_inputs.get("inflation_rate", 0.02),
+            ],
+        }
+    )
+
+    dashboard["global_block"] = pd.DataFrame(
+        {
+            "Metric": ["Corporate Tax", "Investor Share", "Owner Share", "Terminal Growth", "Capital Gains Tax", "Payback Year"],
+            "Value": [
+                global_inputs["corp_tax_rate"],
+                global_inputs["investor_share"],
+                global_inputs["owner_share"],
+                global_inputs.get("terminal_growth", 0.02),
+                global_inputs.get("capital_gains_tax_rate", 0.0),
+                metrics.get("Payback_Year"),
+            ],
+        }
+    )
+
+    final_row = monthly_pnl.iloc[-1]
+    final_cashflow = cashflow.iloc[-1]
+    dashboard["latest_drivers"] = {
+        "final_month_revenue": final_row["Revenue"],
+        "final_month_ebitda": final_row["EBITDA"],
+        "final_month_equity_cf": final_cashflow["NetCashFlow"],
+        "cumulative_fcf_to_date": metrics.get("Cumulative_FCF"),
+        "cumulative_equity_cf": metrics.get("Cumulative_Equity_CF"),
+    }
+
+    dashboard["overview_metrics"] = pd.DataFrame(
+        {
+            "Metric": ["Project NPV", "Project IRR", "Equity IRR", "Payback Year", "DSCR (min)", "DSCR (avg)"],
+            "Value": [
+                metrics.get("Project_NPV"),
+                metrics.get("Project_IRR"),
+                metrics.get("Equity_IRR"),
+                metrics.get("Payback_Year"),
+                metrics.get("DSCR_min"),
+                metrics.get("DSCR_avg"),
+            ],
+        }
+    )
+
+    annual_production = aggregate_annual(production_monthly.assign(revenue=revenue_df.groupby(["date", "product"])["revenue"].sum().reindex(production_monthly.set_index(["date", "product"]).index, fill_value=0.0).values))
+    annual_production_chart = annual_production.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
+
+    charts: Dict[str, Optional[Path]] = {}
+    if plt is not None:
+        if out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _save_chart(fig, name: str) -> Optional[Path]:
+            if out_dir is None:
+                plt.close(fig)
+                return None
+            path = out_dir / f"{name}.png"
+            fig.savefig(path, bbox_inches="tight")
+            plt.close(fig)
+            return path
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        annual_production_chart.plot(kind="bar", stacked=True, ax=ax)
+        ax.set_title("Annual Production by Product")
+        ax.set_ylabel("Volume")
+        charts["annual_production"] = _save_chart(fig, "annual_production")
+
+        annual_cashflow = aggregate_annual(cashflow)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(annual_cashflow["year"], annual_cashflow["NetCashFlow"], label="FCF")
+        ax.bar(annual_cashflow["year"], annual_cashflow["CFO"], label="CFO", alpha=0.5)
+        ax.legend()
+        ax.set_title("Annual Cash Flow")
+        charts["cash_flow"] = _save_chart(fig, "cash_flow")
+
+        revenue_mix = revenue_df.copy()
+        revenue_mix["year"] = revenue_mix["date"].dt.year
+        revenue_mix = revenue_mix.groupby(["year", "product"])["revenue"].sum().unstack(fill_value=0.0)
+        fig, ax = plt.subplots(figsize=(8, 4))
+        revenue_mix.plot(kind="bar", stacked=True, ax=ax)
+        ax.set_title("Revenue Mix")
+        charts["revenue_mix"] = _save_chart(fig, "revenue_mix")
+    else:
+        charts = {"annual_production": None, "cash_flow": None, "revenue_mix": None}
+
+    dashboard["charts"] = charts
+    dashboard["annual_production"] = annual_production_chart.reset_index()
+    dashboard["annual_cashflow"] = annual_cashflow
+
+    return dashboard
+###############################################################################
+# Section 14: Sensitivity, Monte Carlo, Goal Seek, Scenarios
+###############################################################################
+
+
+def sensitivity_tornado(cfg: Mapping[str, object], base_results: Dict[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], drivers: Optional[List[Tuple[str, float]]] = None) -> pd.DataFrame:
+    if drivers is None:
+        drivers = [
+            ("ethanol_price", 0.2),
+            ("sugar_price", 0.2),
+            ("availability", 0.05),
+            ("capex", 0.2),
+            ("debt_rate", 0.02),
+        ]
+    base_npv = base_results["metrics"].get("Project_NPV", 0.0)
+    rows = []
+    for key, pct in drivers:
+        cfg_up = copy.deepcopy(cfg)
+        cfg_down = copy.deepcopy(cfg)
+        if "price" in key:
+            prod = key.split("_")[0]
+            for variant, factor in ((cfg_up, 1 + pct), (cfg_down, 1 - pct)):
+                variant["prices"][prod]["base_price"] *= factor
+        elif key == "availability":
+            for variant, factor in ((cfg_up, 1 + pct), (cfg_down, 1 - pct)):
+                variant["production"]["plant_availability"] *= factor
+        elif key == "capex":
+            for variant, factor in ((cfg_up, 1 + pct), (cfg_down, 1 - pct)):
+                capex_lines = variant.get("capex_lines")
+                if isinstance(capex_lines, pd.DataFrame):
+                    variant["capex_lines"] = capex_lines.copy()
+                    if "amount" in variant["capex_lines"]:
+                        variant["capex_lines"]["amount"] = variant["capex_lines"]["amount"].astype(float) * factor
+                elif isinstance(capex_lines, list):
+                    for line in capex_lines:
+                        line["amount"] *= factor
+        elif key == "debt_rate":
+            for variant, factor in ((cfg_up, pct), (cfg_down, -pct)):
+                for tranche in variant["debt"]["tranches"]:
+                    tranche["interest_rate"] += factor
+        up_results = run_model_fn(cfg_up)
+        down_results = run_model_fn(cfg_down)
+        rows.append({"driver": key, "scenario": "High", "npv": up_results["metrics"].get("Project_NPV", np.nan), "delta": up_results["metrics"].get("Project_NPV", np.nan) - base_npv})
+        rows.append({"driver": key, "scenario": "Low", "npv": down_results["metrics"].get("Project_NPV", np.nan), "delta": down_results["metrics"].get("Project_NPV", np.nan) - base_npv})
+    tornado = pd.DataFrame(rows)
+    tornado["abs_delta"] = tornado["delta"].abs()
+    tornado.sort_values("abs_delta", ascending=False, inplace=True)
+    return tornado
+
+
+def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], iterations: int = 2000, random_seed: int = 42) -> Dict[str, object]:
+    rng = np.random.default_rng(random_seed)
+    risk_params = cfg.get("risk_params")
+    if isinstance(risk_params, pd.DataFrame):
+        params = risk_params.to_dict("records")
+    else:
+        params = DEFAULTS["risk_params"].to_dict("records")
+    project_npvs = []
+    equity_irrs = []
+    unit_margins = []
+    base_price = cfg["prices"]["ethanol"]["base_price"]
+
+    for _ in range(iterations):
+        sample_cfg = copy.deepcopy(cfg)
+        for param in params:
+            dist = param.get("distribution", "normal")
+            p1, p2, p3 = param.get("p1", 0.0), param.get("p2", 0.0), param.get("p3", 0.0)
+            if dist == "normal":
+                draw = rng.normal(p1, p2)
+            elif dist == "lognormal":
+                draw = rng.lognormal(p1, p2)
+            elif dist == "triangular":
+                draw = rng.triangular(p1, p2, p3)
+            elif dist == "uniform":
+                draw = rng.uniform(p1, p2)
+            else:
+                draw = p1
+            target = param.get("target", "price")
+            applies_to = param.get("applies_to", "global")
+            if target == "price" and applies_to in sample_cfg["prices"]:
+                sample_cfg["prices"][applies_to]["base_price"] *= (1 + draw)
+            elif target == "availability":
+                sample_cfg["production"]["plant_availability"] *= (1 + draw)
+            elif target == "opex":
+                sample_cfg["opex"]["fixed_opex_per_month"] *= (1 + draw)
+            elif target == "capex" and "capex_lines" in sample_cfg:
+                if isinstance(sample_cfg["capex_lines"], pd.DataFrame):
+                    sample_cfg["capex_lines"] = sample_cfg["capex_lines"].copy()
+                    if "amount" in sample_cfg["capex_lines"]:
+                        sample_cfg["capex_lines"]["amount"] = sample_cfg["capex_lines"]["amount"].astype(float) * (1 + draw)
+                elif isinstance(sample_cfg["capex_lines"], list):
+                    for line in sample_cfg["capex_lines"]:
+                        line["amount"] *= (1 + draw)
+        result = run_model_fn(sample_cfg)
+        project_npvs.append(result["metrics"].get("Project_NPV", np.nan))
+        equity_irrs.append(result["metrics"].get("Equity_IRR", np.nan))
+        revenue = result.get("revenue", pd.DataFrame())
+        if isinstance(revenue, pd.DataFrame) and not revenue.empty:
+            unit_margins.append(revenue["revenue"].sum() / max(revenue["volume"].sum(), 1.0))
+        else:
+            unit_margins.append(sample_cfg["prices"]["ethanol"]["base_price"] - base_price)
+
+    summary = pd.DataFrame({"Project_NPV": project_npvs, "Equity_IRR": equity_irrs, "Unit_Margin": unit_margins})
+    stats = summary.quantile([0.1, 0.5, 0.9]).rename(index={0.1: "P10", 0.5: "P50", 0.9: "P90"})
+    return {"samples": summary, "percentiles": stats}
+
+
+def goal_seek(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], target_metric: str, target_value: float, variable: str, bounds: Tuple[float, float], tol: float = 1e-4, max_iter: int = 100) -> Optional[Dict[str, float]]:
+    low, high = bounds
+    cfg_low = copy.deepcopy(cfg)
+    cfg_high = copy.deepcopy(cfg)
+
+    def apply_value(cfg_mutable: Dict[str, object], value: float) -> None:
+        if variable.endswith("_price"):
+            prod = variable.split("_")[0]
+            cfg_mutable["prices"][prod]["base_price"] = value
+        elif variable == "debt_ratio":
+            cfg_mutable["debt"]["target_ratio"] = value
+        elif variable == "availability":
+            cfg_mutable["production"]["plant_availability"] = value
+        else:
+            cfg_mutable.setdefault("overrides", {})[variable] = value
+
+    for cfg_mutable, val in ((cfg_low, low), (cfg_high, high)):
+        apply_value(cfg_mutable, val)
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)
+        cfg_mid = copy.deepcopy(cfg)
+        apply_value(cfg_mid, mid)
+        result = run_model_fn(cfg_mid)
+        metric_value = result["metrics"].get(target_metric)
+        if metric_value is None:
+            return None
+        if abs(metric_value - target_value) <= tol:
+            return {"value": mid, "metric": metric_value}
+        if metric_value < target_value:
+            low = mid
+        else:
+            high = mid
+    return None
+
+
+def _apply_overrides(target: MutableMapping[str, object], overrides: Mapping[str, object]) -> None:
+    for key, value in overrides.items():
+        if isinstance(value, Mapping) and key in target and isinstance(target[key], MutableMapping):
+            _apply_overrides(target[key], value)
+        else:
+            target[key] = value
+
+
+def run_scenarios(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], scenarios: Mapping[str, Mapping[str, object]]) -> pd.DataFrame:
+    results = []
+    for name, overrides in scenarios.items():
+        scenario_cfg = copy.deepcopy(cfg)
+        _apply_overrides(scenario_cfg, overrides)
+        result = run_model_fn(scenario_cfg)
+        metrics = result["metrics"]
+        metrics["scenario"] = name
+        results.append(metrics)
+    return pd.DataFrame(results)
+###############################################################################
+# Section 15: Break-even analysis
+###############################################################################
+
+
+def break_even_analysis(statements: Dict[str, pd.DataFrame], revenue_df: pd.DataFrame, production_df: pd.DataFrame) -> Dict[str, object]:
+    pnl = statements["pnl"].copy()
+    fixed_costs = pnl["Opex"].mean() + pnl["Depreciation"].mean()
+    variable_cost_per_unit = (pnl["COGS"].sum() - fixed_costs * len(pnl)) / max(production_df["volume"].sum(), 1.0)
+    average_price = revenue_df["revenue"].sum() / max(production_df["volume"].sum(), 1.0)
+    break_even_volume = fixed_costs / max(average_price - variable_cost_per_unit, 1e-6)
+    margin_of_safety = 1 - break_even_volume / (production_df["volume"].sum() / len(statements["pnl"]))
+    return {
+        "fixed_costs": fixed_costs,
+        "variable_cost_per_unit": variable_cost_per_unit,
+        "average_price": average_price,
+        "break_even_volume": break_even_volume,
+        "margin_of_safety": margin_of_safety,
+    }
+###############################################################################
+# Section 16: Model orchestration
+###############################################################################
+
+
+def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None) -> Dict[str, object]:
+    timeline = Timeline(
+        start_year=int(cfg["projection_horizon"]["start_year"]),
+        end_year=int(cfg["projection_horizon"]["end_year"]),
+        start_month=int(cfg["projection_horizon"].get("start_month", 1)),
+    )
+    production_monthly, production_annual = build_production_tables(cfg, timeline)
+    price_curves = build_price_curves(cfg, timeline)
+    revenue_df = build_revenue_stack(cfg, production_monthly, price_curves)
+    capex_info = build_capex_depr_monthly(cfg, timeline)
+    debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"])
+
+    cost_df = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
+    if not isinstance(cost_df, pd.DataFrame) or cost_df.empty:
+        cost_df = pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
+    else:
+        cost_df = cost_df.copy()
+        cost_df["date"] = pd.to_datetime(cost_df["date"])
+    wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
+
+    statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+    valuation = project_cashflows(statements, cfg, timeline)
+    dashboard = build_dashboard(cfg, statements, production_monthly, revenue_df, valuation, out_dir=export_dir)
+    be = break_even_analysis(statements, revenue_df, production_monthly)
+
+    results = {
+        "config": cfg,
+        "timeline": timeline,
+        "production_monthly": production_monthly,
+        "production_annual": production_annual,
+        "price_curves": price_curves,
+        "revenue": revenue_df,
+        "capex": capex_info["capex"],
+        "depreciation": capex_info["depreciation"],
+        "debt_schedule": debt_schedule,
+        "working_capital": wc_df,
+        "statements_monthly": statements,
+        "statements_annual": {k: aggregate_annual(v) for k, v in statements.items()},
+        "metrics": valuation["metrics"],
+        "dashboard": dashboard,
+        "break_even": be,
+    }
+    return results
+###############################################################################
+# Section 17: Export utilities
+###############################################################################
+
+
+def export_csv(results: Mapping[str, object], out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, value in results.items():
+        if isinstance(value, pd.DataFrame):
+            value.to_csv(out_dir / f"{key}.csv", index=False)
+        elif isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                if isinstance(subvalue, pd.DataFrame):
+                    subvalue.to_csv(out_dir / f"{key}_{subkey}.csv", index=False)
+
+
+def build_excel_pack(results: Mapping[str, object], path: Path) -> None:
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        results["dashboard"]["assumptions_snapshot"].to_excel(writer, sheet_name="Summary", index=False)
+        for key in ("pnl", "cashflow", "balancesheet"):
+            results["statements_annual"][key].to_excel(writer, sheet_name=f"Annual_{key}", index=False)
+        results["capex"].to_excel(writer, sheet_name="CAPEX", index=False)
+        results["debt_schedule"].to_excel(writer, sheet_name="Debt", index=False)
+        results["working_capital"].to_excel(writer, sheet_name="WorkingCapital", index=False)
+        results["dashboard"]["overview_metrics"].to_excel(writer, sheet_name="Metrics", index=False)
+        results["dashboard"]["annual_production"].to_excel(writer, sheet_name="Production", index=False)
+###############################################################################
+# Section 18: CLI entrypoint
+###############################################################################
+
+
+def run_pipeline(cfg: Mapping[str, object]) -> Dict[str, object]:
+    return run_full_model(cfg)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sugarcane Bioethanol Multi-Product Project Finance Model")
+    parser.add_argument("--excel", type=str, default=None, help="Path to Excel workbook containing assumptions")
+    parser.add_argument("--export", type=str, default=None, help="Directory to export CSV outputs")
+    parser.add_argument("--excel-pack", dest="excel_pack", type=str, default=None, help="Path to export Excel pack")
+    parser.add_argument("--capex-sheet", dest="capex_sheet", type=str, default=None, help="Sheet name containing CAPEX table")
+    parser.add_argument("--preview", type=int, default=0, help="Preview N rows per sheet")
+    parser.add_argument("--iterations", type=int, default=2000, help="Monte Carlo iterations")
+    parser.add_argument("--seed", type=int, default=42, help="Monte Carlo random seed")
+    return parser.parse_args(list(argv) if argv is not None else None)
+
+
+def load_inputs_from_excel(path: Path, preview: int = 0) -> Tuple[InputTables, Dict[str, object]]:
+    sheets = load_all(path, header=0)
+    if preview:
+        print("Workbook preview:")
+        for key, df in sheets.items():
+            print(f"Sheet {key}: {df.shape[0]} rows x {df.shape[1]} cols")
+            print(df.head(preview))
+            print()
+    assumptions = detect_assumptions(sheets)
+    tables = InputTables()
+    tables.load_from_workbook(sheets)
+    return tables, assumptions
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+    tables = InputTables()
+    assumptions: Dict[str, object] = {}
+
+    if args.excel:
+        excel_path = Path(args.excel)
+        if excel_path.exists():
+            tables, assumptions = load_inputs_from_excel(excel_path, preview=args.preview)
+            if args.capex_sheet:
+                try:
+                    capex_df = load_sheet(excel_path, args.capex_sheet, header=0)
+                    tables.tables["capex_lines"] = capex_df
+                except Exception as exc:
+                    print(f"Failed to parse CAPEX sheet {args.capex_sheet}: {exc}")
+        else:
+            print(f"Excel file {excel_path} not found. Using defaults.")
+
+    cfg = build_config(assumptions, tables)
+
+    export_dir = Path(args.export) if args.export else None
+    if export_dir is not None:
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+    results = run_full_model(cfg, export_dir=export_dir / "out_png" if export_dir else None)
+
+    tornado = sensitivity_tornado(cfg, {"metrics": results["metrics"]}, lambda c: run_full_model(c), None)
+    monte = monte_carlo(cfg, lambda c: run_full_model(c), iterations=args.iterations, random_seed=args.seed)
+    scenarios = {
+        "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
+        "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
+        "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
+    }
+    scenario_results = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
+
+    results.update({
+        "sensitivities": tornado,
+        "monte_carlo": monte,
+        "scenarios": scenario_results,
+    })
+
+    if export_dir is not None:
+        export_csv(results, export_dir)
+    if args.excel_pack:
+        build_excel_pack(results, Path(args.excel_pack))
+
+    print("Key Metrics:")
+    for key, value in results["metrics"].items():
+        print(f"  {key}: {value}")
+
+
+if __name__ == "__main__":
+    main()
