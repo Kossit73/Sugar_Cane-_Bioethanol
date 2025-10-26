@@ -441,32 +441,24 @@ def main() -> None:
         """
         <style>
         html, body {
-            margin: 0;
-            padding: 0;
-            width: 100%;
-            max-width: 100%;
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
         }
-        [data-testid="stAppViewContainer"] {
-            padding: 0;
-            margin: 0;
-            width: 100vw;
-            max-width: 100vw;
+        .stApp {
+            margin: 0 !important;
+            padding: 0 !important;
         }
-        [data-testid="stAppViewContainer"] .main {
-            max-width: 100vw;
-            width: 100vw;
-            padding-left: 0;
-            padding-right: 0;
-            margin-left: 0;
-            margin-right: 0;
-        }
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] .main,
         [data-testid="stAppViewContainer"] .main .block-container {
-            max-width: 100vw;
-            width: 100vw;
-            padding-left: 0;
-            padding-right: 0;
-            margin-left: 0;
-            margin-right: 0;
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
         }
         </style>
         """,
