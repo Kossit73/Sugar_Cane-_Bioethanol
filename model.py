@@ -754,16 +754,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     if not annual_df.empty:
         annual_df.loc[(annual_df["year"] < prod_start_year) | (annual_df["year"] > prod_end_year), "volume"] = 0.0
 
-    if "production_monthly" in cfg and isinstance(cfg["production_monthly"], pd.DataFrame) and not cfg["production_monthly"].empty:
-        monthly_df = cfg["production_monthly"].copy()
-        monthly_df["date"] = pd.to_datetime(monthly_df["date"])
-        if not monthly_df.empty:
-            mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
-            monthly_df.loc[~mask, "volume"] = 0.0
-    else:
+    def _monthly_from_annual(source: pd.DataFrame) -> pd.DataFrame:
         monthly_rows: List[Dict[str, object]] = []
         seasonality = np.ones(MONTHS_IN_YEAR) / MONTHS_IN_YEAR
-        for _, row in annual_df.iterrows():
+        for _, row in source.iterrows():
             for month in range(1, MONTHS_IN_YEAR + 1):
                 date = pd.Timestamp(year=row["year"], month=month, day=1)
                 if date not in monthly_index:
@@ -782,7 +776,26 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                         "loss_override": np.nan,
                     }
                 )
-        monthly_df = pd.DataFrame(monthly_rows)
+        return pd.DataFrame(monthly_rows)
+
+    if "production_monthly" in cfg and isinstance(cfg["production_monthly"], pd.DataFrame) and not cfg["production_monthly"].empty:
+        monthly_df = cfg["production_monthly"].copy()
+        required_cols = {"date", "volume", "product"}
+        if not required_cols.issubset(monthly_df.columns):
+            monthly_df = _monthly_from_annual(annual_df)
+        else:
+            monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+            monthly_df["product"] = monthly_df["product"].astype(str).str.strip()
+            monthly_df = monthly_df[monthly_df["product"] != ""]
+            monthly_df = monthly_df.dropna(subset=["product"])
+            if monthly_df.empty:
+                monthly_df = _monthly_from_annual(annual_df)
+            else:
+                monthly_df["volume"] = pd.to_numeric(monthly_df["volume"], errors="coerce").fillna(0.0)
+                mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
+                monthly_df.loc[~mask, "volume"] = 0.0
+    else:
+        monthly_df = _monthly_from_annual(annual_df)
 
     monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)].sort_values(["date", "product"]).reset_index(drop=True)
 
