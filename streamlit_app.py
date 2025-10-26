@@ -498,16 +498,23 @@ def main() -> None:
     )
 
     page_tabs_container = st.container()
-
-    st.subheader("Model Controls")
-
-    control_tabs = st.tabs(
+    (
+        model_controls_tab,
+        landing_tab,
+        summary_tab,
+        financial_tab,
+        production_tab,
+        sensitivity_tab,
+        scenario_tab,
+    ) = page_tabs_container.tabs(
         [
-            "Projection",
-            "Financial",
-            "Production",
-            "Pricing",
-            "Risk & Scenarios",
+            "Model Controls",
+            "Input & Assumptions",
+            "Summary",
+            "Financial Statements",
+            "Production & Pricing",
+            "Sensitivities",
+            "Scenarios",
         ]
     )
 
@@ -517,184 +524,228 @@ def main() -> None:
     cfg = build_config(assumptions, tables)
 
     horizon = cfg["projection_horizon"]
-    production_horizon = cfg.get("production_horizon", {"start_year": horizon["start_year"], "end_year": horizon["end_year"]})
-    with control_tabs[0]:
-        st.markdown("### Projection horizon")
-        start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
-        end_year = st.number_input("End year", value=int(horizon["end_year"]), min_value=int(start_year), step=1)
-        start_month = st.number_input("Start month", min_value=1, max_value=12, value=int(horizon.get("start_month", 1)))
-        horizon.update({"start_year": int(start_year), "end_year": int(end_year), "start_month": int(start_month)})
-        st.markdown("### Production horizon")
-        prod_start_year = st.number_input(
-            "Production start year",
-            value=int(production_horizon.get("start_year", start_year)),
-            min_value=int(start_year),
-            step=1,
-        )
-        prod_end_year = st.number_input(
-            "Production end year",
-            value=int(production_horizon.get("end_year", end_year)),
-            min_value=int(prod_start_year),
-            max_value=int(end_year),
-            step=1,
-        )
-        production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
-        cfg["production_horizon"] = production_horizon
-        st.caption("Production volumes are set to zero outside the defined production horizon.")
-        try:
-            tables.set_table("projection_horizon", pd.DataFrame([horizon]))
-            tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
-        except Exception as exc:
-            st.warning(f"Projection inputs not saved due to validation error: {exc}")
+    production_horizon = cfg.get(
+        "production_horizon",
+        {"start_year": horizon["start_year"], "end_year": horizon["end_year"]},
+    )
 
-    global_inputs = cfg["global_inputs"]
-    with control_tabs[1]:
-        st.markdown("### Financial assumptions")
-        discount_rate = st.number_input(
-            "Discount rate (WACC)",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(global_inputs.get("discount_rate", 0.12)),
-            step=0.005,
-            format="%.4f",
+    with model_controls_tab:
+        st.subheader("Model Controls")
+        control_tabs = st.tabs(
+            [
+                "Projection",
+                "Financial",
+                "Production",
+                "Pricing",
+                "Risk & Scenarios",
+            ]
         )
-        corp_tax = st.number_input(
-            "Corporate tax rate",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(global_inputs.get("corp_tax_rate", 0.28)),
-            step=0.01,
-            format="%.4f",
-        )
-        investor_share = st.slider(
-            "Investor equity share",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(global_inputs.get("investor_share", 0.6)),
-            step=0.05,
-        )
-        global_inputs.update(
-            {
-                "discount_rate": float(discount_rate),
-                "corp_tax_rate": float(corp_tax),
-                "investor_share": float(investor_share),
-                "owner_share": float(1.0 - investor_share),
-            }
-        )
-        st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
-        try:
-            tables.set_table("global_inputs", pd.DataFrame([global_inputs]))
-            tables.set_table("working_capital_days", pd.DataFrame([cfg["working_capital"]]))
-        except Exception as exc:
-            st.warning(f"Global inputs not saved due to validation error: {exc}")
 
-    production_cfg = cfg.setdefault("production", {})
-    with control_tabs[2]:
-        st.markdown("### Production assumptions")
-        feedstock = st.number_input(
-            "Annual feedstock (t)",
-            min_value=0.0,
-            value=float(production_cfg.get("annual_feedstock_ton", 100_000.0)),
-            step=10_000.0,
-            format="%.0f",
-        )
-        availability = st.slider(
-            "Plant availability",
-            min_value=0.5,
-            max_value=1.0,
-            value=float(production_cfg.get("plant_availability", 0.9)),
-            step=0.01,
-        )
-        loss_factor = st.slider(
-            "Process loss factor",
-            min_value=0.0,
-            max_value=0.2,
-            value=float(production_cfg.get("loss_factor", 0.02)),
-            step=0.005,
-        )
-        production_cfg.update(
-            {
-                "annual_feedstock_ton": float(feedstock),
-                "plant_availability": float(availability),
-                "loss_factor": float(loss_factor),
-            }
-        )
-        scenario = st.selectbox(
-            "Feedstock sourcing scenario",
-            FEEDSTOCK_SCENARIOS,
-            index=FEEDSTOCK_SCENARIOS.index(production_cfg.get("feedstock_scenario", "HYBRID")),
-        )
-        production_cfg["feedstock_scenario"] = scenario
-        if scenario == "HYBRID":
-            farm_share = st.slider(
-                "Hybrid farm share",
+        with control_tabs[0]:
+            st.markdown("### Projection horizon")
+            start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
+            end_year = st.number_input(
+                "End year",
+                value=int(horizon["end_year"]),
+                min_value=int(start_year),
+                step=1,
+            )
+            start_month = st.number_input(
+                "Start month",
+                min_value=1,
+                max_value=12,
+                value=int(horizon.get("start_month", 1)),
+            )
+            horizon.update(
+                {
+                    "start_year": int(start_year),
+                    "end_year": int(end_year),
+                    "start_month": int(start_month),
+                }
+            )
+            st.markdown("### Production horizon")
+            prod_start_year = st.number_input(
+                "Production start year",
+                value=int(production_horizon.get("start_year", start_year)),
+                min_value=int(start_year),
+                step=1,
+            )
+            prod_end_year = st.number_input(
+                "Production end year",
+                value=int(production_horizon.get("end_year", end_year)),
+                min_value=int(prod_start_year),
+                max_value=int(end_year),
+                step=1,
+            )
+            production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
+            cfg["production_horizon"] = production_horizon
+            st.caption("Production volumes are set to zero outside the defined production horizon.")
+            try:
+                tables.set_table("projection_horizon", pd.DataFrame([horizon]))
+                tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
+            except Exception as exc:
+                st.warning(f"Projection inputs not saved due to validation error: {exc}")
+
+        global_inputs = cfg["global_inputs"]
+        with control_tabs[1]:
+            st.markdown("### Financial assumptions")
+            discount_rate = st.number_input(
+                "Discount rate (WACC)",
                 min_value=0.0,
                 max_value=1.0,
-                value=float(production_cfg.get("farm_share", 0.5)),
-                step=0.05,
-            )
-            production_cfg["farm_share"] = float(farm_share)
-
-    pricing_cfg = cfg.setdefault("prices", {})
-    with control_tabs[3]:
-        st.markdown("### Product pricing")
-        for product in PRODUCTS:
-            params = pricing_cfg.setdefault(product, {})
-            base_price = st.number_input(
-                f"{product.replace('_', ' ').title()} base price",
-                min_value=0.0,
-                value=float(params.get("base_price", 0.0 if product != "ethanol" else 0.7)),
-                step=1.0 if product != "ethanol" else 0.05,
-                format="%.4f",
-            )
-            escalation = st.number_input(
-                f"{product.replace('_', ' ').title()} price escalation (pa)",
-                min_value=0.0,
-                max_value=0.3,
-                value=float(params.get("price_escalation_pa", 0.02)),
+                value=float(global_inputs.get("discount_rate", 0.12)),
                 step=0.005,
                 format="%.4f",
             )
-            params.update({"base_price": float(base_price), "price_escalation_pa": float(escalation)})
-        revenue_table = tables.ensure_table("revenue_params").copy()
-        if revenue_table.empty:
-            revenue_table = pd.DataFrame(columns=list(INPUT_SCHEMAS["revenue_params"].columns.keys()))
-        for product in PRODUCTS:
-            params = pricing_cfg.get(product, {})
-            mask = (
-                revenue_table["product"].astype(str).str.lower() == product
-                if "product" in revenue_table
-                else pd.Series(dtype=bool)
+            corp_tax = st.number_input(
+                "Corporate tax rate",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(global_inputs.get("corp_tax_rate", 0.28)),
+                step=0.01,
+                format="%.4f",
             )
-            updated = {
-                "product": product,
-                "base_price": params.get("base_price", np.nan),
-                "price_escalation_pa": params.get("price_escalation_pa", np.nan),
-                "price_indexation": params.get("price_indexation", "cpi"),
-                "uom": params.get("uom", ""),
-                "tariff_structure": params.get("tariff_structure", ""),
-                "revenue_share": params.get("revenue_share", 1.0),
-            }
-            if mask.any():
-                for key, value in updated.items():
-                    revenue_table.loc[mask, key] = value
-            else:
-                revenue_table = pd.concat([revenue_table, pd.DataFrame([updated])], ignore_index=True)
-        try:
-            tables.set_table("revenue_params", revenue_table)
-        except Exception as exc:
-            st.warning(f"Pricing table not saved due to validation error: {exc}")
-    with control_tabs[4]:
-        st.markdown("### Risk and scenario options")
-        run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
-        run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
-        run_scenario_analysis = st.checkbox("Run scenario comparison", value=True)
+            investor_share = st.slider(
+                "Investor equity share",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(global_inputs.get("investor_share", 0.6)),
+                step=0.05,
+            )
+            global_inputs.update(
+                {
+                    "discount_rate": float(discount_rate),
+                    "corp_tax_rate": float(corp_tax),
+                    "investor_share": float(investor_share),
+                    "owner_share": float(1.0 - investor_share),
+                }
+            )
+            st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
+            try:
+                tables.set_table("global_inputs", pd.DataFrame([global_inputs]))
+                tables.set_table("working_capital_days", pd.DataFrame([cfg["working_capital"]]))
+            except Exception as exc:
+                st.warning(f"Global inputs not saved due to validation error: {exc}")
 
-        monte_iterations = 1000
-        monte_seed = 42
-        if run_monte_carlo:
-            monte_iterations = st.slider("Monte Carlo iterations", min_value=200, max_value=5000, value=1000, step=100)
-            monte_seed = st.number_input("Monte Carlo random seed", value=42, step=1)
+        production_cfg = cfg.setdefault("production", {})
+        with control_tabs[2]:
+            st.markdown("### Production assumptions")
+            feedstock = st.number_input(
+                "Annual feedstock (t)",
+                min_value=0.0,
+                value=float(production_cfg.get("annual_feedstock_ton", 100_000.0)),
+                step=10_000.0,
+                format="%.0f",
+            )
+            availability = st.slider(
+                "Plant availability",
+                min_value=0.5,
+                max_value=1.0,
+                value=float(production_cfg.get("plant_availability", 0.9)),
+                step=0.01,
+            )
+            loss_factor = st.slider(
+                "Process loss factor",
+                min_value=0.0,
+                max_value=0.2,
+                value=float(production_cfg.get("loss_factor", 0.02)),
+                step=0.005,
+            )
+            production_cfg.update(
+                {
+                    "annual_feedstock_ton": float(feedstock),
+                    "plant_availability": float(availability),
+                    "loss_factor": float(loss_factor),
+                }
+            )
+            scenario = st.selectbox(
+                "Feedstock sourcing scenario",
+                FEEDSTOCK_SCENARIOS,
+                index=FEEDSTOCK_SCENARIOS.index(production_cfg.get("feedstock_scenario", "HYBRID")),
+            )
+            production_cfg["feedstock_scenario"] = scenario
+            if scenario == "HYBRID":
+                farm_share = st.slider(
+                    "Hybrid farm share",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(production_cfg.get("farm_share", 0.5)),
+                    step=0.05,
+                )
+                production_cfg["farm_share"] = float(farm_share)
+
+        pricing_cfg = cfg.setdefault("prices", {})
+        with control_tabs[3]:
+            st.markdown("### Product pricing")
+            for product in PRODUCTS:
+                params = pricing_cfg.setdefault(product, {})
+                base_price = st.number_input(
+                    f"{product.replace('_', ' ').title()} base price",
+                    min_value=0.0,
+                    value=float(params.get("base_price", 0.0 if product != "ethanol" else 0.7)),
+                    step=1.0 if product != "ethanol" else 0.05,
+                    format="%.4f",
+                )
+                escalation = st.number_input(
+                    f"{product.replace('_', ' ').title()} price escalation (pa)",
+                    min_value=0.0,
+                    max_value=0.3,
+                    value=float(params.get("price_escalation_pa", 0.02)),
+                    step=0.005,
+                    format="%.4f",
+                )
+                params.update({"base_price": float(base_price), "price_escalation_pa": float(escalation)})
+            revenue_table = tables.ensure_table("revenue_params").copy()
+            if revenue_table.empty:
+                revenue_table = pd.DataFrame(
+                    columns=list(INPUT_SCHEMAS["revenue_params"].columns.keys())
+                )
+            for product in PRODUCTS:
+                params = pricing_cfg.get(product, {})
+                mask = (
+                    revenue_table["product"].astype(str).str.lower() == product
+                    if "product" in revenue_table
+                    else pd.Series(dtype=bool)
+                )
+                updated = {
+                    "product": product,
+                    "base_price": params.get("base_price", np.nan),
+                    "price_escalation_pa": params.get("price_escalation_pa", np.nan),
+                    "price_indexation": params.get("price_indexation", "cpi"),
+                    "uom": params.get("uom", ""),
+                    "tariff_structure": params.get("tariff_structure", ""),
+                    "revenue_share": params.get("revenue_share", 1.0),
+                }
+                if mask.any():
+                    for key, value in updated.items():
+                        revenue_table.loc[mask, key] = value
+                else:
+                    revenue_table = pd.concat(
+                        [revenue_table, pd.DataFrame([updated])],
+                        ignore_index=True,
+                    )
+            try:
+                tables.set_table("revenue_params", revenue_table)
+            except Exception as exc:
+                st.warning(f"Pricing table not saved due to validation error: {exc}")
+
+        with control_tabs[4]:
+            st.markdown("### Risk and scenario options")
+            run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
+            run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
+            run_scenario_analysis = st.checkbox("Run scenario comparison", value=True)
+
+            monte_iterations = 1000
+            monte_seed = 42
+            if run_monte_carlo:
+                monte_iterations = st.slider(
+                    "Monte Carlo iterations",
+                    min_value=200,
+                    max_value=5000,
+                    value=1000,
+                    step=100,
+                )
+                monte_seed = st.number_input("Monte Carlo random seed", value=42, step=1)
 
     with st.spinner("Running base model..."):
         try:
@@ -715,135 +766,124 @@ def main() -> None:
         ("DSCR_avg", "Avg DSCR", "ratio"),
     ]
 
-    with page_tabs_container:
-        landing_tab, summary_tab, financial_tab, production_tab, sensitivity_tab, scenario_tab = st.tabs(
-            [
-                "Input & Assumptions",
-                "Summary",
-                "Financial Statements",
-                "Production & Pricing",
-                "Sensitivities",
-                "Scenarios",
-            ]
+
+    with landing_tab:
+        st.subheader("Input & assumptions tables")
+        st.markdown(
+            "Review, add, or remove records from each canonical input table. Updates apply across the model "
+            "on the next run."
         )
+        if sync_errors:
+            for table_name, message in sync_errors.items():
+                st.error(f"{table_name}: {message}")
+        for label, table_name, description in LANDING_TABLES:
+            _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
 
-        with landing_tab:
-            st.subheader("Input & assumptions tables")
-            st.markdown(
-                "Review, add, or remove records from each canonical input table. Updates apply across the model "
-                "on the next run."
+    with summary_tab:
+        st.subheader("Headline metrics")
+        for idx in range(0, len(metric_items), 3):
+            cols = st.columns(3)
+            for col, (key, label, kind) in zip(cols, metric_items[idx: idx + 3]):
+                col.metric(label, _format_metric(metrics.get(key), kind))
+        st.subheader("Assumptions snapshot")
+        st.dataframe(dashboard["assumptions_snapshot"], use_container_width=True)
+        st.subheader("Global block")
+        st.dataframe(dashboard["global_block"], use_container_width=True)
+        latest = dashboard.get("latest_drivers", {})
+        if latest:
+            st.subheader("Latest drivers")
+            latest_df = pd.DataFrame([latest])
+            st.dataframe(latest_df, use_container_width=True)
+        annual_prod = dashboard.get("annual_production")
+        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
+            st.subheader("Annual production by product")
+            prod_chart = annual_prod.set_index("year")
+            st.bar_chart(prod_chart)
+        annual_cashflow = dashboard.get("annual_cashflow")
+        if isinstance(annual_cashflow, pd.DataFrame) and not annual_cashflow.empty:
+            st.subheader("Annual cash flows")
+            cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
+            st.bar_chart(cash_chart)
+
+    statement_configs = [
+        ("Income Statement (P&L)", "pnl"),
+        ("Statement of Cash Flows", "cashflow"),
+        ("Statement of Financial Position", "balancesheet"),
+    ]
+    with financial_tab:
+        fs_tabs = st.tabs([label for label, _ in statement_configs])
+        for tab, (label, key) in zip(fs_tabs, statement_configs):
+            with tab:
+                monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
+                annual_df = results["statements_annual"].get(key, pd.DataFrame())
+                safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
+                _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
+                _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
+
+    with production_tab:
+        prod_monthly = results["production_monthly"].copy()
+        prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
+        _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
+        prod_annual_src = results.get("production_annual")
+        if (
+            isinstance(prod_annual_src, pd.DataFrame)
+            and {"year", "product", "volume"}.issubset(prod_annual_src.columns)
+            and not prod_annual_src.empty
+        ):
+            prod_annual = (
+                prod_annual_src.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
+                .reset_index()
+                .fillna(0.0)
             )
-            if sync_errors:
-                for table_name, message in sync_errors.items():
-                    st.error(f"{table_name}: {message}")
-            for label, table_name, description in LANDING_TABLES:
-                _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
+        else:
+            prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
+        _render_dataframe(prod_annual, "Annual production", key="production_annual")
+        price_curves = results["price_curves"].copy()
+        price_curves["date"] = pd.to_datetime(price_curves["date"])
+        _render_dataframe(price_curves, "Price curves", key="price_curves")
+        revenue_df = results["revenue"].copy()
+        revenue_df["date"] = pd.to_datetime(revenue_df["date"])
+        _render_dataframe(revenue_df, "Revenue stack", key="revenue")
 
-        with summary_tab:
-            st.subheader("Headline metrics")
-            for idx in range(0, len(metric_items), 3):
-                cols = st.columns(3)
-                for col, (key, label, kind) in zip(cols, metric_items[idx: idx + 3]):
-                    col.metric(label, _format_metric(metrics.get(key), kind))
-            st.subheader("Assumptions snapshot")
-            st.dataframe(dashboard["assumptions_snapshot"], use_container_width=True)
-            st.subheader("Global block")
-            st.dataframe(dashboard["global_block"], use_container_width=True)
-            latest = dashboard.get("latest_drivers", {})
-            if latest:
-                st.subheader("Latest drivers")
-                latest_df = pd.DataFrame([latest])
-                st.dataframe(latest_df, use_container_width=True)
-            annual_prod = dashboard.get("annual_production")
-            if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
-                st.subheader("Annual production by product")
-                prod_chart = annual_prod.set_index("year")
-                st.bar_chart(prod_chart)
-            annual_cashflow = dashboard.get("annual_cashflow")
-            if isinstance(annual_cashflow, pd.DataFrame) and not annual_cashflow.empty:
-                st.subheader("Annual cash flows")
-                cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
-                st.bar_chart(cash_chart)
+    with sensitivity_tab:
+        if run_tornado:
+            with st.spinner("Calculating sensitivity tornado..."):
+                tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
+            _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
+        else:
+            st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
 
-        statement_configs = [
-            ("Income Statement (P&L)", "pnl"),
-            ("Statement of Cash Flows", "cashflow"),
-            ("Statement of Financial Position", "balancesheet"),
-        ]
-        with financial_tab:
-            fs_tabs = st.tabs([label for label, _ in statement_configs])
-            for tab, (label, key) in zip(fs_tabs, statement_configs):
-                with tab:
-                    monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
-                    annual_df = results["statements_annual"].get(key, pd.DataFrame())
-                    safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
-                    _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
-                    _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
-
-        with production_tab:
-            prod_monthly = results["production_monthly"].copy()
-            prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
-            _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
-            prod_annual_src = results.get("production_annual")
-            if (
-                isinstance(prod_annual_src, pd.DataFrame)
-                and {"year", "product", "volume"}.issubset(prod_annual_src.columns)
-                and not prod_annual_src.empty
-            ):
-                prod_annual = (
-                    prod_annual_src.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
-                    .reset_index()
-                    .fillna(0.0)
+        if run_monte_carlo:
+            with st.spinner("Running Monte Carlo simulation..."):
+                monte_results = monte_carlo(
+                    cfg,
+                    lambda c: run_full_model(c),
+                    iterations=int(monte_iterations),
+                    random_seed=int(monte_seed),
                 )
-            else:
-                prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
-            _render_dataframe(prod_annual, "Annual production", key="production_annual")
-            price_curves = results["price_curves"].copy()
-            price_curves["date"] = pd.to_datetime(price_curves["date"])
-            _render_dataframe(price_curves, "Price curves", key="price_curves")
-            revenue_df = results["revenue"].copy()
-            revenue_df["date"] = pd.to_datetime(revenue_df["date"])
-            _render_dataframe(revenue_df, "Revenue stack", key="revenue")
+            _render_dataframe(
+                monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}),
+                "Monte Carlo percentiles",
+                key="monte_percentiles",
+            )
+            _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+        else:
+            st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
 
-        with sensitivity_tab:
-            if run_tornado:
-                with st.spinner("Calculating sensitivity tornado..."):
-                    tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
-                _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
-            else:
-                st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
-
-            if run_monte_carlo:
-                with st.spinner("Running Monte Carlo simulation..."):
-                    monte_results = monte_carlo(
-                        cfg,
-                        lambda c: run_full_model(c),
-                        iterations=int(monte_iterations),
-                        random_seed=int(monte_seed),
-                    )
-                _render_dataframe(
-                    monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}),
-                    "Monte Carlo percentiles",
-                    key="monte_percentiles",
-                )
-                _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
-            else:
-                st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
-
-        with scenario_tab:
-            if run_scenario_analysis:
-                scenarios = {
-                    "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
-                    "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
-                    "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
-                }
-                with st.spinner("Evaluating scenarios..."):
-                    scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
-                base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
-                scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-                _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
-            else:
-                st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
+    with scenario_tab:
+        if run_scenario_analysis:
+            scenarios = {
+                "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
+                "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
+                "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
+            }
+            with st.spinner("Evaluating scenarios..."):
+                scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
+            base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
+            scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+            _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+        else:
+            st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
 
     st.success("Model run complete.")
 
