@@ -109,7 +109,9 @@ def main() -> None:
     try:
         if _streamlit_runtime_exists():
             st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
-    except (StreamlitAPIException, RuntimeError):  # pragma: no cover - defensive guard
+    except (StreamlitAPIException, RuntimeError, Exception):  # pragma: no cover - defensive guard
+        # Some Streamlit versions raise a generic Exception when page config is invoked
+        # outside a live runtime; swallow and continue so local execution still works.
         pass
 
     if MODEL_IMPORT_ERROR is not None:
