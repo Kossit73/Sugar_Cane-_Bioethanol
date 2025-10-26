@@ -440,40 +440,40 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        html, body {
+        html, body, .stApp {
             margin: 0 !important;
             padding: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        .stApp {
-            margin: 0 !important;
-            padding: 0 !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
+            overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
             padding: 0 !important;
             margin: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
         }
         [data-testid="stAppViewContainer"] > .main {
             padding: 0 !important;
             margin: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
         }
-        [data-testid="stAppViewContainer"] > .main > div,
-        [data-testid="stAppViewContainer"] .main .block-container {
+        [data-testid="stAppViewContainer"] .main .block-container,
+        .block-container {
             padding: 0 !important;
             margin: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
         }
-        [data-testid="stVerticalBlock"] {
+        [data-testid="stVerticalBlock"],
+        [data-testid="stHorizontalBlock"] {
             padding-left: 0 !important;
             padding-right: 0 !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
+            width: 100vw !important;
+            max-width: 100vw !important;
         }
         </style>
         """,
