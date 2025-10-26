@@ -450,15 +450,30 @@ def main() -> None:
             margin: 0 !important;
             padding: 0 !important;
         }
-        [data-testid="stAppViewContainer"],
-        [data-testid="stAppViewContainer"] .main,
+        [data-testid="stAppViewContainer"] {
+            padding: 0 !important;
+            margin: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+        }
+        [data-testid="stAppViewContainer"] > .main {
+            padding: 0 !important;
+            margin: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+        }
+        [data-testid="stAppViewContainer"] > .main > div,
         [data-testid="stAppViewContainer"] .main .block-container {
+            padding: 0 !important;
+            margin: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+        }
+        [data-testid="stVerticalBlock"] {
             padding-left: 0 !important;
             padding-right: 0 !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
         }
         </style>
         """,
