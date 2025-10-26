@@ -1,8 +1,8 @@
 """Streamlit front-end for the Sugar Cane Bioethanol multi-product finance model.
 
-This app wraps the `model.py` engine and exposes interactive controls for loading
-assumption workbooks, adjusting key drivers, and reviewing the resulting
-financial outputs, dashboards, sensitivities, and scenarios.
+This app wraps the `model.py` engine and exposes interactive controls for
+adjusting key drivers and reviewing the resulting financial outputs, dashboards,
+sensitivities, and scenarios.
 
 Run with:
     streamlit run streamlit_app.py
@@ -10,11 +10,8 @@ Run with:
 
 from __future__ import annotations
 
-import io
 import math
 import sys
-import tempfile
-from pathlib import Path
 from typing import Dict
 
 import pandas as pd
@@ -44,7 +41,6 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         PRODUCTS,
         InputTables,
         build_config,
-        load_inputs_from_excel,
         monte_carlo,
         run_full_model,
         run_scenarios,
@@ -52,25 +48,6 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
     MODEL_IMPORT_ERROR = exc
-
-
-def _load_tables_from_upload(uploaded_file: io.BytesIO | None) -> tuple[InputTables, Dict[str, object]]:
-    """Persist an uploaded Excel file temporarily and load it via the model helpers."""
-    if uploaded_file is None:
-        return InputTables(), {}
-
-    suffix = Path(uploaded_file.name).suffix or ".xlsx"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        tmp_path = Path(tmp.name)
-    try:
-        tables, assumptions = load_inputs_from_excel(tmp_path, preview=0)
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:  # pragma: no cover - best effort cleanup
-            pass
-    return tables, assumptions
 
 
 def _format_metric(value: object, kind: str = "number") -> str:
@@ -126,17 +103,15 @@ def main() -> None:
     st.title("Sugarcane Bioethanol Project Finance Model")
     st.markdown(
         "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
-        "electricity, and animal feed project finance model. Upload an Excel "
-        "assumptions workbook or rely on defaults, tweak critical drivers in the "
-        "control tabs above, and review the resulting statements, dashboards, sensitivities, "
-        "and scenarios."
+        "electricity, and animal feed project finance model. Adjust critical drivers "
+        "in the control tabs above and review the resulting statements, dashboards, "
+        "sensitivities, and scenarios."
     )
 
     st.subheader("Model Controls")
 
     control_tabs = st.tabs(
         [
-            "Workbook",
             "Projection",
             "Financial",
             "Production",
@@ -145,20 +120,12 @@ def main() -> None:
         ]
     )
 
-    uploaded_file: io.BytesIO | None = None
-    with control_tabs[0]:
-        uploaded_file = st.file_uploader(
-            "Upload assumptions workbook",
-            type=["xlsx", "xlsm", "xls"],
-            key="workbook",
-            help="Drop your Excel assumptions workbook here to override defaults.",
-        )
-
-    tables, assumptions = _load_tables_from_upload(uploaded_file)
+    tables = InputTables()
+    assumptions: Dict[str, object] = {}
     cfg = build_config(assumptions, tables)
 
     horizon = cfg["projection_horizon"]
-    with control_tabs[1]:
+    with control_tabs[0]:
         st.markdown("### Projection horizon")
         start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
         end_year = st.number_input("End year", value=int(horizon["end_year"]), min_value=int(start_year), step=1)
@@ -166,7 +133,7 @@ def main() -> None:
         horizon.update({"start_year": int(start_year), "end_year": int(end_year), "start_month": int(start_month)})
 
     global_inputs = cfg["global_inputs"]
-    with control_tabs[2]:
+    with control_tabs[1]:
         st.markdown("### Financial assumptions")
         discount_rate = st.number_input(
             "Discount rate (WACC)",
@@ -202,7 +169,7 @@ def main() -> None:
         st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
 
     production_cfg = cfg.setdefault("production", {})
-    with control_tabs[3]:
+    with control_tabs[2]:
         st.markdown("### Production assumptions")
         feedstock = st.number_input(
             "Annual feedstock (t)",
@@ -249,7 +216,7 @@ def main() -> None:
             production_cfg["farm_share"] = float(farm_share)
 
     pricing_cfg = cfg.setdefault("prices", {})
-    with control_tabs[4]:
+    with control_tabs[3]:
         st.markdown("### Product pricing")
         for product in PRODUCTS:
             params = pricing_cfg.setdefault(product, {})
@@ -269,7 +236,7 @@ def main() -> None:
                 format="%.4f",
             )
             params.update({"base_price": float(base_price), "price_escalation_pa": float(escalation)})
-    with control_tabs[5]:
+    with control_tabs[4]:
         st.markdown("### Risk and scenario options")
         run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
         run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
