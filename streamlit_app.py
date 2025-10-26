@@ -344,12 +344,24 @@ def main() -> None:
         prices_cfg = cfg_display.get("prices", {})
         pricing_df = pd.DataFrame.from_dict(prices_cfg, orient="index").reset_index().rename(columns={"index": "product"})
 
-        production_annual_df = results["production_annual"].pivot_table(
-            index="year",
-            columns="product",
-            values="volume",
-            aggfunc="sum",
-        ).reset_index().fillna(0.0)
+        production_annual_base = results.get("production_annual")
+        if (
+            isinstance(production_annual_base, pd.DataFrame)
+            and {"year", "product", "volume"}.issubset(production_annual_base.columns)
+            and not production_annual_base.empty
+        ):
+            production_annual_df = (
+                production_annual_base.pivot_table(
+                    index="year",
+                    columns="product",
+                    values="volume",
+                    aggfunc="sum",
+                )
+                .reset_index()
+                .fillna(0.0)
+            )
+        else:
+            production_annual_df = pd.DataFrame(columns=["year", *PRODUCTS])
 
         opex_cfg = cfg_display.get("opex", {})
         opex_rows = []
@@ -419,8 +431,19 @@ def main() -> None:
         prod_monthly = results["production_monthly"].copy()
         prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
         _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
-        prod_annual = results["production_annual"].pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
-        prod_annual = prod_annual.reset_index().fillna(0.0)
+        prod_annual_src = results.get("production_annual")
+        if (
+            isinstance(prod_annual_src, pd.DataFrame)
+            and {"year", "product", "volume"}.issubset(prod_annual_src.columns)
+            and not prod_annual_src.empty
+        ):
+            prod_annual = (
+                prod_annual_src.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
+                .reset_index()
+                .fillna(0.0)
+            )
+        else:
+            prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
         _render_dataframe(prod_annual, "Annual production", key="production_annual")
         price_curves = results["price_curves"].copy()
         price_curves["date"] = pd.to_datetime(price_curves["date"])
