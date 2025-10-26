@@ -497,6 +497,8 @@ def main() -> None:
         "sensitivities, and scenarios."
     )
 
+    page_tabs_container = st.container()
+
     st.subheader("Model Controls")
 
     control_tabs = st.tabs(
@@ -713,125 +715,135 @@ def main() -> None:
         ("DSCR_avg", "Avg DSCR", "ratio"),
     ]
 
-    landing_tab, summary_tab, financial_tab, production_tab, sensitivity_tab, scenario_tab = st.tabs(
-        [
-            "Input & Assumptions",
-            "Summary",
-            "Financial Statements",
-            "Production & Pricing",
-            "Sensitivities",
-            "Scenarios",
-        ]
-    )
-
-    with landing_tab:
-        st.subheader("Input & assumptions tables")
-        st.markdown(
-            "Review, add, or remove records from each canonical input table. Updates apply across the model "
-            "on the next run."
+    with page_tabs_container:
+        landing_tab, summary_tab, financial_tab, production_tab, sensitivity_tab, scenario_tab = st.tabs(
+            [
+                "Input & Assumptions",
+                "Summary",
+                "Financial Statements",
+                "Production & Pricing",
+                "Sensitivities",
+                "Scenarios",
+            ]
         )
-        if sync_errors:
-            for table_name, message in sync_errors.items():
-                st.error(f"{table_name}: {message}")
-        for label, table_name, description in LANDING_TABLES:
-            _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
 
-    with summary_tab:
-        st.subheader("Headline metrics")
-        for idx in range(0, len(metric_items), 3):
-            cols = st.columns(3)
-            for col, (key, label, kind) in zip(cols, metric_items[idx: idx + 3]):
-                col.metric(label, _format_metric(metrics.get(key), kind))
-        st.subheader("Assumptions snapshot")
-        st.dataframe(dashboard["assumptions_snapshot"], use_container_width=True)
-        st.subheader("Global block")
-        st.dataframe(dashboard["global_block"], use_container_width=True)
-        latest = dashboard.get("latest_drivers", {})
-        if latest:
-            st.subheader("Latest drivers")
-            latest_df = pd.DataFrame([latest])
-            st.dataframe(latest_df, use_container_width=True)
-        annual_prod = dashboard.get("annual_production")
-        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
-            st.subheader("Annual production by product")
-            prod_chart = annual_prod.set_index("year")
-            st.bar_chart(prod_chart)
-        annual_cashflow = dashboard.get("annual_cashflow")
-        if isinstance(annual_cashflow, pd.DataFrame) and not annual_cashflow.empty:
-            st.subheader("Annual cash flows")
-            cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
-            st.bar_chart(cash_chart)
-
-    statement_configs = [
-        ("Income Statement (P&L)", "pnl"),
-        ("Statement of Cash Flows", "cashflow"),
-        ("Statement of Financial Position", "balancesheet"),
-    ]
-    with financial_tab:
-        fs_tabs = st.tabs([label for label, _ in statement_configs])
-        for tab, (label, key) in zip(fs_tabs, statement_configs):
-            with tab:
-                monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
-                annual_df = results["statements_annual"].get(key, pd.DataFrame())
-                safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
-                _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
-                _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
-
-    with production_tab:
-        prod_monthly = results["production_monthly"].copy()
-        prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
-        _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
-        prod_annual_src = results.get("production_annual")
-        if (
-            isinstance(prod_annual_src, pd.DataFrame)
-            and {"year", "product", "volume"}.issubset(prod_annual_src.columns)
-            and not prod_annual_src.empty
-        ):
-            prod_annual = (
-                prod_annual_src.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
-                .reset_index()
-                .fillna(0.0)
+        with landing_tab:
+            st.subheader("Input & assumptions tables")
+            st.markdown(
+                "Review, add, or remove records from each canonical input table. Updates apply across the model "
+                "on the next run."
             )
-        else:
-            prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
-        _render_dataframe(prod_annual, "Annual production", key="production_annual")
-        price_curves = results["price_curves"].copy()
-        price_curves["date"] = pd.to_datetime(price_curves["date"])
-        _render_dataframe(price_curves, "Price curves", key="price_curves")
-        revenue_df = results["revenue"].copy()
-        revenue_df["date"] = pd.to_datetime(revenue_df["date"])
-        _render_dataframe(revenue_df, "Revenue stack", key="revenue")
+            if sync_errors:
+                for table_name, message in sync_errors.items():
+                    st.error(f"{table_name}: {message}")
+            for label, table_name, description in LANDING_TABLES:
+                _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
 
-    with sensitivity_tab:
-        if run_tornado:
-            with st.spinner("Calculating sensitivity tornado..."):
-                tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
-            _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
-        else:
-            st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
+        with summary_tab:
+            st.subheader("Headline metrics")
+            for idx in range(0, len(metric_items), 3):
+                cols = st.columns(3)
+                for col, (key, label, kind) in zip(cols, metric_items[idx: idx + 3]):
+                    col.metric(label, _format_metric(metrics.get(key), kind))
+            st.subheader("Assumptions snapshot")
+            st.dataframe(dashboard["assumptions_snapshot"], use_container_width=True)
+            st.subheader("Global block")
+            st.dataframe(dashboard["global_block"], use_container_width=True)
+            latest = dashboard.get("latest_drivers", {})
+            if latest:
+                st.subheader("Latest drivers")
+                latest_df = pd.DataFrame([latest])
+                st.dataframe(latest_df, use_container_width=True)
+            annual_prod = dashboard.get("annual_production")
+            if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
+                st.subheader("Annual production by product")
+                prod_chart = annual_prod.set_index("year")
+                st.bar_chart(prod_chart)
+            annual_cashflow = dashboard.get("annual_cashflow")
+            if isinstance(annual_cashflow, pd.DataFrame) and not annual_cashflow.empty:
+                st.subheader("Annual cash flows")
+                cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
+                st.bar_chart(cash_chart)
 
-        if run_monte_carlo:
-            with st.spinner("Running Monte Carlo simulation..."):
-                monte_results = monte_carlo(cfg, lambda c: run_full_model(c), iterations=int(monte_iterations), random_seed=int(monte_seed))
-            _render_dataframe(monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}), "Monte Carlo percentiles", key="monte_percentiles")
-            _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
-        else:
-            st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
+        statement_configs = [
+            ("Income Statement (P&L)", "pnl"),
+            ("Statement of Cash Flows", "cashflow"),
+            ("Statement of Financial Position", "balancesheet"),
+        ]
+        with financial_tab:
+            fs_tabs = st.tabs([label for label, _ in statement_configs])
+            for tab, (label, key) in zip(fs_tabs, statement_configs):
+                with tab:
+                    monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
+                    annual_df = results["statements_annual"].get(key, pd.DataFrame())
+                    safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
+                    _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
+                    _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
 
-    with scenario_tab:
-        if run_scenario_analysis:
-            scenarios = {
-                "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
-                "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
-                "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
-            }
-            with st.spinner("Evaluating scenarios..."):
-                scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
-            base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
-            scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-            _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
-        else:
-            st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
+        with production_tab:
+            prod_monthly = results["production_monthly"].copy()
+            prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
+            _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
+            prod_annual_src = results.get("production_annual")
+            if (
+                isinstance(prod_annual_src, pd.DataFrame)
+                and {"year", "product", "volume"}.issubset(prod_annual_src.columns)
+                and not prod_annual_src.empty
+            ):
+                prod_annual = (
+                    prod_annual_src.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
+                    .reset_index()
+                    .fillna(0.0)
+                )
+            else:
+                prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
+            _render_dataframe(prod_annual, "Annual production", key="production_annual")
+            price_curves = results["price_curves"].copy()
+            price_curves["date"] = pd.to_datetime(price_curves["date"])
+            _render_dataframe(price_curves, "Price curves", key="price_curves")
+            revenue_df = results["revenue"].copy()
+            revenue_df["date"] = pd.to_datetime(revenue_df["date"])
+            _render_dataframe(revenue_df, "Revenue stack", key="revenue")
+
+        with sensitivity_tab:
+            if run_tornado:
+                with st.spinner("Calculating sensitivity tornado..."):
+                    tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
+                _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
+            else:
+                st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
+
+            if run_monte_carlo:
+                with st.spinner("Running Monte Carlo simulation..."):
+                    monte_results = monte_carlo(
+                        cfg,
+                        lambda c: run_full_model(c),
+                        iterations=int(monte_iterations),
+                        random_seed=int(monte_seed),
+                    )
+                _render_dataframe(
+                    monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}),
+                    "Monte Carlo percentiles",
+                    key="monte_percentiles",
+                )
+                _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+            else:
+                st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
+
+        with scenario_tab:
+            if run_scenario_analysis:
+                scenarios = {
+                    "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
+                    "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
+                    "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
+                }
+                with st.spinner("Evaluating scenarios..."):
+                    scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
+                base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
+                scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+                _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+            else:
+                st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
 
     st.success("Model run complete.")
 
