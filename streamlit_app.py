@@ -443,28 +443,28 @@ def main() -> None:
         html, body, .stApp {
             margin: 0 !important;
             padding: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            width: 100% !important;
+            max-width: 100% !important;
             overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
-            padding: 0 !important;
+            padding: 0 1.5rem !important;
             margin: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            width: 100% !important;
+            max-width: 100% !important;
         }
         [data-testid="stAppViewContainer"] > .main {
             padding: 0 !important;
-            margin: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            margin: 0 auto !important;
+            width: 100% !important;
+            max-width: 100% !important;
         }
         [data-testid="stAppViewContainer"] .main .block-container,
         .block-container {
-            padding: 0 !important;
-            margin: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            padding: 0 1.5rem !important;
+            margin: 0 auto !important;
+            width: 100% !important;
+            max-width: calc(100vw - 3rem) !important;
         }
         [data-testid="stVerticalBlock"],
         [data-testid="stHorizontalBlock"] {
@@ -472,8 +472,8 @@ def main() -> None:
             padding-right: 0 !important;
             margin-left: 0 !important;
             margin-right: 0 !important;
-            width: 100vw !important;
-            max-width: 100vw !important;
+            width: 100% !important;
+            max-width: 100% !important;
         }
         </style>
         """,
