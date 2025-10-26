@@ -1181,6 +1181,7 @@ def aggregate_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
     df = monthly_df.copy()
     df["year"] = df["date"].dt.year
     numeric_cols = df.select_dtypes(include=[float, int, np.number]).columns
+    numeric_cols = [col for col in numeric_cols if col != "year"]
     agg_df = df.groupby("year")[numeric_cols].sum().reset_index()
     return agg_df
 ###############################################################################
