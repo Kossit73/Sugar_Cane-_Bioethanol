@@ -335,6 +335,10 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             else None,
         ],
     ),
+    "working_capital_days": TableSchema(
+        columns={"dso_days": "float", "dio_days": "float", "dpo_days": "float"},
+        defaults={**DEFAULTS["working_capital"]},
+    ),
     "capex_lines": TableSchema(
         columns={
             "item_name": "str",
@@ -478,6 +482,44 @@ class InputTables:
         if schema.derived is not None:
             self.tables[table_name] = schema.derived(self.tables[table_name])
 
+    def set_table(self, table_name: str, df: pd.DataFrame) -> None:
+        if table_name not in INPUT_SCHEMAS:
+            raise KeyError(f"Unknown table '{table_name}'")
+        schema = INPUT_SCHEMAS[table_name]
+        df_copy = pd.DataFrame(df).copy()
+        if df_copy.empty:
+            self.tables[table_name] = pd.DataFrame(columns=list(schema.columns.keys()))
+            return
+
+        for col in schema.columns:
+            if col not in df_copy.columns:
+                default_value = schema.defaults.get(col, np.nan)
+                df_copy[col] = default_value
+
+        df_copy = df_copy[list(schema.columns.keys())]
+        df_copy = df_copy.replace({"": np.nan})
+
+        for col, dtype in schema.columns.items():
+            if dtype == "float":
+                df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce")
+            elif dtype == "int":
+                df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce")
+            elif dtype == "bool":
+                df_copy[col] = df_copy[col].fillna(schema.defaults.get(col, False)).astype(bool)
+            elif dtype == "str":
+                df_copy[col] = df_copy[col].astype(str).where(df_copy[col].notna(), None)
+
+        df_copy = df_copy.dropna(how="all").reset_index(drop=True)
+
+        for _, row in df_copy.iterrows():
+            for validator in schema.validators:
+                validator(row)
+
+        if schema.derived is not None and not df_copy.empty:
+            df_copy = schema.derived(df_copy)
+
+        self.tables[table_name] = df_copy.reset_index(drop=True)
+
     def remove_row(self, table_name: str, row_id: int) -> None:
         df = self.ensure_table(table_name)
         if not 0 <= row_id < len(df):
@@ -497,21 +539,21 @@ class InputTables:
             if best_match:
                 df_raw = sheets[best_match]
                 df_norm = pd.DataFrame()
-                for col, dtype in schema.columns.items():
+                for col in schema.columns.keys():
                     matches = [c for c in df_raw.columns if normalize_key(c) == col]
                     if matches:
                         df_norm[col] = df_raw[matches[0]]
-                    else:
-                        df_norm[col] = schema.defaults.get(col, np.nan)
-                    if dtype == "float":
-                        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce")
-                    elif dtype == "int":
-                        df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce").astype(float)
-                    elif dtype == "bool":
-                        df_norm[col] = df_norm[col].astype(bool)
-                self.tables[table_name] = df_norm.dropna(how="all")
-                if schema.derived is not None and not self.tables[table_name].empty:
-                    self.tables[table_name] = schema.derived(self.tables[table_name])
+                try:
+                    self.set_table(table_name, df_norm)
+                except Exception:
+                    # fall back to raw dropna if validation fails; retain best effort load
+                    df_basic = df_norm.copy()
+                    for col in schema.columns.keys():
+                        if col not in df_basic.columns:
+                            df_basic[col] = schema.defaults.get(col, np.nan)
+                    self.tables[table_name] = df_basic.dropna(how="all").reset_index(drop=True)
+                    if schema.derived is not None and not self.tables[table_name].empty:
+                        self.tables[table_name] = schema.derived(self.tables[table_name])
 ###############################################################################
 # Section 4: Configuration builder
 ###############################################################################
@@ -604,10 +646,40 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
                 else:
                     cfg["global_inputs"][key] = float(val)
 
+    tables.ensure_table("working_capital_days")
+    if not tables.tables["working_capital_days"].empty:
+        wc_row = tables.tables["working_capital_days"].iloc[0]
+        for key in cfg["working_capital"].keys():
+            val = wc_row.get(key)
+            if pd.notna(val):
+                cfg["working_capital"][key] = float(val)
+
     for table_name in ("revenue_params", "production_annual", "production_monthly", "direct_costs_monthly", "staff_costs_monthly", "other_opex_monthly", "ar_other_assets", "inventory_ap", "debt_tranches", "tax_schedule", "inflation_index", "risk_params", "capex_lines"):
         df = tables.ensure_table(table_name)
         if not df.empty:
             cfg[table_name] = df.copy().reset_index(drop=True)
+
+    revenue_table = tables.ensure_table("revenue_params")
+    if not revenue_table.empty:
+        for _, row in revenue_table.iterrows():
+            product = str(row.get("product", "")).strip().lower()
+            if not product:
+                continue
+            if product not in PRODUCTS:
+                continue
+            params = cfg["prices"].setdefault(product, dict(DEFAULTS["prices"][product]))
+            if pd.notna(row.get("base_price")):
+                params["base_price"] = float(row["base_price"])
+            if pd.notna(row.get("price_escalation_pa")):
+                params["price_escalation_pa"] = float(row["price_escalation_pa"])
+            if isinstance(row.get("price_indexation"), str) and row.get("price_indexation"):
+                params["price_indexation"] = str(row["price_indexation"])
+            if isinstance(row.get("uom"), str) and row.get("uom"):
+                params["uom"] = str(row["uom"])
+            if pd.notna(row.get("revenue_share")):
+                params["revenue_share"] = float(row["revenue_share"])
+            if isinstance(row.get("tariff_structure"), str) and row.get("tariff_structure"):
+                params["tariff_structure"] = str(row["tariff_structure"])
 
     total_share = cfg["global_inputs"]["investor_share"] + cfg["global_inputs"]["owner_share"]
     if not math.isclose(total_share, 1.0, rel_tol=1e-4, abs_tol=1e-4):

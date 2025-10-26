@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
@@ -39,6 +40,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
         DEFAULTS,
         FEEDSTOCK_SCENARIOS,
+        INPUT_SCHEMAS,
         PRODUCTS,
         InputTables,
         build_config,
@@ -84,6 +86,320 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     )
 
 
+def _seed_tables_with_defaults(tables: InputTables) -> None:
+    """Populate session tables with sensible defaults for every schema."""
+    horizon_defaults = dict(DEFAULTS["horizon"])
+    tables.set_table("projection_horizon", pd.DataFrame([horizon_defaults]))
+    tables.set_table("production_horizon", pd.DataFrame([DEFAULTS["production_horizon"]]))
+    tables.set_table("global_inputs", pd.DataFrame([DEFAULTS["global"]]))
+    tables.set_table("working_capital_days", pd.DataFrame([DEFAULTS["working_capital"]]))
+
+    start_year = int(horizon_defaults["start_year"])
+    start_month = int(horizon_defaults.get("start_month", 1))
+
+    capex_rows = [
+        {
+            "item_name": "Land Acquisition",
+            "category": "land",
+            "amount": 5_000_000.0,
+            "currency": "USD",
+            "fx_curve": "",
+            "start_date": f"{start_year}-01",
+            "end_date": f"{start_year}-12",
+            "life_years": 40,
+            "depr_method": "straight",
+            "depr_rate_override": np.nan,
+            "vat_rate": 0.0,
+            "vat_recovery_lag_months": 0,
+            "capitalized": True,
+            "is_farm_capex": True,
+        },
+        {
+            "item_name": "Civil Works",
+            "category": "civil",
+            "amount": 8_500_000.0,
+            "currency": "USD",
+            "fx_curve": "",
+            "start_date": f"{start_year}-01",
+            "end_date": f"{start_year}-12",
+            "life_years": 20,
+            "depr_method": "straight",
+            "depr_rate_override": np.nan,
+            "vat_rate": 0.0,
+            "vat_recovery_lag_months": 0,
+            "capitalized": True,
+            "is_farm_capex": False,
+        },
+        {
+            "item_name": "Process Equipment",
+            "category": "equipment",
+            "amount": 12_500_000.0,
+            "currency": "USD",
+            "fx_curve": "",
+            "start_date": f"{start_year}-01",
+            "end_date": f"{start_year}-12",
+            "life_years": 12,
+            "depr_method": "straight",
+            "depr_rate_override": np.nan,
+            "vat_rate": 0.0,
+            "vat_recovery_lag_months": 0,
+            "capitalized": True,
+            "is_farm_capex": False,
+        },
+        {
+            "item_name": "Farm Machinery",
+            "category": "farm_machinery",
+            "amount": 4_000_000.0,
+            "currency": "USD",
+            "fx_curve": "",
+            "start_date": f"{start_year}-01",
+            "end_date": f"{start_year}-12",
+            "life_years": 10,
+            "depr_method": "straight",
+            "depr_rate_override": np.nan,
+            "vat_rate": 0.0,
+            "vat_recovery_lag_months": 0,
+            "capitalized": True,
+            "is_farm_capex": True,
+        },
+    ]
+    tables.set_table("capex_lines", pd.DataFrame(capex_rows))
+
+    price_rows = []
+    for product, params in DEFAULTS["prices"].items():
+        price_rows.append(
+            {
+                "product": product,
+                "base_price": params.get("base_price", 0.0),
+                "price_escalation_pa": params.get("price_escalation_pa", 0.0),
+                "price_indexation": params.get("price_indexation", "cpi"),
+                "uom": params.get("uom", ""),
+                "tariff_structure": "",
+                "revenue_share": 1.0,
+            }
+        )
+    tables.set_table("revenue_params", pd.DataFrame(price_rows))
+
+    prod_defaults = DEFAULTS["production"]
+    feedstock = prod_defaults["annual_feedstock_ton"]
+    availability = prod_defaults["plant_availability"]
+    loss = prod_defaults["loss_factor"]
+    ramp = "0.7;0.9;1.0"
+
+    production_rows = [
+        {
+            "product": "ethanol",
+            "annual_volume": feedstock * prod_defaults["ethanol_litre_per_ton"] * availability * (1 - loss),
+            "availability": availability,
+            "loss_factor": loss,
+            "startup_ramp": ramp,
+            "boe_conversion": np.nan,
+            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+        },
+        {
+            "product": "sugar",
+            "annual_volume": feedstock * prod_defaults["sugar_ton_per_ton_cane"] * availability * (1 - loss),
+            "availability": availability,
+            "loss_factor": loss,
+            "startup_ramp": ramp,
+            "boe_conversion": np.nan,
+            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+        },
+        {
+            "product": "electricity",
+            "annual_volume": feedstock * prod_defaults["electricity_mwh_per_ton_cane"] * availability * (1 - loss),
+            "availability": availability,
+            "loss_factor": loss,
+            "startup_ramp": ramp,
+            "boe_conversion": np.nan,
+            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+        },
+        {
+            "product": "animal_feed",
+            "annual_volume": feedstock * prod_defaults["animal_feed_ton_per_ton_cane"] * availability * (1 - loss),
+            "availability": availability,
+            "loss_factor": loss,
+            "startup_ramp": ramp,
+            "boe_conversion": np.nan,
+            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+        },
+    ]
+    tables.set_table("production_annual", pd.DataFrame(production_rows))
+
+    first_year_months = pd.date_range(f"{start_year}-{start_month:02d}-01", periods=12, freq="MS")
+    monthly_rows = []
+    for row in production_rows:
+        monthly_volume = float(row["annual_volume"]) / 12.0
+        for date in first_year_months:
+            monthly_rows.append(
+                {
+                    "date": date.strftime("%Y-%m"),
+                    "product": row["product"],
+                    "volume": monthly_volume,
+                    "availability_override": np.nan,
+                    "maintenance_downtime": np.nan,
+                    "loss_override": np.nan,
+                }
+            )
+    tables.set_table("production_monthly", pd.DataFrame(monthly_rows))
+
+    direct_rows = [
+        {
+            "date": f"{start_year}-01",
+            "cost_type": "feedstock purchase",
+            "product_link": "ethanol",
+            "amount": 500_000.0,
+            "currency": "USD",
+        }
+    ]
+    tables.set_table("direct_costs_monthly", pd.DataFrame(direct_rows))
+
+    staff_rows = [
+        {
+            "date": f"{start_year}-01",
+            "dept": "Operations",
+            "headcount": 50,
+            "gross_pay": 150_000.0,
+            "benefits": 25_000.0,
+            "training": 5_000.0,
+            "other": 10_000.0,
+            "currency": "USD",
+        }
+    ]
+    tables.set_table("staff_costs_monthly", pd.DataFrame(staff_rows))
+
+    other_rows = [
+        {"date": f"{start_year}-01", "category": "insurance", "amount": 20_000.0, "currency": "USD"},
+        {"date": f"{start_year}-01", "category": "service_contract", "amount": 35_000.0, "currency": "USD"},
+        {"date": f"{start_year}-01", "category": "general_admin", "amount": 50_000.0, "currency": "USD"},
+        {"date": f"{start_year}-01", "category": "energy_cost", "amount": 15_000.0, "currency": "USD"},
+    ]
+    tables.set_table("other_opex_monthly", pd.DataFrame(other_rows))
+
+    ar_rows = [
+        {
+            "date": f"{start_year}-01",
+            "receivables": 0.0,
+            "prepaid_expenses": 0.0,
+            "other_current_assets": 0.0,
+            "dso_days": DEFAULTS["working_capital"]["dso_days"],
+        }
+    ]
+    tables.set_table("ar_other_assets", pd.DataFrame(ar_rows))
+
+    inventory_rows = [
+        {
+            "date": f"{start_year}-01",
+            "inventory_raw": 0.0,
+            "inventory_wip": 0.0,
+            "inventory_fg": 0.0,
+            "accounts_payable": 0.0,
+            "dio_days": DEFAULTS["working_capital"]["dio_days"],
+            "dpo_days": DEFAULTS["working_capital"]["dpo_days"],
+        }
+    ]
+    tables.set_table("inventory_ap", pd.DataFrame(inventory_rows))
+
+    debt_rows = []
+    for tranche in DEFAULTS["debt"]["tranches"]:
+        debt_rows.append(tranche)
+    tables.set_table("debt_tranches", pd.DataFrame(debt_rows))
+
+    tax_rows = [DEFAULTS["tax"]]
+    tables.set_table("tax_schedule", pd.DataFrame(tax_rows))
+
+    tables.set_table("inflation_index", DEFAULTS["inflation_index"])
+    tables.set_table("risk_params", DEFAULTS["risk_params"])
+
+
+def _get_tables() -> InputTables:
+    if "input_tables" not in st.session_state:
+        tables = InputTables()
+        _seed_tables_with_defaults(tables)
+        st.session_state["input_tables"] = tables
+    return st.session_state["input_tables"]
+
+
+def _sync_tables_from_state(tables: InputTables) -> Dict[str, str]:
+    errors: Dict[str, str] = {}
+    for table_name in INPUT_SCHEMAS.keys():
+        state_key = f"editor_{table_name}"
+        value = st.session_state.get(state_key)
+        if isinstance(value, pd.DataFrame):
+            try:
+                tables.set_table(table_name, value)
+            except Exception as exc:  # pragma: no cover - validation feedback for UI edits
+                errors[table_name] = str(exc)
+    return errors
+
+
+LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
+    ("Projection Horizon", "projection_horizon", "Define the calendar start and end of the modeling period."),
+    ("Production Horizon", "production_horizon", "Limit operating volumes to the active production window."),
+    ("Global Inputs", "global_inputs", "Corporate tax, discount rate, and ownership split."),
+    ("Working Capital Days", "working_capital_days", "DSO, DIO, and DPO assumptions."),
+    ("Initial Investment (CAPEX)", "capex_lines", "Detailed plant and farm investment lines with depreciation lives."),
+    ("Revenue Inputs", "revenue_params", "Product pricing, escalation, and indexation."),
+    ("Production Annual", "production_annual", "Annual production volumes and availability by product."),
+    ("Production Monthly", "production_monthly", "Monthly production schedule by product."),
+    ("Direct Costs Monthly", "direct_costs_monthly", "Feedstock and variable operating expenses."),
+    ("Staff Costs Monthly", "staff_costs_monthly", "Headcount and payroll assumptions."),
+    ("Other Opex Monthly", "other_opex_monthly", "Insurance, services, and overhead costs."),
+    ("Accounts Receivable & Other Assets", "ar_other_assets", "Receivables and prepaid balances."),
+    ("Inventory & Accounts Payable", "inventory_ap", "Inventory positions and supplier payables."),
+    ("Loan Schedule", "debt_tranches", "Debt facilities with rates, tenors, and amortization."),
+    ("Tax Schedule", "tax_schedule", "Tax rate, incentives, and loss carryforwards."),
+    ("Inflation Schedule", "inflation_index", "Inflation and FX indexation curves."),
+    ("Risk Schedule", "risk_params", "Drivers for sensitivities and Monte Carlo simulations."),
+]
+
+
+def _render_table_editor(
+    tables: InputTables,
+    table_name: str,
+    label: str,
+    error_message: Optional[str] = None,
+    description: Optional[str] = None,
+) -> None:
+    st.markdown(f"#### {label}")
+    if description:
+        st.caption(description)
+    df = tables.ensure_table(table_name).copy()
+    controls = st.columns(2)
+    if controls[0].button(f"Add row", key=f"add_{table_name}"):
+        try:
+            tables.add_row(table_name, {})
+        except Exception as exc:  # pragma: no cover - validation feedback
+            st.error(f"Unable to add row: {exc}")
+        st.experimental_rerun()
+    if not df.empty:
+        remove_idx = controls[1].selectbox(
+            "Row to remove",
+            options=list(df.index),
+            format_func=lambda idx: f"Row {idx + 1}",
+            key=f"remove_select_{table_name}",
+        )
+        if controls[1].button("Remove selected", key=f"remove_{table_name}"):
+            try:
+                tables.remove_row(table_name, int(remove_idx))
+            except Exception as exc:  # pragma: no cover - defensive feedback
+                st.error(f"Unable to remove row: {exc}")
+            st.experimental_rerun()
+    editor = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key=f"editor_{table_name}",
+    )
+    if error_message:
+        st.error(f"Validation error: {error_message}")
+    st.divider()
+
+
 def main() -> None:
     try:
         if _streamlit_runtime_exists():
@@ -121,7 +437,8 @@ def main() -> None:
         ]
     )
 
-    tables = InputTables()
+    tables = _get_tables()
+    sync_errors = _sync_tables_from_state(tables)
     assumptions: Dict[str, object] = {}
     cfg = build_config(assumptions, tables)
 
@@ -150,6 +467,11 @@ def main() -> None:
         production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
         cfg["production_horizon"] = production_horizon
         st.caption("Production volumes are set to zero outside the defined production horizon.")
+        try:
+            tables.set_table("projection_horizon", pd.DataFrame([horizon]))
+            tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
+        except Exception as exc:
+            st.warning(f"Projection inputs not saved due to validation error: {exc}")
 
     global_inputs = cfg["global_inputs"]
     with control_tabs[1]:
@@ -186,6 +508,11 @@ def main() -> None:
             }
         )
         st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
+        try:
+            tables.set_table("global_inputs", pd.DataFrame([global_inputs]))
+            tables.set_table("working_capital_days", pd.DataFrame([cfg["working_capital"]]))
+        except Exception as exc:
+            st.warning(f"Global inputs not saved due to validation error: {exc}")
 
     production_cfg = cfg.setdefault("production", {})
     with control_tabs[2]:
@@ -255,6 +582,34 @@ def main() -> None:
                 format="%.4f",
             )
             params.update({"base_price": float(base_price), "price_escalation_pa": float(escalation)})
+        revenue_table = tables.ensure_table("revenue_params").copy()
+        if revenue_table.empty:
+            revenue_table = pd.DataFrame(columns=list(INPUT_SCHEMAS["revenue_params"].columns.keys()))
+        for product in PRODUCTS:
+            params = pricing_cfg.get(product, {})
+            mask = (
+                revenue_table["product"].astype(str).str.lower() == product
+                if "product" in revenue_table
+                else pd.Series(dtype=bool)
+            )
+            updated = {
+                "product": product,
+                "base_price": params.get("base_price", np.nan),
+                "price_escalation_pa": params.get("price_escalation_pa", np.nan),
+                "price_indexation": params.get("price_indexation", "cpi"),
+                "uom": params.get("uom", ""),
+                "tariff_structure": params.get("tariff_structure", ""),
+                "revenue_share": params.get("revenue_share", 1.0),
+            }
+            if mask.any():
+                for key, value in updated.items():
+                    revenue_table.loc[mask, key] = value
+            else:
+                revenue_table = pd.concat([revenue_table, pd.DataFrame([updated])], ignore_index=True)
+        try:
+            tables.set_table("revenue_params", revenue_table)
+        except Exception as exc:
+            st.warning(f"Pricing table not saved due to validation error: {exc}")
     with control_tabs[4]:
         st.markdown("### Risk and scenario options")
         run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
@@ -286,9 +641,30 @@ def main() -> None:
         ("DSCR_avg", "Avg DSCR", "ratio"),
     ]
 
-    tabs = st.tabs(["Summary", "Financial Statements", "Production & Pricing", "Sensitivities", "Scenarios"])
+    landing_tab, summary_tab, financial_tab, production_tab, sensitivity_tab, scenario_tab = st.tabs(
+        [
+            "Input Landing Tables",
+            "Summary",
+            "Financial Statements",
+            "Production & Pricing",
+            "Sensitivities",
+            "Scenarios",
+        ]
+    )
 
-    with tabs[0]:
+    with landing_tab:
+        st.subheader("Input landing tables")
+        st.markdown(
+            "Review, add, or remove records from each canonical input table. Updates apply across the model "
+            "on the next run."
+        )
+        if sync_errors:
+            for table_name, message in sync_errors.items():
+                st.error(f"{table_name}: {message}")
+        for label, table_name, description in LANDING_TABLES:
+            _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
+
+    with summary_tab:
         st.subheader("Headline metrics")
         for idx in range(0, len(metric_items), 3):
             cols = st.columns(3)
@@ -314,112 +690,8 @@ def main() -> None:
             cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
             st.bar_chart(cash_chart)
 
-        cfg_display = results["config"]
-        projection_df = pd.DataFrame([cfg_display.get("projection_horizon", {})])
-        production_horizon_df = pd.DataFrame([cfg_display.get("production_horizon", {})])
-        global_inputs_df = pd.DataFrame([cfg_display.get("global_inputs", {})])
-
-        capex_lines_df = cfg_display.get("capex_lines")
-        if not isinstance(capex_lines_df, pd.DataFrame) or capex_lines_df.empty:
-            capex_lines_df = pd.DataFrame(
-                [
-                    {
-                        "item_name": "Plant",
-                        "category": "plant",
-                        "amount": 35_000_000.0,
-                        "currency": "USD",
-                        "start_date": f"{cfg_display.get('projection_horizon', DEFAULTS['horizon'])['start_year']}-01",
-                        "end_date": f"{cfg_display.get('projection_horizon', DEFAULTS['horizon'])['start_year']}-12",
-                        "life_years": 15,
-                        "depr_method": "straight",
-                        "depr_rate_override": float("nan"),
-                        "vat_rate": 0.0,
-                        "vat_recovery_lag_months": 0,
-                        "capitalized": True,
-                        "is_farm_capex": False,
-                    }
-                ]
-            )
-
-        prices_cfg = cfg_display.get("prices", {})
-        pricing_df = pd.DataFrame.from_dict(prices_cfg, orient="index").reset_index().rename(columns={"index": "product"})
-
-        production_annual_base = results.get("production_annual")
-        if (
-            isinstance(production_annual_base, pd.DataFrame)
-            and {"year", "product", "volume"}.issubset(production_annual_base.columns)
-            and not production_annual_base.empty
-        ):
-            production_annual_df = (
-                production_annual_base.pivot_table(
-                    index="year",
-                    columns="product",
-                    values="volume",
-                    aggfunc="sum",
-                )
-                .reset_index()
-                .fillna(0.0)
-            )
-        else:
-            production_annual_df = pd.DataFrame(columns=["year", *PRODUCTS])
-
-        opex_cfg = cfg_display.get("opex", {})
-        opex_rows = []
-        for key, value in opex_cfg.items():
-            if isinstance(value, dict):
-                for sub_key, sub_val in value.items():
-                    opex_rows.append({"category": key, "item": sub_key, "value": sub_val})
-            else:
-                opex_rows.append({"category": "global", "item": key, "value": value})
-        opex_df = pd.DataFrame(opex_rows)
-        if opex_df.empty:
-            opex_df = pd.DataFrame(columns=["category", "item", "value"])
-
-        working_capital_df = results["working_capital"].copy()
-        debt_df = results["debt_schedule"].copy()
-
-        tax_cfg = cfg_display.get("tax", {})
-        tax_rows = [
-            {"parameter": key, "value": (value if not isinstance(value, dict) else str(value))}
-            for key, value in tax_cfg.items()
-        ]
-        tax_df = pd.DataFrame(tax_rows)
-
-        inflation_df = cfg_display.get("inflation_index")
-        if not isinstance(inflation_df, pd.DataFrame):
-            inflation_df = DEFAULTS["inflation_index"].copy()
-
-        risk_df = cfg_display.get("risk_params")
-        if not isinstance(risk_df, pd.DataFrame):
-            risk_df = DEFAULTS["risk_params"].copy()
-
-        input_sections = {
-            "Projection Horizon": (projection_df, "projection_horizon"),
-            "Production Horizon": (production_horizon_df, "production_horizon"),
-            "Global Inputs": (global_inputs_df, "global_inputs"),
-            "CAPEX": (capex_lines_df, "capex"),
-            "Product Pricing": (pricing_df, "product_pricing"),
-            "Production Volumes": (production_annual_df, "production_volumes"),
-            "Operating Costs": (opex_df, "operating_costs"),
-            "Working Capital": (working_capital_df, "working_capital"),
-            "Debt": (debt_df, "debt"),
-            "Tax": (tax_df, "tax"),
-            "Inflation": (inflation_df, "inflation"),
-            "Risk": (risk_df, "risk"),
-        }
-
-        st.subheader("Input tables overview")
-        overview_tabs = st.tabs(list(input_sections.keys()))
-        for (label, (df_to_show, key_suffix)), tab in zip(input_sections.items(), overview_tabs):
-            with tab:
-                display_df = df_to_show if isinstance(df_to_show, pd.DataFrame) else pd.DataFrame(df_to_show)
-                if label == "CAPEX" and "date" in display_df.columns:
-                    display_df = display_df.copy()
-                    display_df["date"] = pd.to_datetime(display_df["date"])
-                _render_dataframe(display_df, label, key=f"landing_{key_suffix}")
-
     statement_map = {"P&L": "pnl", "Cash Flow": "cashflow", "Balance Sheet": "balancesheet"}
-    with tabs[1]:
+    with financial_tab:
         statement_choice = st.selectbox("Statement", list(statement_map.keys()), index=0)
         key = statement_map[statement_choice]
         monthly_df = results["statements_monthly"][key]
@@ -427,7 +699,7 @@ def main() -> None:
         _render_dataframe(monthly_df, f"Monthly {statement_choice}", key=f"monthly_{key}")
         _render_dataframe(annual_df, f"Annual {statement_choice}", key=f"annual_{key}")
 
-    with tabs[2]:
+    with production_tab:
         prod_monthly = results["production_monthly"].copy()
         prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
         _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
@@ -452,7 +724,7 @@ def main() -> None:
         revenue_df["date"] = pd.to_datetime(revenue_df["date"])
         _render_dataframe(revenue_df, "Revenue stack", key="revenue")
 
-    with tabs[3]:
+    with sensitivity_tab:
         if run_tornado:
             with st.spinner("Calculating sensitivity tornado..."):
                 tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
@@ -468,7 +740,7 @@ def main() -> None:
         else:
             st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
 
-    with tabs[4]:
+    with scenario_tab:
         if run_scenario_analysis:
             scenarios = {
                 "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
