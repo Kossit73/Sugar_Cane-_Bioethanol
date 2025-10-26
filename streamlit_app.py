@@ -574,19 +574,29 @@ def main() -> None:
                 }
             )
             st.markdown("### Production horizon")
+            prod_start_default = int(production_horizon.get("start_year", start_year))
+            prod_start_default = max(prod_start_default, int(start_year))
+            prod_start_default = min(prod_start_default, int(end_year))
             prod_start_year = st.number_input(
                 "Production start year",
-                value=int(production_horizon.get("start_year", start_year)),
+                value=prod_start_default,
                 min_value=int(start_year),
+                max_value=int(end_year),
                 step=1,
             )
+            prod_end_default = int(production_horizon.get("end_year", end_year))
+            prod_end_default = max(prod_end_default, int(prod_start_year))
+            prod_end_default = min(prod_end_default, int(end_year))
             prod_end_year = st.number_input(
                 "Production end year",
-                value=int(production_horizon.get("end_year", end_year)),
+                value=prod_end_default,
                 min_value=int(prod_start_year),
                 max_value=int(end_year),
                 step=1,
             )
+            if prod_end_year < prod_start_year:
+                st.warning("Production end year adjusted to be no earlier than the start year.")
+                prod_end_year = prod_start_year
             production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
             cfg["production_horizon"] = production_horizon
             st.caption("Production volumes are set to zero outside the defined production horizon.")
