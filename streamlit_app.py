@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
+from pandas.testing import assert_frame_equal
 
 
 def _streamlit_runtime_exists() -> bool:
@@ -49,9 +50,18 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         run_full_model,
         run_scenarios,
         sensitivity_tornado,
+        normalize_key,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
     MODEL_IMPORT_ERROR = exc
+
+if MODEL_IMPORT_ERROR is not None:
+    _KEY_NORMALIZER = re.compile(r"[^0-9a-zA-Z]+")
+
+    def normalize_key(value: str) -> str:
+        key = _KEY_NORMALIZER.sub("_", str(value).strip().lower())
+        key = re.sub(r"_+", "_", key).strip("_")
+        return key
 
 
 def _format_metric(value: object, kind: str = "number") -> str:
@@ -397,6 +407,7 @@ def _render_table_editor(
     st.markdown(f"#### {label}")
     if description:
         st.caption(description)
+    schema = INPUT_SCHEMAS[table_name]
     df = tables.ensure_table(table_name).copy()
     controls = st.columns(2)
     if controls[0].button(f"Add row", key=f"add_{table_name}"):
@@ -424,6 +435,49 @@ def _render_table_editor(
         use_container_width=True,
         key=f"editor_{table_name}",
     )
+    if isinstance(editor, pd.DataFrame):
+        editor_clean = editor.copy()
+        if "_index" in editor_clean.columns:
+            editor_clean = editor_clean.drop(columns=["_index"])
+
+        drop_columns: List[str] = []
+        rename_map: Dict[str, str] = {}
+        for col in list(editor_clean.columns):
+            if col in schema.columns:
+                continue
+            norm = normalize_key(col)
+            if norm in schema.columns:
+                rename_map[col] = norm
+            else:
+                drop_columns.append(col)
+        if drop_columns:
+            editor_clean = editor_clean.drop(columns=drop_columns)
+        if rename_map:
+            editor_clean = editor_clean.rename(columns=rename_map)
+
+        canonical_cols = list(schema.columns.keys())
+        editor_clean = editor_clean.reindex(columns=canonical_cols, fill_value=np.nan)
+        editor_clean = editor_clean.replace({None: np.nan})
+        editor_clean = editor_clean.dropna(how="all").reset_index(drop=True)
+
+        try:
+            assert_frame_equal(
+                df.reset_index(drop=True),
+                editor_clean.reset_index(drop=True),
+                check_dtype=False,
+                check_like=True,
+            )
+            frames_equal = True
+        except AssertionError:
+            frames_equal = False
+
+        if not frames_equal:
+            try:
+                tables.set_table(table_name, editor_clean)
+            except Exception as exc:
+                st.error(f"Unable to update table: {exc}")
+            else:
+                st.experimental_rerun()
     if error_message:
         st.error(f"Validation error: {error_message}")
     st.divider()
