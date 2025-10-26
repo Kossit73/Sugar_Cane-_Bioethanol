@@ -1506,8 +1506,34 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
         }
     )
 
-    annual_production = aggregate_annual(production_monthly.assign(revenue=revenue_df.groupby(["date", "product"])["revenue"].sum().reindex(production_monthly.set_index(["date", "product"]).index, fill_value=0.0).values))
-    annual_production_chart = annual_production.pivot_table(index="year", columns="product", values="volume", aggfunc="sum")
+    prod_for_annual = production_monthly.copy()
+    prod_for_annual["date"] = pd.to_datetime(prod_for_annual["date"], errors="coerce")
+    prod_for_annual = prod_for_annual.dropna(subset=["date"]) if "date" in prod_for_annual else pd.DataFrame()
+
+    revenue_by_product = revenue_df.copy()
+    revenue_by_product["date"] = pd.to_datetime(revenue_by_product["date"], errors="coerce")
+    revenue_by_product = revenue_by_product.dropna(subset=["date"]) if not revenue_by_product.empty else revenue_by_product
+
+    if prod_for_annual is not None and {"date", "product", "volume"}.issubset(prod_for_annual.columns):
+        prod_for_annual["year"] = prod_for_annual["date"].dt.year
+        volume_annual = (
+            prod_for_annual.groupby(["year", "product"], as_index=False)["volume"].sum()
+        )
+        if {"product"}.issubset(revenue_by_product.columns):
+            revenue_by_product["year"] = revenue_by_product["date"].dt.year
+            revenue_annual = (
+                revenue_by_product.groupby(["year", "product"], as_index=False)["revenue"].sum()
+            )
+        else:
+            revenue_annual = pd.DataFrame(columns=["year", "product", "revenue"])
+        annual_production = volume_annual.merge(revenue_annual, on=["year", "product"], how="left")
+        annual_production["revenue"].fillna(0.0, inplace=True)
+        annual_production_chart = (
+            annual_production.pivot(index="year", columns="product", values="volume").fillna(0.0)
+        )
+    else:
+        annual_production = pd.DataFrame(columns=["year", "product", "volume", "revenue"])
+        annual_production_chart = pd.DataFrame(columns=PRODUCTS)
 
     charts: Dict[str, Optional[Path]] = {}
     if plt is not None:
@@ -1549,6 +1575,8 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
 
     dashboard["charts"] = charts
     dashboard["annual_production"] = annual_production_chart.reset_index()
+    dashboard["annual_production_detail"] = annual_production
+    annual_cashflow = aggregate_annual(cashflow)
     dashboard["annual_cashflow"] = annual_cashflow
 
     return dashboard
