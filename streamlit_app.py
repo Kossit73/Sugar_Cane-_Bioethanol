@@ -449,7 +449,7 @@ def main() -> None:
             overflow-x: hidden !important;
         }
         [data-testid="stAppViewContainer"] {
-            padding: 0 1.5rem !important;
+            padding: 1.25rem 1.5rem 1.5rem !important;
             margin: 0 !important;
             width: 100% !important;
             max-width: 100% !important;
