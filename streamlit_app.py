@@ -440,10 +440,20 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        [data-testid="stAppViewContainer"] {
+            padding: 0;
+        }
+        [data-testid="stAppViewContainer"] .main {
+            max-width: 100vw;
+            padding-left: 0;
+            padding-right: 0;
+        }
         [data-testid="stAppViewContainer"] .main .block-container {
-            max-width: 100%;
-            padding-left: 1.5rem;
-            padding-right: 1.5rem;
+            max-width: 100vw;
+            padding-left: 0;
+            padding-right: 0;
+            margin-left: 0;
+            margin-right: 0;
         }
         </style>
         """,
