@@ -437,6 +437,19 @@ def main() -> None:
         # outside a live runtime; swallow and continue so local execution still works.
         pass
 
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"] .main .block-container {
+            max-width: 100%;
+            padding-left: 1.5rem;
+            padding-right: 1.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if MODEL_IMPORT_ERROR is not None:
         st.error(
             "Required dependency missing when importing the finance engine: "
