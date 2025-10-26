@@ -11,6 +11,7 @@ Run with:
 from __future__ import annotations
 
 import math
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -761,14 +762,20 @@ def main() -> None:
             cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
             st.bar_chart(cash_chart)
 
-    statement_map = {"P&L": "pnl", "Cash Flow": "cashflow", "Balance Sheet": "balancesheet"}
+    statement_configs = [
+        ("Income Statement (P&L)", "pnl"),
+        ("Statement of Cash Flows", "cashflow"),
+        ("Statement of Financial Position", "balancesheet"),
+    ]
     with financial_tab:
-        statement_choice = st.selectbox("Statement", list(statement_map.keys()), index=0)
-        key = statement_map[statement_choice]
-        monthly_df = results["statements_monthly"][key]
-        annual_df = results["statements_annual"][key]
-        _render_dataframe(monthly_df, f"Monthly {statement_choice}", key=f"monthly_{key}")
-        _render_dataframe(annual_df, f"Annual {statement_choice}", key=f"annual_{key}")
+        fs_tabs = st.tabs([label for label, _ in statement_configs])
+        for tab, (label, key) in zip(fs_tabs, statement_configs):
+            with tab:
+                monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
+                annual_df = results["statements_annual"].get(key, pd.DataFrame())
+                safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
+                _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
+                _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
 
     with production_tab:
         prod_monthly = results["production_monthly"].copy()
