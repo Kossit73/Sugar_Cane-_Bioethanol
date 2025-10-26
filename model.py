@@ -758,7 +758,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
             [
                 {
                     "product": "ethanol",
-                    "annual_volume": feedstock * base["ethanol_litre_per_ton"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "annual_volume": feedstock
+                    * base["ethanol_litre_per_ton"]
+                    * base["plant_availability"]
+                    * (1 - base["loss_factor"]),
                     "availability": base["plant_availability"],
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
@@ -768,7 +771,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 },
                 {
                     "product": "sugar",
-                    "annual_volume": feedstock * base["sugar_ton_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "annual_volume": feedstock
+                    * base["sugar_ton_per_ton_cane"]
+                    * base["plant_availability"]
+                    * (1 - base["loss_factor"]),
                     "availability": base["plant_availability"],
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
@@ -778,7 +784,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 },
                 {
                     "product": "electricity",
-                    "annual_volume": feedstock * base["electricity_mwh_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "annual_volume": feedstock
+                    * base["electricity_mwh_per_ton_cane"]
+                    * base["plant_availability"]
+                    * (1 - base["loss_factor"]),
                     "availability": base["plant_availability"],
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
@@ -788,7 +797,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 },
                 {
                     "product": "animal_feed",
-                    "annual_volume": feedstock * base["animal_feed_ton_per_ton_cane"] * base["plant_availability"] * (1 - base["loss_factor"]),
+                    "annual_volume": feedstock
+                    * base["animal_feed_ton_per_ton_cane"]
+                    * base["plant_availability"]
+                    * (1 - base["loss_factor"]),
                     "availability": base["plant_availability"],
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
@@ -799,60 +811,46 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
             ]
         )
 
-    if "production_annual" in cfg and isinstance(cfg["production_annual"], pd.DataFrame) and not cfg["production_annual"].empty:
-        prod_annual = cfg["production_annual"].copy()
-    else:
-        prod_annual = _default_production_table()
+    def _prepare_annual_table(raw: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if isinstance(raw, pd.DataFrame) and not raw.empty:
+            prod_annual = raw.copy()
+        else:
+            prod_annual = _default_production_table()
 
-    required_columns = {"product", "annual_volume"}
-    if not required_columns.issubset(prod_annual.columns):
-        prod_annual = _default_production_table()
+        required_columns = {"product", "annual_volume"}
+        if not required_columns.issubset(prod_annual.columns):
+            prod_annual = _default_production_table()
 
-    for col, default_val in {
-        "availability": DEFAULTS["production"]["plant_availability"],
-        "loss_factor": DEFAULTS["production"]["loss_factor"],
-        "startup_ramp": "0.7;0.9;1.0",
-    }.items():
-        if col not in prod_annual.columns:
-            prod_annual[col] = default_val
+        for col, default_val in {
+            "availability": DEFAULTS["production"]["plant_availability"],
+            "loss_factor": DEFAULTS["production"]["loss_factor"],
+            "startup_ramp": "0.7;0.9;1.0",
+        }.items():
+            if col not in prod_annual.columns:
+                prod_annual[col] = default_val
 
-    prod_annual["product"] = prod_annual["product"].astype(str).str.strip()
-    prod_annual = prod_annual[prod_annual["product"].str.lower() != "nan"]
-    prod_annual = prod_annual[prod_annual["product"] != ""]
+        prod_annual["product"] = prod_annual["product"].astype(str).str.strip()
+        prod_annual = prod_annual[prod_annual["product"].str.lower() != "nan"]
+        prod_annual = prod_annual[prod_annual["product"] != ""]
 
-    if prod_annual.empty:
-        prod_annual = _default_production_table()
+        if prod_annual.empty:
+            prod_annual = _default_production_table()
 
-    prod_annual["annual_volume"] = pd.to_numeric(prod_annual["annual_volume"], errors="coerce").fillna(0.0)
-    annual_rows: List[Dict[str, object]] = []
-    for _, row in prod_annual.iterrows():
-        ramp = parse_ramp(row.get("startup_ramp"), len(annual_years))
-        for idx, year in enumerate(annual_years):
-            annual_rows.append(
-                {
-                    "year": year,
-                    "product": row["product"],
-                    "volume": float(row["annual_volume"]) * float(ramp[idx]),
-                    "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
-                    "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
-                }
-            )
-    annual_df = pd.DataFrame(annual_rows)
-    if not annual_df.empty:
-        annual_df.loc[(annual_df["year"] < prod_start_year) | (annual_df["year"] > prod_end_year), "volume"] = 0.0
+        prod_annual["annual_volume"] = pd.to_numeric(prod_annual["annual_volume"], errors="coerce").fillna(0.0)
+        return prod_annual
 
     def _monthly_from_annual(source: pd.DataFrame) -> pd.DataFrame:
         monthly_rows: List[Dict[str, object]] = []
         seasonality = np.ones(MONTHS_IN_YEAR) / MONTHS_IN_YEAR
         for _, row in source.iterrows():
             for month in range(1, MONTHS_IN_YEAR + 1):
-                date = pd.Timestamp(year=row["year"], month=month, day=1)
+                date = pd.Timestamp(year=int(row["year"]), month=month, day=1)
                 if date not in monthly_index:
                     continue
                 if date.year < prod_start_year or date.year > prod_end_year:
                     volume = 0.0
                 else:
-                    volume = row["volume"] * seasonality[month - 1]
+                    volume = float(row["volume"]) * seasonality[month - 1]
                 monthly_rows.append(
                     {
                         "date": date,
@@ -865,38 +863,84 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 )
         return pd.DataFrame(monthly_rows)
 
-    if "production_monthly" in cfg and isinstance(cfg["production_monthly"], pd.DataFrame) and not cfg["production_monthly"].empty:
-        monthly_df = cfg["production_monthly"].copy()
-        required_cols = {"date", "volume", "product"}
-        if not required_cols.issubset(monthly_df.columns):
-            monthly_df = _monthly_from_annual(annual_df)
-        else:
-            monthly_df["date"] = pd.to_datetime(monthly_df["date"])
-            monthly_df["product"] = monthly_df["product"].astype(str).str.strip()
-            monthly_df = monthly_df[monthly_df["product"] != ""]
-            monthly_df = monthly_df.dropna(subset=["product"])
-            if monthly_df.empty:
+    try:
+        prod_annual = _prepare_annual_table(cfg.get("production_annual"))
+
+        annual_rows: List[Dict[str, object]] = []
+        for _, row in prod_annual.iterrows():
+            ramp = parse_ramp(row.get("startup_ramp"), len(annual_years))
+            for idx, year in enumerate(annual_years):
+                annual_rows.append(
+                    {
+                        "year": year,
+                        "product": row["product"],
+                        "volume": float(row["annual_volume"]) * float(ramp[idx]),
+                        "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
+                        "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
+                    }
+                )
+        annual_df = pd.DataFrame(annual_rows)
+        if not annual_df.empty:
+            annual_df.loc[(annual_df["year"] < prod_start_year) | (annual_df["year"] > prod_end_year), "volume"] = 0.0
+
+        raw_monthly = cfg.get("production_monthly") if isinstance(cfg.get("production_monthly"), pd.DataFrame) else None
+        if raw_monthly is not None and not raw_monthly.empty:
+            monthly_df = raw_monthly.copy()
+            monthly_df.columns = [normalize_key(col) if isinstance(col, str) else col for col in monthly_df.columns]
+            required_cols = {"date", "volume", "product"}
+            if not required_cols.issubset(set(monthly_df.columns)):
                 monthly_df = _monthly_from_annual(annual_df)
             else:
-                monthly_df["volume"] = pd.to_numeric(monthly_df["volume"], errors="coerce").fillna(0.0)
-                mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
-                monthly_df.loc[~mask, "volume"] = 0.0
-    else:
+                monthly_df = monthly_df.rename(columns={col: col for col in required_cols})
+                monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+                monthly_df["product"] = monthly_df["product"].astype(str).str.strip()
+                monthly_df = monthly_df[monthly_df["product"] != ""]
+                monthly_df = monthly_df[monthly_df["product"].str.lower() != "nan"]
+                monthly_df = monthly_df.dropna(subset=["product"])
+                if monthly_df.empty:
+                    monthly_df = _monthly_from_annual(annual_df)
+                else:
+                    monthly_df["volume"] = pd.to_numeric(monthly_df["volume"], errors="coerce").fillna(0.0)
+                    mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
+                    monthly_df.loc[~mask, "volume"] = 0.0
+        else:
+            monthly_df = _monthly_from_annual(annual_df)
+    except KeyError:
+        # Any unexpected column issues fall back to a fully defaulted schedule so the
+        # broader model can continue executing without raising ``KeyError: 'product'``.
+        prod_annual = _prepare_annual_table(None)
+        annual_rows = []
+        for _, row in prod_annual.iterrows():
+            ramp = parse_ramp(row.get("startup_ramp"), len(annual_years))
+            for idx, year in enumerate(annual_years):
+                annual_rows.append(
+                    {
+                        "year": year,
+                        "product": row["product"],
+                        "volume": float(row["annual_volume"]) * float(ramp[idx]),
+                        "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
+                        "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
+                    }
+                )
+        annual_df = pd.DataFrame(annual_rows)
         monthly_df = _monthly_from_annual(annual_df)
 
-    # In some edge cases (for example, when the Streamlit editor returns an empty
-    # column block), the copied monthly dataframe can lose the required
-    # ``product`` field even after the guards above. If that happens, rebuild the
-    # monthly schedule from the validated annual table so downstream joins never
-    # raise ``KeyError: 'product'``.
-    if "product" not in monthly_df.columns:
-        monthly_df = _monthly_from_annual(annual_df)
+    required_order = ["date", "product", "volume", "availability_override", "maintenance_downtime", "loss_override"]
+    for col in required_order:
+        if col not in monthly_df.columns:
+            monthly_df[col] = np.nan if col != "date" else pd.NaT
+    monthly_df = monthly_df[required_order]
 
+    monthly_df["date"] = pd.to_datetime(monthly_df["date"])
     monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)]
-    if "product" in monthly_df.columns:
-        monthly_df = monthly_df.sort_values(["date", "product"]).reset_index(drop=True)
-    else:  # pragma: no cover - extremely defensive fallback
-        monthly_df = monthly_df.sort_values(["date"]).reset_index(drop=True)
+    monthly_df = monthly_df.sort_values(["date", "product"]).reset_index(drop=True)
+
+    if "year" not in annual_df.columns:
+        # When the annual fallback above regenerates the schedule, the helper already
+        # populates the ``year`` column. This guard simply guarantees consistency if
+        # upstream inputs were malformed but not severe enough to trigger the
+        # ``KeyError`` branch.
+        annual_df["year"] = [year for year in annual_years for _ in range(len(prod_annual))][: len(annual_df)]
 
     return monthly_df, annual_df
 ###############################################################################
