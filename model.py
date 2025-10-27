@@ -1367,8 +1367,32 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         staff_costs = staff_costs.copy()
         staff_costs["date"] = pd.to_datetime(staff_costs["date"])
     else:
-        staff_costs = pd.DataFrame({"date": monthly_index, "gross_pay": 0.0, "benefits": 0.0, "training": 0.0, "other": 0.0})
-    staff_costs_total = staff_costs.set_index("date").reindex(monthly_index, fill_value=0.0)[["gross_pay", "benefits", "training", "other"]].sum(axis=1)
+        staff_costs = pd.DataFrame(
+            {
+                "date": monthly_index,
+                "dept": "Operations",
+                "headcount": 0.0,
+                "gross_pay": 0.0,
+                "benefits": 0.0,
+                "training": 0.0,
+                "other": 0.0,
+                "currency": DEFAULTS["global"].get("base_currency", "USD"),
+            }
+        )
+    for col in ("dept", "currency"):
+        if col not in staff_costs.columns:
+            default_val = "" if col == "dept" else DEFAULTS["global"].get("base_currency", "USD")
+            staff_costs[col] = default_val
+    if "headcount" not in staff_costs.columns:
+        staff_costs["headcount"] = 0.0
+    for col in ("gross_pay", "benefits", "training", "other", "headcount"):
+        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
+    staff_costs_total = (
+        staff_costs.groupby("date")[["gross_pay", "benefits", "training", "other"]]
+        .sum()
+        .reindex(monthly_index, fill_value=0.0)
+        .sum(axis=1)
+    )
 
     other_opex = cfg.get("other_opex_monthly") if "other_opex_monthly" in cfg else pd.DataFrame()
     if isinstance(other_opex, pd.DataFrame) and not other_opex.empty:
