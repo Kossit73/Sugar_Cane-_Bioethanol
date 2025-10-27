@@ -382,7 +382,9 @@ def _factory_default_frames() -> Dict[str, pd.DataFrame]:
                     "date": f"{start_year}-01",
                     "cost_type": "feedstock purchase",
                     "product_link": "ethanol",
-                    "amount": 500_000.0,
+                    "unit_price": 65.0,
+                    "quantity": 8_000.0,
+                    "amount": 520_000.0,
                     "currency": "USD",
                 }
             ]

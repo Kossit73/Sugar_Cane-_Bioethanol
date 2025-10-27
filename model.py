@@ -334,6 +334,27 @@ def _validate_production_horizon(row: pd.Series) -> None:
     end_val = _coerce_int(end, start_val)
     if end_val < start_val:
         raise ValueError("production end_year must be >= start_year")
+
+
+def _derive_direct_costs(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure direct cost lines carry a calculated amount from unit rates."""
+
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date", "cost_type", "product_link", "unit_price", "quantity", "amount", "currency"])
+
+    result = df.copy()
+    for column in ("unit_price", "quantity", "amount"):
+        if column not in result.columns:
+            result[column] = np.nan
+
+    result["unit_price"] = pd.to_numeric(result["unit_price"], errors="coerce")
+    result["quantity"] = pd.to_numeric(result["quantity"], errors="coerce")
+    result["amount"] = pd.to_numeric(result["amount"], errors="coerce")
+
+    mask = result["unit_price"].notna() & result["quantity"].notna()
+    result.loc[mask, "amount"] = result.loc[mask, "unit_price"] * result.loc[mask, "quantity"]
+
+    return result
 ###############################################################################
 # Section 3: Input tables and CRUD helpers
 ###############################################################################
@@ -439,8 +460,17 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         columns={"date": "str", "product": "str", "volume": "float", "availability_override": "float", "maintenance_downtime": "float", "loss_override": "float"},
     ),
     "direct_costs_monthly": TableSchema(
-        columns={"date": "str", "cost_type": "str", "product_link": "str", "amount": "float", "currency": "str"},
-        defaults={"currency": "USD"},
+        columns={
+            "date": "str",
+            "cost_type": "str",
+            "product_link": "str",
+            "unit_price": "float",
+            "quantity": "float",
+            "amount": "float",
+            "currency": "str",
+        },
+        defaults={"currency": "USD", "unit_price": 0.0, "quantity": 0.0, "amount": 0.0},
+        derived=lambda df: _derive_direct_costs(df),
     ),
     "staff_costs_monthly": TableSchema(
         columns={"date": "str", "dept": "str", "headcount": "float", "gross_pay": "float", "benefits": "float", "training": "float", "other": "float", "currency": "str"},
@@ -1258,6 +1288,7 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
 
 def working_capital_block(revenue_df: pd.DataFrame, cost_df: pd.DataFrame, cfg: Mapping[str, object], timeline: Timeline) -> pd.DataFrame:
     monthly_index = timeline.monthly_index()
+    cost_df = _derive_direct_costs(cost_df)
     revenue = revenue_df.groupby("date")["revenue"].sum().reindex(monthly_index, fill_value=0.0)
     cost = cost_df.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
     wc_days = cfg.get("working_capital", DEFAULTS["working_capital"])
@@ -1322,7 +1353,13 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         direct_costs = direct_costs.copy()
         direct_costs["date"] = pd.to_datetime(direct_costs["date"])
     else:
-        direct_costs = pd.DataFrame({"date": monthly_index, "amount": 0.0})
+        direct_costs = pd.DataFrame({
+            "date": monthly_index,
+            "unit_price": 0.0,
+            "quantity": 0.0,
+            "amount": 0.0,
+        })
+    direct_costs = _derive_direct_costs(direct_costs)
     direct_costs_total = direct_costs.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
 
     staff_costs = cfg.get("staff_costs_monthly") if "staff_costs_monthly" in cfg else pd.DataFrame()
@@ -1828,10 +1865,16 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
 
     cost_df = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
     if not isinstance(cost_df, pd.DataFrame) or cost_df.empty:
-        cost_df = pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
+        cost_df = pd.DataFrame({
+            "date": timeline.monthly_index(),
+            "unit_price": 0.0,
+            "quantity": 0.0,
+            "amount": 0.0,
+        })
     else:
         cost_df = cost_df.copy()
         cost_df["date"] = pd.to_datetime(cost_df["date"])
+    cost_df = _derive_direct_costs(cost_df)
     wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
 
     statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
