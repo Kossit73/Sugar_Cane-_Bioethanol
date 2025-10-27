@@ -46,6 +46,10 @@ def _safe_rerun() -> None:
         st.experimental_rerun()
     except StreamlitAPIException:  # pragma: no cover - defensive catch
         pass
+    except Exception:
+        # Older Streamlit builds or embedded executions may surface bespoke
+        # rerun exceptions; swallow them so non-Streamlit contexts keep running.
+        pass
 
 
 MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
