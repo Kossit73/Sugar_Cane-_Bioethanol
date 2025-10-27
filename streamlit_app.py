@@ -83,6 +83,11 @@ def _format_metric(value: object, kind: str = "number") -> str:
     return str(value)
 
 
+DEFAULT_TABLE_STORE_KEY = "table_defaults_store"
+DEFAULT_EDIT_STATE_KEY = "default_edit_state"
+_FACTORY_DEFAULT_FRAMES_CACHE: Optional[Dict[str, pd.DataFrame]] = None
+
+
 def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     """Render a dataframe with a download button."""
     st.subheader(title)
@@ -97,234 +102,423 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     )
 
 
-def _seed_tables_with_defaults(tables: InputTables) -> None:
-    """Populate session tables with sensible defaults for every schema."""
-    horizon_defaults = dict(DEFAULTS["horizon"])
-    tables.set_table("projection_horizon", pd.DataFrame([horizon_defaults]))
-    tables.set_table("production_horizon", pd.DataFrame([DEFAULTS["production_horizon"]]))
-    tables.set_table("global_inputs", pd.DataFrame([DEFAULTS["global"]]))
-    tables.set_table("working_capital_days", pd.DataFrame([DEFAULTS["working_capital"]]))
+def _display_default_value(value: object) -> str:
+    """Pretty-print values for the default-row manager."""
+    if value is None:
+        return "—"
+    if isinstance(value, (float, np.floating)):
+        if math.isnan(float(value)):
+            return "—"
+        magnitude = abs(float(value))
+        if magnitude >= 1_000:
+            return f"{float(value):,.2f}"
+        if magnitude >= 1:
+            return f"{float(value):,.2f}"
+        return (f"{float(value):.6f}").rstrip("0").rstrip(".")
+    if isinstance(value, (int, np.integer)):
+        return f"{int(value):,}"
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
 
-    start_year = int(horizon_defaults["start_year"])
-    start_month = int(horizon_defaults.get("start_month", 1))
 
-    capex_rows = [
-        {
-            "item_name": "Land Acquisition",
-            "category": "land",
-            "amount": 5_000_000.0,
-            "currency": "USD",
-            "fx_curve": "",
-            "start_date": f"{start_year}-01",
-            "end_date": f"{start_year}-12",
-            "life_years": 40,
-            "depr_method": "straight",
-            "depr_rate_override": np.nan,
-            "vat_rate": 0.0,
-            "vat_recovery_lag_months": 0,
-            "capitalized": True,
-            "is_farm_capex": True,
-        },
-        {
-            "item_name": "Civil Works",
-            "category": "civil",
-            "amount": 8_500_000.0,
-            "currency": "USD",
-            "fx_curve": "",
-            "start_date": f"{start_year}-01",
-            "end_date": f"{start_year}-12",
-            "life_years": 20,
-            "depr_method": "straight",
-            "depr_rate_override": np.nan,
-            "vat_rate": 0.0,
-            "vat_recovery_lag_months": 0,
-            "capitalized": True,
-            "is_farm_capex": False,
-        },
-        {
-            "item_name": "Process Equipment",
-            "category": "equipment",
-            "amount": 12_500_000.0,
-            "currency": "USD",
-            "fx_curve": "",
-            "start_date": f"{start_year}-01",
-            "end_date": f"{start_year}-12",
-            "life_years": 12,
-            "depr_method": "straight",
-            "depr_rate_override": np.nan,
-            "vat_rate": 0.0,
-            "vat_recovery_lag_months": 0,
-            "capitalized": True,
-            "is_farm_capex": False,
-        },
-        {
-            "item_name": "Farm Machinery",
-            "category": "farm_machinery",
-            "amount": 4_000_000.0,
-            "currency": "USD",
-            "fx_curve": "",
-            "start_date": f"{start_year}-01",
-            "end_date": f"{start_year}-12",
-            "life_years": 10,
-            "depr_method": "straight",
-            "depr_rate_override": np.nan,
-            "vat_rate": 0.0,
-            "vat_recovery_lag_months": 0,
-            "capitalized": True,
-            "is_farm_capex": True,
-        },
-    ]
-    tables.set_table("capex_lines", pd.DataFrame(capex_rows))
+def _factory_default_frames() -> Dict[str, pd.DataFrame]:
+    """Return deep copies of the model's factory default tables."""
 
-    price_rows = []
-    for product, params in DEFAULTS["prices"].items():
-        price_rows.append(
+    global _FACTORY_DEFAULT_FRAMES_CACHE
+    if _FACTORY_DEFAULT_FRAMES_CACHE is None:
+        frames: Dict[str, pd.DataFrame] = {}
+
+        horizon_defaults = dict(DEFAULTS["horizon"])
+        frames["projection_horizon"] = pd.DataFrame([horizon_defaults])
+        frames["production_horizon"] = pd.DataFrame([DEFAULTS["production_horizon"]])
+        frames["global_inputs"] = pd.DataFrame([DEFAULTS["global"]])
+        frames["working_capital_days"] = pd.DataFrame([DEFAULTS["working_capital"]])
+
+        start_year = int(horizon_defaults["start_year"])
+        start_month = int(horizon_defaults.get("start_month", 1))
+
+        capex_rows = [
             {
-                "product": product,
-                "base_price": params.get("base_price", 0.0),
-                "price_escalation_pa": params.get("price_escalation_pa", 0.0),
-                "price_indexation": params.get("price_indexation", "cpi"),
-                "uom": params.get("uom", ""),
-                "tariff_structure": "",
-                "revenue_share": 1.0,
-            }
-        )
-    tables.set_table("revenue_params", pd.DataFrame(price_rows))
+                "item_name": "Land Acquisition",
+                "category": "land",
+                "amount": 5_000_000.0,
+                "currency": "USD",
+                "fx_curve": "",
+                "start_date": f"{start_year}-01",
+                "end_date": f"{start_year}-12",
+                "life_years": 40,
+                "depr_method": "straight",
+                "depr_rate_override": np.nan,
+                "vat_rate": 0.0,
+                "vat_recovery_lag_months": 0,
+                "capitalized": True,
+                "is_farm_capex": True,
+            },
+            {
+                "item_name": "Civil Works",
+                "category": "civil",
+                "amount": 8_500_000.0,
+                "currency": "USD",
+                "fx_curve": "",
+                "start_date": f"{start_year}-01",
+                "end_date": f"{start_year}-12",
+                "life_years": 20,
+                "depr_method": "straight",
+                "depr_rate_override": np.nan,
+                "vat_rate": 0.0,
+                "vat_recovery_lag_months": 0,
+                "capitalized": True,
+                "is_farm_capex": False,
+            },
+            {
+                "item_name": "Process Equipment",
+                "category": "equipment",
+                "amount": 12_500_000.0,
+                "currency": "USD",
+                "fx_curve": "",
+                "start_date": f"{start_year}-01",
+                "end_date": f"{start_year}-12",
+                "life_years": 12,
+                "depr_method": "straight",
+                "depr_rate_override": np.nan,
+                "vat_rate": 0.0,
+                "vat_recovery_lag_months": 0,
+                "capitalized": True,
+                "is_farm_capex": False,
+            },
+            {
+                "item_name": "Farm Machinery",
+                "category": "farm_machinery",
+                "amount": 4_000_000.0,
+                "currency": "USD",
+                "fx_curve": "",
+                "start_date": f"{start_year}-01",
+                "end_date": f"{start_year}-12",
+                "life_years": 10,
+                "depr_method": "straight",
+                "depr_rate_override": np.nan,
+                "vat_rate": 0.0,
+                "vat_recovery_lag_months": 0,
+                "capitalized": True,
+                "is_farm_capex": True,
+            },
+        ]
+        frames["capex_lines"] = pd.DataFrame(capex_rows)
 
-    prod_defaults = DEFAULTS["production"]
-    feedstock = prod_defaults["annual_feedstock_ton"]
-    availability = prod_defaults["plant_availability"]
-    loss = prod_defaults["loss_factor"]
-    ramp = "0.7;0.9;1.0"
-
-    production_rows = [
-        {
-            "product": "ethanol",
-            "annual_volume": feedstock * prod_defaults["ethanol_litre_per_ton"] * availability * (1 - loss),
-            "availability": availability,
-            "loss_factor": loss,
-            "startup_ramp": ramp,
-            "boe_conversion": np.nan,
-            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
-            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
-        },
-        {
-            "product": "sugar",
-            "annual_volume": feedstock * prod_defaults["sugar_ton_per_ton_cane"] * availability * (1 - loss),
-            "availability": availability,
-            "loss_factor": loss,
-            "startup_ramp": ramp,
-            "boe_conversion": np.nan,
-            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
-            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
-        },
-        {
-            "product": "electricity",
-            "annual_volume": feedstock * prod_defaults["electricity_mwh_per_ton_cane"] * availability * (1 - loss),
-            "availability": availability,
-            "loss_factor": loss,
-            "startup_ramp": ramp,
-            "boe_conversion": np.nan,
-            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
-            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
-        },
-        {
-            "product": "animal_feed",
-            "annual_volume": feedstock * prod_defaults["animal_feed_ton_per_ton_cane"] * availability * (1 - loss),
-            "availability": availability,
-            "loss_factor": loss,
-            "startup_ramp": ramp,
-            "boe_conversion": np.nan,
-            "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
-            "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
-        },
-    ]
-    tables.set_table("production_annual", pd.DataFrame(production_rows))
-
-    first_year_months = pd.date_range(f"{start_year}-{start_month:02d}-01", periods=12, freq="MS")
-    monthly_rows = []
-    for row in production_rows:
-        monthly_volume = float(row["annual_volume"]) / 12.0
-        for date in first_year_months:
-            monthly_rows.append(
+        price_rows = []
+        for product, params in DEFAULTS["prices"].items():
+            price_rows.append(
                 {
-                    "date": date.strftime("%Y-%m"),
-                    "product": row["product"],
-                    "volume": monthly_volume,
-                    "availability_override": np.nan,
-                    "maintenance_downtime": np.nan,
-                    "loss_override": np.nan,
+                    "product": product,
+                    "base_price": params.get("base_price", 0.0),
+                    "price_escalation_pa": params.get("price_escalation_pa", 0.0),
+                    "price_indexation": params.get("price_indexation", "cpi"),
+                    "uom": params.get("uom", ""),
+                    "tariff_structure": "",
+                    "revenue_share": 1.0,
                 }
             )
-    tables.set_table("production_monthly", pd.DataFrame(monthly_rows))
+        frames["revenue_params"] = pd.DataFrame(price_rows)
 
-    direct_rows = [
-        {
-            "date": f"{start_year}-01",
-            "cost_type": "feedstock purchase",
-            "product_link": "ethanol",
-            "amount": 500_000.0,
-            "currency": "USD",
+        prod_defaults = DEFAULTS["production"]
+        feedstock = prod_defaults["annual_feedstock_ton"]
+        availability = prod_defaults["plant_availability"]
+        loss = prod_defaults["loss_factor"]
+        ramp = "0.7;0.9;1.0"
+
+        production_rows = [
+            {
+                "product": "ethanol",
+                "annual_volume": feedstock * prod_defaults["ethanol_litre_per_ton"] * availability * (1 - loss),
+                "availability": availability,
+                "loss_factor": loss,
+                "startup_ramp": ramp,
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+                "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+            },
+            {
+                "product": "sugar",
+                "annual_volume": feedstock * prod_defaults["sugar_ton_per_ton_cane"] * availability * (1 - loss),
+                "availability": availability,
+                "loss_factor": loss,
+                "startup_ramp": ramp,
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+                "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+            },
+            {
+                "product": "electricity",
+                "annual_volume": feedstock * prod_defaults["electricity_mwh_per_ton_cane"] * availability * (1 - loss),
+                "availability": availability,
+                "loss_factor": loss,
+                "startup_ramp": ramp,
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+                "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+            },
+            {
+                "product": "animal_feed",
+                "annual_volume": feedstock * prod_defaults["animal_feed_ton_per_ton_cane"] * availability * (1 - loss),
+                "availability": availability,
+                "loss_factor": loss,
+                "startup_ramp": ramp,
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": prod_defaults["sugarcane_yield_ton_per_ha"],
+                "farm_area_ha": feedstock / prod_defaults["sugarcane_yield_ton_per_ha"],
+            },
+        ]
+        frames["production_annual"] = pd.DataFrame(production_rows)
+
+        first_year_months = pd.date_range(f"{start_year}-{start_month:02d}-01", periods=12, freq="MS")
+        monthly_rows = []
+        for row in production_rows:
+            monthly_volume = float(row["annual_volume"]) / 12.0
+            for date in first_year_months:
+                monthly_rows.append(
+                    {
+                        "date": date.strftime("%Y-%m"),
+                        "product": row["product"],
+                        "volume": monthly_volume,
+                        "availability_override": np.nan,
+                        "maintenance_downtime": np.nan,
+                        "loss_override": np.nan,
+                    }
+                )
+        frames["production_monthly"] = pd.DataFrame(monthly_rows)
+
+        frames["direct_costs_monthly"] = pd.DataFrame(
+            [
+                {
+                    "date": f"{start_year}-01",
+                    "cost_type": "feedstock purchase",
+                    "product_link": "ethanol",
+                    "amount": 500_000.0,
+                    "currency": "USD",
+                }
+            ]
+        )
+
+        frames["staff_costs_monthly"] = pd.DataFrame(
+            [
+                {
+                    "date": f"{start_year}-01",
+                    "dept": "Operations",
+                    "headcount": 50,
+                    "gross_pay": 150_000.0,
+                    "benefits": 25_000.0,
+                    "training": 5_000.0,
+                    "other": 10_000.0,
+                    "currency": "USD",
+                }
+            ]
+        )
+
+        frames["other_opex_monthly"] = pd.DataFrame(
+            [
+                {"date": f"{start_year}-01", "category": "insurance", "amount": 20_000.0, "currency": "USD"},
+                {"date": f"{start_year}-01", "category": "service_contract", "amount": 35_000.0, "currency": "USD"},
+                {"date": f"{start_year}-01", "category": "general_admin", "amount": 50_000.0, "currency": "USD"},
+                {"date": f"{start_year}-01", "category": "energy_cost", "amount": 15_000.0, "currency": "USD"},
+            ]
+        )
+
+        frames["ar_other_assets"] = pd.DataFrame(
+            [
+                {
+                    "date": f"{start_year}-01",
+                    "receivables": 0.0,
+                    "prepaid_expenses": 0.0,
+                    "other_current_assets": 0.0,
+                    "dso_days": DEFAULTS["working_capital"]["dso_days"],
+                }
+            ]
+        )
+
+        frames["inventory_ap"] = pd.DataFrame(
+            [
+                {
+                    "date": f"{start_year}-01",
+                    "inventory_raw": 0.0,
+                    "inventory_wip": 0.0,
+                    "inventory_fg": 0.0,
+                    "accounts_payable": 0.0,
+                    "dio_days": DEFAULTS["working_capital"]["dio_days"],
+                    "dpo_days": DEFAULTS["working_capital"]["dpo_days"],
+                }
+            ]
+        )
+
+        frames["debt_tranches"] = pd.DataFrame(DEFAULTS["debt"]["tranches"])
+        frames["tax_schedule"] = pd.DataFrame([DEFAULTS["tax"]])
+        frames["inflation_index"] = DEFAULTS["inflation_index"].copy()
+        frames["risk_params"] = DEFAULTS["risk_params"].copy()
+
+        for table_name, schema in INPUT_SCHEMAS.items():
+            frames.setdefault(table_name, pd.DataFrame(columns=list(schema.columns.keys())))
+
+        _FACTORY_DEFAULT_FRAMES_CACHE = {name: df.copy(deep=True) for name, df in frames.items()}
+
+    return {name: df.copy(deep=True) for name, df in _FACTORY_DEFAULT_FRAMES_CACHE.items()}
+
+
+def _ensure_default_table_store() -> Dict[str, pd.DataFrame]:
+    """Ensure session state carries a mutable, schema-aligned default table store."""
+
+    if DEFAULT_TABLE_STORE_KEY not in st.session_state:
+        factory_frames = _factory_default_frames()
+        seeded_tables = InputTables()
+        for table_name, df in factory_frames.items():
+            seeded_tables.set_table(table_name, df)
+        st.session_state[DEFAULT_TABLE_STORE_KEY] = {
+            name: seeded_tables.ensure_table(name).copy()
+            for name in INPUT_SCHEMAS.keys()
         }
-    ]
-    tables.set_table("direct_costs_monthly", pd.DataFrame(direct_rows))
 
-    staff_rows = [
-        {
-            "date": f"{start_year}-01",
-            "dept": "Operations",
-            "headcount": 50,
-            "gross_pay": 150_000.0,
-            "benefits": 25_000.0,
-            "training": 5_000.0,
-            "other": 10_000.0,
-            "currency": "USD",
-        }
-    ]
-    tables.set_table("staff_costs_monthly", pd.DataFrame(staff_rows))
+    store = st.session_state[DEFAULT_TABLE_STORE_KEY]
+    for table_name, schema in INPUT_SCHEMAS.items():
+        if table_name not in store:
+            store[table_name] = pd.DataFrame(columns=list(schema.columns.keys()))
+    return store
 
-    other_rows = [
-        {"date": f"{start_year}-01", "category": "insurance", "amount": 20_000.0, "currency": "USD"},
-        {"date": f"{start_year}-01", "category": "service_contract", "amount": 35_000.0, "currency": "USD"},
-        {"date": f"{start_year}-01", "category": "general_admin", "amount": 50_000.0, "currency": "USD"},
-        {"date": f"{start_year}-01", "category": "energy_cost", "amount": 15_000.0, "currency": "USD"},
-    ]
-    tables.set_table("other_opex_monthly", pd.DataFrame(other_rows))
 
-    ar_rows = [
-        {
-            "date": f"{start_year}-01",
-            "receivables": 0.0,
-            "prepaid_expenses": 0.0,
-            "other_current_assets": 0.0,
-            "dso_days": DEFAULTS["working_capital"]["dso_days"],
-        }
-    ]
-    tables.set_table("ar_other_assets", pd.DataFrame(ar_rows))
+def _get_default_table(table_name: str) -> pd.DataFrame:
+    store = _ensure_default_table_store()
+    df = store.get(table_name)
+    if df is None:
+        schema = INPUT_SCHEMAS[table_name]
+        return pd.DataFrame(columns=list(schema.columns.keys()))
+    return df.copy(deep=True)
 
-    inventory_rows = [
-        {
-            "date": f"{start_year}-01",
-            "inventory_raw": 0.0,
-            "inventory_wip": 0.0,
-            "inventory_fg": 0.0,
-            "accounts_payable": 0.0,
-            "dio_days": DEFAULTS["working_capital"]["dio_days"],
-            "dpo_days": DEFAULTS["working_capital"]["dpo_days"],
-        }
-    ]
-    tables.set_table("inventory_ap", pd.DataFrame(inventory_rows))
 
-    debt_rows = []
-    for tranche in DEFAULTS["debt"]["tranches"]:
-        debt_rows.append(tranche)
-    tables.set_table("debt_tranches", pd.DataFrame(debt_rows))
+def _save_default_table(table_name: str, df: pd.DataFrame) -> None:
+    temp = InputTables()
+    temp.set_table(table_name, df)
+    store = _ensure_default_table_store()
+    store[table_name] = temp.ensure_table(table_name).copy()
 
-    tax_rows = [DEFAULTS["tax"]]
-    tables.set_table("tax_schedule", pd.DataFrame(tax_rows))
 
-    tables.set_table("inflation_index", DEFAULTS["inflation_index"])
-    tables.set_table("risk_params", DEFAULTS["risk_params"])
+def _restore_factory_default_table(table_name: str) -> pd.DataFrame:
+    factory_frames = _factory_default_frames()
+    df = factory_frames.get(
+        table_name,
+        pd.DataFrame(columns=list(INPUT_SCHEMAS[table_name].columns.keys())),
+    )
+    _save_default_table(table_name, df)
+    return _get_default_table(table_name)
+
+
+def _render_default_row_controls(table_name: str, label: str, schema, default_df: pd.DataFrame) -> None:
+    if default_df.empty:
+        st.info("No default rows defined yet – save the current table to create a baseline.")
+        return
+
+    st.markdown("##### Default baseline rows")
+    display_df = default_df.reset_index(drop=True)
+    for idx, row in display_df.iterrows():
+        col_widths = [1] * len(schema.columns) + [0.6]
+        row_cols = st.columns(col_widths)
+        for position, column_name in enumerate(schema.columns.keys()):
+            value = row.get(column_name, np.nan)
+            display_value = _display_default_value(value)
+            row_cols[position].markdown(
+                f"<span style='font-size:0.7rem;color:#6b6b6b'>{column_name.replace('_', ' ').title()}</span><br>"
+                f"<span style='font-weight:600'>{display_value}</span>",
+                unsafe_allow_html=True,
+            )
+        if row_cols[-1].button("Edit", key=f"default_edit_{table_name}_{idx}"):
+            st.session_state[DEFAULT_EDIT_STATE_KEY] = {"table": table_name, "row": int(idx)}
+            st.experimental_rerun()
+
+
+def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
+    edit_state = st.session_state.get(DEFAULT_EDIT_STATE_KEY)
+    if not edit_state or edit_state.get("table") != table_name:
+        return
+
+    row_index = int(edit_state.get("row", -1))
+    store = _ensure_default_table_store()
+    df = store.get(table_name)
+    if df is None or not (0 <= row_index < len(df)):
+        st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+        return
+
+    row = df.iloc[row_index]
+    with st.modal(f"Edit default row {row_index + 1} – {label}"):
+        form = st.form(key=f"default_edit_form_{table_name}_{row_index}")
+        updated_values: Dict[str, object] = {}
+        for column_name, dtype in schema.columns.items():
+            field_label = column_name.replace("_", " ").title()
+            current_value = row.get(column_name, np.nan)
+            if dtype == "int":
+                default_val = schema.defaults.get(column_name, 0)
+                base_value = int(default_val) if pd.isna(current_value) else int(current_value)
+                input_value = form.number_input(
+                    field_label,
+                    value=float(base_value),
+                    step=1.0,
+                    format="%d",
+                    key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                )
+                updated_values[column_name] = int(input_value)
+            elif dtype == "float":
+                default_val = schema.defaults.get(column_name, 0.0)
+                base_value = float(default_val) if pd.isna(current_value) else float(current_value)
+                input_value = form.number_input(
+                    field_label,
+                    value=base_value,
+                    step=0.01,
+                    format="%.6f",
+                    key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                )
+                updated_values[column_name] = float(input_value)
+            elif dtype == "bool":
+                default_val = bool(schema.defaults.get(column_name, False))
+                base_value = default_val if pd.isna(current_value) else bool(current_value)
+                input_value = form.checkbox(
+                    field_label,
+                    value=base_value,
+                    key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                )
+                updated_values[column_name] = bool(input_value)
+            else:
+                if current_value is None or (isinstance(current_value, float) and math.isnan(current_value)):
+                    text_value = ""
+                else:
+                    text_value = str(current_value)
+                input_value = form.text_input(
+                    field_label,
+                    value=text_value,
+                    key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                )
+                updated_values[column_name] = input_value if input_value != "" else None
+
+        if form.form_submit_button("Save changes", type="primary"):
+            updated_df = df.copy()
+            for column_name, value in updated_values.items():
+                updated_df.at[row_index, column_name] = value
+            _save_default_table(table_name, updated_df)
+            st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+            st.session_state[f"default_feedback_{table_name}"] = "Default row updated."
+            st.experimental_rerun()
+
+        if st.button("Cancel", key=f"default_edit_cancel_{table_name}_{row_index}"):
+            st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+            st.experimental_rerun()
+
+
+def _seed_tables_with_defaults(tables: InputTables) -> None:
+    """Populate session tables with the active default frames."""
+
+    default_store = _ensure_default_table_store()
+    for table_name, schema in INPUT_SCHEMAS.items():
+        default_df = default_store.get(table_name)
+        if default_df is None:
+            empty_df = pd.DataFrame(columns=list(schema.columns.keys()))
+            tables.set_table(table_name, empty_df)
+        else:
+            tables.set_table(table_name, default_df.copy())
 
 
 def _get_tables() -> InputTables:
@@ -409,6 +603,11 @@ def _render_table_editor(
         st.caption(description)
     schema = INPUT_SCHEMAS[table_name]
     df = tables.ensure_table(table_name).copy()
+
+    feedback_key = f"default_feedback_{table_name}"
+    feedback_message = st.session_state.pop(feedback_key, None)
+    if feedback_message:
+        st.success(feedback_message)
     controls = st.columns(2)
     if controls[0].button(f"Add row", key=f"add_{table_name}"):
         try:
@@ -478,6 +677,45 @@ def _render_table_editor(
                 st.error(f"Unable to update table: {exc}")
             else:
                 st.experimental_rerun()
+
+    current_df = tables.ensure_table(table_name).copy()
+
+    with st.expander("Manage defaults & clean start", expanded=False):
+        st.caption(
+            "Reset this table to the stored defaults or update the baseline values used when creating a clean workbook."
+        )
+        action_cols = st.columns(3)
+        if action_cols[0].button("Reset table to defaults", key=f"reset_defaults_{table_name}"):
+            try:
+                tables.set_table(table_name, _get_default_table(table_name))
+            except Exception as exc:
+                st.error(f"Unable to reset table: {exc}")
+            else:
+                st.session_state[feedback_key] = "Table reset to stored defaults."
+                st.experimental_rerun()
+        if action_cols[1].button("Save current as defaults", key=f"save_defaults_{table_name}"):
+            try:
+                _save_default_table(table_name, current_df)
+            except Exception as exc:
+                st.error(f"Unable to save defaults: {exc}")
+            else:
+                st.session_state[feedback_key] = "Stored defaults updated from current table."
+                st.experimental_rerun()
+        if action_cols[2].button("Restore factory defaults", key=f"factory_defaults_{table_name}"):
+            try:
+                restored_df = _restore_factory_default_table(table_name)
+                tables.set_table(table_name, restored_df)
+            except Exception as exc:
+                st.error(f"Unable to restore factory defaults: {exc}")
+            else:
+                st.session_state[feedback_key] = "Factory defaults restored and applied."
+                st.experimental_rerun()
+
+        defaults_df = _get_default_table(table_name)
+        _render_default_row_controls(table_name, label, schema, defaults_df)
+
+    _render_default_edit_modal(table_name, label, schema)
+
     if error_message:
         st.error(f"Validation error: {error_message}")
     st.divider()
