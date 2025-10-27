@@ -91,6 +91,40 @@ def _modal_container(title: str):
         yield False
 
 
+def _format_default_for_entry(value: object, dtype: str) -> object:
+    """Return a widget-friendly default for modal data-entry fields."""
+
+    if dtype == "bool":
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return False
+        return bool(value)
+    if value is None:
+        return ""
+    if isinstance(value, (float, np.floating)) and math.isnan(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
+def _parse_modal_entry(value: object, dtype: str) -> object:
+    """Convert modal widget values back into schema-compatible data."""
+
+    if dtype == "bool":
+        return bool(value)
+    text = str(value).strip() if value is not None else ""
+    if text == "":
+        return np.nan
+    try:
+        if dtype == "int":
+            return int(float(text))
+        if dtype == "float":
+            return float(text)
+    except ValueError:
+        raise ValueError(f"'{text}' is not a valid {dtype} value")
+    return text
+
+
 MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
@@ -664,19 +698,61 @@ def _render_table_editor(
     if feedback_message:
         st.success(feedback_message)
     controls = st.columns(2)
+    add_modal_key = f"show_add_modal_{table_name}"
     if controls[0].button(f"Add row", key=f"add_{table_name}"):
-        try:
-            tables.add_row(table_name, {})
-        except Exception as exc:  # pragma: no cover - validation feedback
-            st.error(f"Unable to add row: {exc}")
-        df = tables.ensure_table(table_name).copy()
-        st.session_state[feedback_key] = (
-            "New row added. Scroll to the bottom of the table and click inside any "
-            "cell to type your values. Press Enter or click outside the cell to "
-            "save the edit."
-        )
-        _update_editor_state(table_name, tables)
-        _safe_rerun()
+        st.session_state[add_modal_key] = True
+
+    if st.session_state.get(add_modal_key):
+        modal_title = f"Add {label} row"
+        with _modal_container(modal_title):
+            schema_columns = list(schema.columns.items())
+            with st.form(f"add_row_form_{table_name}"):
+                form_values: Dict[str, object] = {}
+                for col_name, dtype in schema_columns:
+                    pretty_label = col_name.replace("_", " ").title()
+                    default_value = schema.defaults.get(col_name, np.nan)
+                    if dtype == "bool":
+                        form_values[col_name] = st.checkbox(
+                            pretty_label,
+                            value=_format_default_for_entry(default_value, dtype),
+                            key=f"add_row_{table_name}_{col_name}",
+                        )
+                    else:
+                        form_values[col_name] = st.text_input(
+                            pretty_label,
+                            value=_format_default_for_entry(default_value, dtype),
+                            key=f"add_row_{table_name}_{col_name}",
+                        )
+
+                submit_col, cancel_col = st.columns(2)
+                submitted = submit_col.form_submit_button("Save row", use_container_width=True)
+                cancelled = cancel_col.form_submit_button("Cancel", use_container_width=True, type="secondary")
+
+            if cancelled:
+                st.session_state.pop(add_modal_key, None)
+                for col_name, _ in schema_columns:
+                    st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
+                _safe_rerun()
+            elif submitted:
+                try:
+                    row_payload: Dict[str, object] = {}
+                    for col_name, dtype in schema_columns:
+                        widget_value = form_values[col_name]
+                        row_payload[col_name] = _parse_modal_entry(widget_value, dtype)
+                    tables.add_row(table_name, row_payload)
+                except Exception as exc:
+                    st.error(f"Unable to add row: {exc}")
+                else:
+                    st.session_state[feedback_key] = (
+                        "Row added successfully. You can fine-tune the values directly "
+                        "in the table below."
+                    )
+                    st.session_state.pop(add_modal_key, None)
+                    for col_name, _ in schema_columns:
+                        st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
+                    _update_editor_state(table_name, tables)
+                    _safe_rerun()
+
     if not df.empty:
         remove_idx = controls[1].selectbox(
             "Row to remove",
