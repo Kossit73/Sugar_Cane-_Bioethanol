@@ -53,15 +53,23 @@ def _safe_rerun() -> None:
         pass
 
 
+def _editor_state_key(table_name: str) -> str:
+    """Return the canonical widget state key for a given table editor."""
+
+    return f"table_editor__{table_name}"
+
+
 def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     """Synchronise the Streamlit data editor state with the backing table."""
 
     _ = tables  # retained for signature compatibility
-    state_key = f"editor_{table_name}"
+    state_key = _editor_state_key(table_name)
     # Streamlit forbids direct writes to widget-managed keys once the widget is
     # instantiated. Clearing the state entry ensures the next render picks up
-    # the refreshed DataFrame without violating session-state policies.
+    # the refreshed DataFrame without violating session-state policies. Also
+    # purge the legacy key from earlier builds to avoid conflicts.
     st.session_state.pop(state_key, None)
+    st.session_state.pop(f"editor_{table_name}", None)
 
 
 @contextmanager
@@ -579,7 +587,7 @@ def _get_tables() -> InputTables:
 def _sync_tables_from_state(tables: InputTables) -> Dict[str, str]:
     errors: Dict[str, str] = {}
     for table_name in INPUT_SCHEMAS.keys():
-        state_key = f"editor_{table_name}"
+        state_key = _editor_state_key(table_name)
         value = st.session_state.get(state_key)
         if isinstance(value, pd.DataFrame):
             try:
@@ -679,11 +687,16 @@ def _render_table_editor(
             df = tables.ensure_table(table_name).copy()
             _update_editor_state(table_name, tables)
             _safe_rerun()
+    state_key = _editor_state_key(table_name)
+    # Clear any legacy widget state that may have been set by previous builds
+    # using the old key to avoid Streamlit policy violations on render.
+    st.session_state.pop(f"editor_{table_name}", None)
+
     editor = st.data_editor(
         df,
         num_rows="dynamic",
         use_container_width=True,
-        key=f"editor_{table_name}",
+        key=state_key,
     )
     if isinstance(editor, pd.DataFrame):
         editor_clean = editor.copy()
