@@ -53,6 +53,16 @@ def _safe_rerun() -> None:
         pass
 
 
+def _update_editor_state(table_name: str, tables: "InputTables") -> None:
+    """Synchronise the Streamlit data editor state with the backing table."""
+
+    state_key = f"editor_{table_name}"
+    try:
+        st.session_state[state_key] = tables.ensure_table(table_name).copy()
+    except Exception:
+        st.session_state.pop(state_key, None)
+
+
 @contextmanager
 def _modal_container(title: str):
     """Yield a modal-like container, falling back when `st.modal` is unavailable."""
@@ -651,6 +661,7 @@ def _render_table_editor(
         except Exception as exc:  # pragma: no cover - validation feedback
             st.error(f"Unable to add row: {exc}")
         df = tables.ensure_table(table_name).copy()
+        _update_editor_state(table_name, tables)
         _safe_rerun()
     if not df.empty:
         remove_idx = controls[1].selectbox(
@@ -665,6 +676,7 @@ def _render_table_editor(
             except Exception as exc:  # pragma: no cover - defensive feedback
                 st.error(f"Unable to remove row: {exc}")
             df = tables.ensure_table(table_name).copy()
+            _update_editor_state(table_name, tables)
             _safe_rerun()
     editor = st.data_editor(
         df,
@@ -714,6 +726,7 @@ def _render_table_editor(
             except Exception as exc:
                 st.error(f"Unable to update table: {exc}")
             else:
+                _update_editor_state(table_name, tables)
                 _safe_rerun()
 
     current_df = tables.ensure_table(table_name).copy()
@@ -730,6 +743,7 @@ def _render_table_editor(
                 st.error(f"Unable to reset table: {exc}")
             else:
                 st.session_state[feedback_key] = "Table reset to stored defaults."
+                _update_editor_state(table_name, tables)
                 _safe_rerun()
         if action_cols[1].button("Save current as defaults", key=f"save_defaults_{table_name}"):
             try:
@@ -747,6 +761,7 @@ def _render_table_editor(
                 st.error(f"Unable to restore factory defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Factory defaults restored and applied."
+                _update_editor_state(table_name, tables)
                 _safe_rerun()
 
         defaults_df = _get_default_table(table_name)
@@ -932,7 +947,9 @@ def main() -> None:
             st.caption("Production volumes are set to zero outside the defined production horizon.")
             try:
                 tables.set_table("projection_horizon", pd.DataFrame([horizon]))
+                _update_editor_state("projection_horizon", tables)
                 tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
+                _update_editor_state("production_horizon", tables)
             except Exception as exc:
                 st.warning(f"Projection inputs not saved due to validation error: {exc}")
 
@@ -973,7 +990,9 @@ def main() -> None:
             st.caption(f"Owner equity share automatically set to {1.0 - investor_share:.2f}")
             try:
                 tables.set_table("global_inputs", pd.DataFrame([global_inputs]))
+                _update_editor_state("global_inputs", tables)
                 tables.set_table("working_capital_days", pd.DataFrame([cfg["working_capital"]]))
+                _update_editor_state("working_capital_days", tables)
             except Exception as exc:
                 st.warning(f"Global inputs not saved due to validation error: {exc}")
 
@@ -1078,6 +1097,8 @@ def main() -> None:
                 tables.set_table("revenue_params", revenue_table)
             except Exception as exc:
                 st.warning(f"Pricing table not saved due to validation error: {exc}")
+            else:
+                _update_editor_state("revenue_params", tables)
 
         with control_tabs[4]:
             st.markdown("### Risk and scenario options")
