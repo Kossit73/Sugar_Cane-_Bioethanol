@@ -37,6 +37,17 @@ def _streamlit_runtime_exists() -> bool:
             return False
 
 
+def _safe_rerun() -> None:
+    """Attempt to trigger a Streamlit rerun only when a runtime exists."""
+
+    if not _streamlit_runtime_exists():
+        return
+    try:
+        st.experimental_rerun()
+    except StreamlitAPIException:  # pragma: no cover - defensive catch
+        pass
+
+
 MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
 try:  # noqa: SIM105 - streamlit feedback when dependencies missing
     from model import (
@@ -429,7 +440,7 @@ def _render_default_row_controls(table_name: str, label: str, schema, default_df
             )
         if row_cols[-1].button("Edit", key=f"default_edit_{table_name}_{idx}"):
             st.session_state[DEFAULT_EDIT_STATE_KEY] = {"table": table_name, "row": int(idx)}
-            st.experimental_rerun()
+            _safe_rerun()
 
 
 def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
@@ -501,11 +512,11 @@ def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
             _save_default_table(table_name, updated_df)
             st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
             st.session_state[f"default_feedback_{table_name}"] = "Default row updated."
-            st.experimental_rerun()
+            _safe_rerun()
 
         if st.button("Cancel", key=f"default_edit_cancel_{table_name}_{row_index}"):
             st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
-            st.experimental_rerun()
+            _safe_rerun()
 
 
 def _seed_tables_with_defaults(tables: InputTables) -> None:
@@ -614,7 +625,8 @@ def _render_table_editor(
             tables.add_row(table_name, {})
         except Exception as exc:  # pragma: no cover - validation feedback
             st.error(f"Unable to add row: {exc}")
-        st.experimental_rerun()
+        df = tables.ensure_table(table_name).copy()
+        _safe_rerun()
     if not df.empty:
         remove_idx = controls[1].selectbox(
             "Row to remove",
@@ -627,7 +639,8 @@ def _render_table_editor(
                 tables.remove_row(table_name, int(remove_idx))
             except Exception as exc:  # pragma: no cover - defensive feedback
                 st.error(f"Unable to remove row: {exc}")
-            st.experimental_rerun()
+            df = tables.ensure_table(table_name).copy()
+            _safe_rerun()
     editor = st.data_editor(
         df,
         num_rows="dynamic",
@@ -676,7 +689,7 @@ def _render_table_editor(
             except Exception as exc:
                 st.error(f"Unable to update table: {exc}")
             else:
-                st.experimental_rerun()
+                _safe_rerun()
 
     current_df = tables.ensure_table(table_name).copy()
 
@@ -692,7 +705,7 @@ def _render_table_editor(
                 st.error(f"Unable to reset table: {exc}")
             else:
                 st.session_state[feedback_key] = "Table reset to stored defaults."
-                st.experimental_rerun()
+                _safe_rerun()
         if action_cols[1].button("Save current as defaults", key=f"save_defaults_{table_name}"):
             try:
                 _save_default_table(table_name, current_df)
@@ -700,7 +713,7 @@ def _render_table_editor(
                 st.error(f"Unable to save defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Stored defaults updated from current table."
-                st.experimental_rerun()
+                _safe_rerun()
         if action_cols[2].button("Restore factory defaults", key=f"factory_defaults_{table_name}"):
             try:
                 restored_df = _restore_factory_default_table(table_name)
@@ -709,7 +722,7 @@ def _render_table_editor(
                 st.error(f"Unable to restore factory defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Factory defaults restored and applied."
-                st.experimental_rerun()
+                _safe_rerun()
 
         defaults_df = _get_default_table(table_name)
         _render_default_row_controls(table_name, label, schema, defaults_df)
