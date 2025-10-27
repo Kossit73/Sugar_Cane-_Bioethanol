@@ -473,8 +473,21 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         derived=lambda df: _derive_direct_costs(df),
     ),
     "staff_costs_monthly": TableSchema(
-        columns={"date": "str", "dept": "str", "headcount": "float", "gross_pay": "float", "benefits": "float", "training": "float", "other": "float", "currency": "str"},
-        defaults={"currency": "USD"},
+        columns={
+            "date": "str",
+            "dept": "str",
+            "headcount": "float",
+            "gross_pay": "float",
+            "benefits": "float",
+            "training": "float",
+            "other": "float",
+            "gross_pay_per_head": "float",
+            "benefits_per_head": "float",
+            "training_per_head": "float",
+            "other_per_head": "float",
+            "currency": "str",
+        },
+        defaults={"currency": "USD", "gross_pay_per_head": 0.0, "benefits_per_head": 0.0, "training_per_head": 0.0, "other_per_head": 0.0},
     ),
     "other_opex_monthly": TableSchema(
         columns={"date": "str", "category": "str", "amount": "float", "currency": "str"},
@@ -1394,8 +1407,25 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     )
     if "headcount" not in staff_costs.columns:
         staff_costs["headcount"] = 0.0
+
     for col in ("gross_pay", "benefits", "training", "other", "headcount"):
         staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
+
+    cost_components = ("gross_pay", "benefits", "training", "other")
+    for col in cost_components:
+        per_head_col = f"{col}_per_head"
+        if per_head_col in staff_costs.columns:
+            staff_costs[per_head_col] = pd.to_numeric(
+                staff_costs[per_head_col], errors="coerce"
+            ).fillna(0.0)
+        else:
+            staff_costs[per_head_col] = 0.0
+
+        per_head_values = staff_costs[per_head_col]
+        computed_totals = per_head_values * staff_costs["headcount"]
+        totals = staff_costs[col]
+        use_per_head = per_head_values > 0
+        staff_costs[col] = np.where(use_per_head, computed_totals, totals)
 
     staff_costs_detail = (
         staff_costs.groupby(["date", "dept", "currency"], dropna=False)[

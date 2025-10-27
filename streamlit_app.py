@@ -400,6 +400,10 @@ def _factory_default_frames() -> Dict[str, pd.DataFrame]:
                     "benefits": 25_000.0,
                     "training": 5_000.0,
                     "other": 10_000.0,
+                    "gross_pay_per_head": 3_000.0,
+                    "benefits_per_head": 500.0,
+                    "training_per_head": 100.0,
+                    "other_per_head": 200.0,
                     "currency": "USD",
                 }
             ]
