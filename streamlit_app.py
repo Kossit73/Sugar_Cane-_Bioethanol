@@ -670,6 +670,11 @@ def _render_table_editor(
         except Exception as exc:  # pragma: no cover - validation feedback
             st.error(f"Unable to add row: {exc}")
         df = tables.ensure_table(table_name).copy()
+        st.session_state[feedback_key] = (
+            "New row added. Scroll to the bottom of the table and click inside any "
+            "cell to type your values. Press Enter or click outside the cell to "
+            "save the edit."
+        )
         _update_editor_state(table_name, tables)
         _safe_rerun()
     if not df.empty:
