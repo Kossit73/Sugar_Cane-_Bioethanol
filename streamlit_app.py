@@ -56,11 +56,12 @@ def _safe_rerun() -> None:
 def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     """Synchronise the Streamlit data editor state with the backing table."""
 
+    _ = tables  # retained for signature compatibility
     state_key = f"editor_{table_name}"
-    try:
-        st.session_state[state_key] = tables.ensure_table(table_name).copy()
-    except Exception:
-        st.session_state.pop(state_key, None)
+    # Streamlit forbids direct writes to widget-managed keys once the widget is
+    # instantiated. Clearing the state entry ensures the next render picks up
+    # the refreshed DataFrame without violating session-state policies.
+    st.session_state.pop(state_key, None)
 
 
 @contextmanager
