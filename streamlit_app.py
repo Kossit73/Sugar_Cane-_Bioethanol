@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 import sys
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -50,6 +51,25 @@ def _safe_rerun() -> None:
         # Older Streamlit builds or embedded executions may surface bespoke
         # rerun exceptions; swallow them so non-Streamlit contexts keep running.
         pass
+
+
+@contextmanager
+def _modal_container(title: str):
+    """Yield a modal-like container, falling back when `st.modal` is unavailable."""
+
+    if hasattr(st, "modal"):
+        with st.modal(title):
+            yield True
+        return
+
+    # Fallback for older Streamlit releases – use an expander to host the form.
+    with st.expander(title, expanded=True):
+        st.info(
+            "Modal dialogs are not supported in this Streamlit version; "
+            "editing is displayed inline instead.",
+            icon="ℹ️",
+        )
+        yield False
 
 
 MODEL_IMPORT_ERROR: ModuleNotFoundError | None = None
@@ -460,7 +480,7 @@ def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
         return
 
     row = df.iloc[row_index]
-    with st.modal(f"Edit default row {row_index + 1} – {label}"):
+    with _modal_container(f"Edit default row {row_index + 1} – {label}") as modal_supported:
         form = st.form(key=f"default_edit_form_{table_name}_{row_index}")
         updated_values: Dict[str, object] = {}
         for column_name, dtype in schema.columns.items():
@@ -509,7 +529,8 @@ def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
                 )
                 updated_values[column_name] = input_value if input_value != "" else None
 
-        if form.form_submit_button("Save changes", type="primary"):
+        submit_label = "Save changes" if modal_supported else "Save inline changes"
+        if form.form_submit_button(submit_label, type="primary"):
             updated_df = df.copy()
             for column_name, value in updated_values.items():
                 updated_df.at[row_index, column_name] = value
