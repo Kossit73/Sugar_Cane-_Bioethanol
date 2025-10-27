@@ -270,6 +270,32 @@ def detect_assumptions(sheets: Mapping[str, pd.DataFrame]) -> Dict[str, object]:
     return assumptions
 
 
+def _coerce_int(value: object, default: int) -> int:
+    if value is None:
+        return int(default)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return int(default)
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return int(default)
+        try:
+            return int(float(value))
+        except ValueError:
+            return int(default)
+    try:
+        numeric = float(value)
+        if math.isnan(numeric):
+            return int(default)
+        return int(numeric)
+    except Exception:
+        return int(default)
+
+
 def _coerce_float(value: object, default: float) -> float:
     if value is None or value == "":
         return default
@@ -286,6 +312,28 @@ def _coerce_str(value: object, default: Optional[str] = None) -> Optional[str]:
     if value == "":
         return default
     return value
+
+
+def _validate_projection_horizon(row: pd.Series) -> None:
+    start = row.get("start_year")
+    end = row.get("end_year")
+    if pd.isna(start) or pd.isna(end):
+        return
+    start_val = _coerce_int(start, DEFAULTS["horizon"]["start_year"])
+    end_val = _coerce_int(end, start_val)
+    if end_val < start_val:
+        raise ValueError("end_year must be >= start_year")
+
+
+def _validate_production_horizon(row: pd.Series) -> None:
+    start = row.get("start_year")
+    end = row.get("end_year")
+    if pd.isna(start) or pd.isna(end):
+        return
+    start_val = _coerce_int(start, DEFAULTS["production_horizon"]["start_year"])
+    end_val = _coerce_int(end, start_val)
+    if end_val < start_val:
+        raise ValueError("production end_year must be >= start_year")
 ###############################################################################
 # Section 3: Input tables and CRUD helpers
 ###############################################################################
@@ -302,17 +350,12 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
     "projection_horizon": TableSchema(
         columns={"start_year": "int", "end_year": "int", "start_month": "int", "frequency": "str"},
         defaults={"frequency": "monthly", "start_month": 1},
-        validators=[
-            lambda row: (_ for _ in ()).throw(ValueError("end_year must be >= start_year")) if int(row["end_year"]) < int(row["start_year"]) else None,
-        ],
+        validators=[_validate_projection_horizon],
     ),
     "production_horizon": TableSchema(
         columns={"start_year": "int", "end_year": "int"},
         defaults=dict(DEFAULTS["production_horizon"]),
-        validators=[
-            lambda row: (_ for _ in ()).throw(ValueError("production end_year must be >= start_year"))
-            if int(row["end_year"]) < int(row["start_year"]) else None,
-        ],
+        validators=[_validate_production_horizon],
     ),
     "global_inputs": TableSchema(
         columns={
@@ -591,13 +634,13 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
 
     for key, value in assumptions.items():
         if key in {"start_year", "end_year", "start_month"}:
-            cfg["projection_horizon"][key] = int(float(value))
+            cfg["projection_horizon"][key] = _coerce_int(value, cfg["projection_horizon"][key])
         elif key == "frequency":
             cfg["projection_horizon"]["frequency"] = str(value).lower()
         elif key in {"production_start_year", "operations_start_year"}:
-            cfg["production_horizon"]["start_year"] = int(float(value))
+            cfg["production_horizon"]["start_year"] = _coerce_int(value, cfg["production_horizon"]["start_year"])
         elif key in {"production_end_year", "operations_end_year"}:
-            cfg["production_horizon"]["end_year"] = int(float(value))
+            cfg["production_horizon"]["end_year"] = _coerce_int(value, cfg["production_horizon"]["end_year"])
         elif key in cfg["global_inputs"]:
             if isinstance(cfg["global_inputs"][key], str):
                 cfg["global_inputs"][key] = _coerce_str(value, cfg["global_inputs"][key])
@@ -632,9 +675,9 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
     if not tables.tables["projection_horizon"].empty:
         horizon_row = tables.tables["projection_horizon"].iloc[0]
         cfg["projection_horizon"].update({
-            "start_year": int(horizon_row.get("start_year", cfg["projection_horizon"]["start_year"])),
-            "end_year": int(horizon_row.get("end_year", cfg["projection_horizon"]["end_year"])),
-            "start_month": int(horizon_row.get("start_month", cfg["projection_horizon"]["start_month"])),
+            "start_year": _coerce_int(horizon_row.get("start_year"), cfg["projection_horizon"]["start_year"]),
+            "end_year": _coerce_int(horizon_row.get("end_year"), cfg["projection_horizon"]["end_year"]),
+            "start_month": _coerce_int(horizon_row.get("start_month"), cfg["projection_horizon"]["start_month"]),
             "frequency": horizon_row.get("frequency", cfg["projection_horizon"]["frequency"]),
         })
 
@@ -642,8 +685,8 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
     if not tables.tables["production_horizon"].empty:
         prod_row = tables.tables["production_horizon"].iloc[0]
         cfg["production_horizon"].update({
-            "start_year": int(prod_row.get("start_year", cfg["production_horizon"]["start_year"])),
-            "end_year": int(prod_row.get("end_year", cfg["production_horizon"]["end_year"])),
+            "start_year": _coerce_int(prod_row.get("start_year"), cfg["production_horizon"]["start_year"]),
+            "end_year": _coerce_int(prod_row.get("end_year"), cfg["production_horizon"]["end_year"]),
         })
 
     if cfg["production_horizon"]["start_year"] < cfg["projection_horizon"]["start_year"]:
@@ -748,8 +791,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     monthly_index = timeline.monthly_index()
     annual_years = timeline.annual_index()
     prod_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
-    prod_start_year = int(prod_horizon.get("start_year", timeline.start_year))
-    prod_end_year = int(prod_horizon.get("end_year", timeline.end_year))
+    prod_start_year = _coerce_int(prod_horizon.get("start_year"), timeline.start_year)
+    prod_end_year = _coerce_int(prod_horizon.get("end_year"), timeline.end_year)
 
     def _default_production_table() -> pd.DataFrame:
         base = DEFAULTS["production"]
@@ -843,14 +886,18 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
         monthly_rows: List[Dict[str, object]] = []
         seasonality = np.ones(MONTHS_IN_YEAR) / MONTHS_IN_YEAR
         for _, row in source.iterrows():
+            year_value = _coerce_int(row.get("year"), timeline.start_year)
+            volume_value = float(row.get("volume", 0.0) or 0.0)
+            if math.isnan(volume_value):
+                volume_value = 0.0
             for month in range(1, MONTHS_IN_YEAR + 1):
-                date = pd.Timestamp(year=int(row["year"]), month=month, day=1)
+                date = pd.Timestamp(year=year_value, month=month, day=1)
                 if date not in monthly_index:
                     continue
                 if date.year < prod_start_year or date.year > prod_end_year:
                     volume = 0.0
                 else:
-                    volume = float(row["volume"]) * seasonality[month - 1]
+                    volume = volume_value * seasonality[month - 1]
                 monthly_rows.append(
                     {
                         "date": date,
@@ -1052,7 +1099,7 @@ def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> D
                     "is_farm_capex": bool(row.get("is_farm_capex", False)),
                 }
             )
-        life_years = int(row.get("life_years", 10))
+        life_years = max(1, _coerce_int(row.get("life_years"), 10))
         depr_rate_override = row.get("depr_rate_override")
         if pd.notna(depr_rate_override) and float(depr_rate_override) > 0:
             life_months = int(round(12 / float(depr_rate_override)))
@@ -1145,8 +1192,8 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
         draw_curve = parse_draw_curve(tranche.get("draw_curve"), monthly_index)
         draws = draw_curve * principal_total
         rate = float(tranche.get("interest_rate", cfg["debt"].get("global_rate", 0.1))) + float(tranche.get("base_rate", 0.0)) + float(tranche.get("margin", 0.0))
-        tenor_years = int(tranche.get("tenor_years", 8))
-        grace_years = int(tranche.get("grace_years", 1))
+        tenor_years = max(0, _coerce_int(tranche.get("tenor_years"), 8))
+        grace_years = max(0, _coerce_int(tranche.get("grace_years"), 1))
         capitalize_idc = bool(tranche.get("capitalize_idc", True))
         amortization = str(tranche.get("amortization", "straight")).lower()
 
@@ -1255,7 +1302,9 @@ def tax_block(pnl_df: pd.DataFrame, cfg: Mapping[str, object]) -> pd.DataFrame:
         else:
             nol_queue.append((idx, -taxable_after_loss))
             if nol_years is not None:
-                nol_queue = [(age, val) for age, val in nol_queue if idx - age < int(nol_years) * 12]
+                nol_horizon = max(0, _coerce_int(nol_years, 0))
+                if nol_horizon > 0:
+                    nol_queue = [(age, val) for age, val in nol_queue if idx - age < nol_horizon * 12]
         rows.append({"date": date, "taxable_income": taxable_after_loss, "tax": tax, "loss_carryforward": sum(val for _, val in nol_queue)})
     return pd.DataFrame(rows)
 ###############################################################################
