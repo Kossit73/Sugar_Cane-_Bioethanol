@@ -1363,6 +1363,9 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     direct_costs_total = direct_costs.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
 
     staff_costs = cfg.get("staff_costs_monthly") if "staff_costs_monthly" in cfg else pd.DataFrame()
+    default_currency = cfg.get("global_inputs", {}).get(
+        "base_currency", DEFAULTS["global"].get("base_currency", "USD")
+    )
     if isinstance(staff_costs, pd.DataFrame) and not staff_costs.empty:
         staff_costs = staff_costs.copy()
         staff_costs["date"] = pd.to_datetime(staff_costs["date"])
@@ -1376,19 +1379,49 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
                 "benefits": 0.0,
                 "training": 0.0,
                 "other": 0.0,
-                "currency": DEFAULTS["global"].get("base_currency", "USD"),
+                "currency": default_currency,
             }
         )
     for col in ("dept", "currency"):
         if col not in staff_costs.columns:
-            default_val = "" if col == "dept" else DEFAULTS["global"].get("base_currency", "USD")
+            default_val = "" if col == "dept" else default_currency
             staff_costs[col] = default_val
+    staff_costs["dept"] = (
+        staff_costs["dept"].fillna("Unassigned").astype(str).replace({"": "Unassigned"})
+    )
+    staff_costs["currency"] = (
+        staff_costs["currency"].fillna(default_currency).astype(str).replace({"": default_currency})
+    )
     if "headcount" not in staff_costs.columns:
         staff_costs["headcount"] = 0.0
     for col in ("gross_pay", "benefits", "training", "other", "headcount"):
         staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
+
+    staff_costs_detail = (
+        staff_costs.groupby(["date", "dept", "currency"], dropna=False)[
+            ["headcount", "gross_pay", "benefits", "training", "other"]
+        ]
+        .sum()
+        .reset_index()
+    )
+    staff_costs_detail = staff_costs_detail.sort_values(["date", "dept"]).reset_index(drop=True)
+    for col in ("gross_pay", "benefits", "training", "other"):
+        staff_costs_detail[f"{col}_per_head"] = np.where(
+            staff_costs_detail["headcount"] > 0,
+            staff_costs_detail[col] / staff_costs_detail["headcount"],
+            0.0,
+        )
+    staff_costs_detail["total_cost"] = staff_costs_detail[
+        ["gross_pay", "benefits", "training", "other"]
+    ].sum(axis=1)
+    staff_costs_detail["total_cost_per_head"] = np.where(
+        staff_costs_detail["headcount"] > 0,
+        staff_costs_detail["total_cost"] / staff_costs_detail["headcount"],
+        0.0,
+    )
+
     staff_costs_total = (
-        staff_costs.groupby("date")[["gross_pay", "benefits", "training", "other"]]
+        staff_costs_detail.groupby("date")[["gross_pay", "benefits", "training", "other"]]
         .sum()
         .reindex(monthly_index, fill_value=0.0)
         .sum(axis=1)
@@ -1462,15 +1495,61 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     diff = balance_sheet["TotalAssets"] - (balance_sheet["TotalLiabilities"] + balance_sheet["Equity"])
     assert (diff.abs() < 1e-3).all(), "Balance sheet does not balance"
 
-    return {"pnl": pnl_df, "cashflow": cash_flow_df, "balancesheet": balance_sheet}
+    return {
+        "pnl": pnl_df,
+        "cashflow": cash_flow_df,
+        "balancesheet": balance_sheet,
+        "staff_costs_detail": staff_costs_detail,
+    }
 
 
 def aggregate_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    if monthly_df is None or monthly_df.empty:
+        return pd.DataFrame()
+
     df = monthly_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
     df["year"] = df["date"].dt.year
-    numeric_cols = df.select_dtypes(include=[float, int, np.number]).columns
-    numeric_cols = [col for col in numeric_cols if col != "year"]
-    agg_df = df.groupby("year")[numeric_cols].sum().reset_index()
+
+    numeric_cols = df.select_dtypes(include=[float, int, np.number]).columns.tolist()
+    per_head_cols = [col for col in numeric_cols if col.endswith("_per_head")]
+    sum_cols = [col for col in numeric_cols if col not in per_head_cols and col != "year"]
+
+    group_cols: List[str] = ["year"]
+    for col in df.columns:
+        if col in {"date", "year"}:
+            continue
+        if col in sum_cols or col in per_head_cols:
+            continue
+        group_cols.append(col)
+
+    grouped = df.groupby(group_cols, dropna=False)
+    if "headcount" in sum_cols:
+        sum_targets = [col for col in sum_cols if col != "headcount"]
+        if sum_targets:
+            agg_df = grouped[sum_targets].sum().reset_index()
+        else:
+            agg_df = grouped.size().reset_index(name="_tmp")
+            agg_df = agg_df.drop(columns=["_tmp"])
+        headcount_series = grouped["headcount"].mean().reset_index(name="headcount")
+        agg_df = agg_df.merge(headcount_series, on=group_cols, how="left")
+    else:
+        agg_df = grouped[sum_cols].sum().reset_index()
+
+    if "headcount" in agg_df.columns:
+        headcount = agg_df["headcount"].replace({0: np.nan})
+    else:
+        headcount = None
+
+    for col in per_head_cols:
+        base_col = col[: -len("_per_head")]
+        if headcount is not None and base_col in agg_df.columns:
+            agg_df[col] = np.where(headcount.fillna(0.0) > 0, agg_df[base_col] / headcount, 0.0)
+        else:
+            agg_df[col] = 0.0
+
+    numeric_result_cols = agg_df.select_dtypes(include=[float, int, np.number]).columns
+    agg_df[numeric_result_cols] = agg_df[numeric_result_cols].fillna(0.0)
     return agg_df
 ###############################################################################
 # Section 12: Valuation metrics
@@ -1902,6 +1981,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
 
     statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+    staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
     valuation = project_cashflows(statements, cfg, timeline)
     dashboard = build_dashboard(cfg, statements, production_monthly, revenue_df, valuation, out_dir=export_dir)
     be = break_even_analysis(statements, revenue_df, production_monthly)
@@ -1923,6 +2003,9 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "dashboard": dashboard,
         "break_even": be,
     }
+    if isinstance(staff_detail, pd.DataFrame):
+        results["staff_costs_detail"] = staff_detail
+        results["staff_costs_detail_annual"] = aggregate_annual(staff_detail)
     return results
 ###############################################################################
 # Section 17: Export utilities

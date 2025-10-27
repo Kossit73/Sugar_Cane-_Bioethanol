@@ -1273,6 +1273,31 @@ def main() -> None:
             cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
             st.bar_chart(cash_chart)
 
+        staff_monthly = results.get("staff_costs_detail")
+        if isinstance(staff_monthly, pd.DataFrame) and not staff_monthly.empty:
+            staff_monthly_view = staff_monthly.copy()
+            staff_monthly_view["date"] = pd.to_datetime(staff_monthly_view["date"])
+            staff_monthly_view = staff_monthly_view.sort_values(["date", "dept"]).reset_index(drop=True)
+            _render_dataframe(
+                staff_monthly_view,
+                "Staff operating cost breakdown (monthly)",
+                key="staff_costs_detail_monthly",
+            )
+
+        staff_annual = results.get("staff_costs_detail_annual")
+        if isinstance(staff_annual, pd.DataFrame) and not staff_annual.empty:
+            sort_cols = ["year"]
+            if "dept" in staff_annual.columns:
+                sort_cols.append("dept")
+            if "currency" in staff_annual.columns and "currency" not in sort_cols:
+                sort_cols.append("currency")
+            staff_annual_view = staff_annual.sort_values(sort_cols).reset_index(drop=True)
+            _render_dataframe(
+                staff_annual_view,
+                "Staff operating cost breakdown (annual)",
+                key="staff_costs_detail_annual",
+            )
+
     statement_configs = [
         ("Income Statement (P&L)", "pnl"),
         ("Statement of Cash Flows", "cashflow"),
