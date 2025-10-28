@@ -133,6 +133,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         INPUT_SCHEMAS,
         PRODUCTS,
         InputTables,
+        align_with_projection_horizon,
         build_config,
         monte_carlo,
         run_full_model,
@@ -700,6 +701,37 @@ LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
 ]
 
 
+HORIZON_SYNC_TABLES: Tuple[str, ...] = (
+    "capex_lines",
+    "production_monthly",
+    "direct_costs_monthly",
+    "staff_costs_monthly",
+    "other_opex_monthly",
+    "ar_other_assets",
+    "inventory_ap",
+    "inflation_index",
+)
+
+
+def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None:
+    """Update time-indexed tables in the UI after horizon edits."""
+
+    errors: List[str] = []
+    for table in HORIZON_SYNC_TABLES:
+        df = cfg.get(table)
+        if not isinstance(df, pd.DataFrame):
+            continue
+        try:
+            tables.set_table(table, df.copy())
+        except Exception as exc:  # pragma: no cover - UI validation feedback
+            errors.append(f"{table}: {exc}")
+        else:
+            _update_editor_state(table, tables)
+            cfg[table] = tables.ensure_table(table).copy()
+    for message in errors:
+        st.warning(f"Unable to align {message}")
+
+
 def _render_table_editor(
     tables: InputTables,
     table_name: str,
@@ -1067,6 +1099,9 @@ def main() -> None:
                 _update_editor_state("production_horizon", tables)
             except Exception as exc:
                 st.warning(f"Projection inputs not saved due to validation error: {exc}")
+            else:
+                cfg = align_with_projection_horizon(cfg)
+                _sync_tables_to_horizon(tables, cfg)
 
         global_inputs = cfg["global_inputs"]
         with control_tabs[1]:

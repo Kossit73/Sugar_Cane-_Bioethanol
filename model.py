@@ -314,6 +314,116 @@ def _coerce_str(value: object, default: Optional[str] = None) -> Optional[str]:
     return value
 
 
+def _projection_horizon_bounds(horizon: Mapping[str, object]) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """Return inclusive timestamps for the active projection horizon."""
+
+    start_year = _coerce_int(horizon.get("start_year"), DEFAULTS["horizon"]["start_year"])
+    end_year = _coerce_int(horizon.get("end_year"), DEFAULTS["horizon"]["end_year"])
+    start_month = _coerce_int(horizon.get("start_month"), DEFAULTS["horizon"].get("start_month", 1))
+
+    if end_year < start_year:
+        end_year = start_year
+
+    start_ts = pd.Timestamp(year=start_year, month=start_month, day=1)
+    end_ts = pd.Timestamp(year=end_year, month=12, day=1)
+    if end_ts < start_ts:
+        end_ts = start_ts
+    return start_ts, end_ts
+
+
+def _filter_dates_to_horizon(
+    df: pd.DataFrame,
+    column: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> pd.DataFrame:
+    """Clamp a dataframe to the projection horizon based on a date column."""
+
+    if column not in df.columns:
+        return df
+
+    df_local = df.copy()
+    df_local[column] = pd.to_datetime(df_local[column], errors="coerce")
+    df_local = df_local[pd.notna(df_local[column])]
+    if df_local.empty:
+        return df_local.reset_index(drop=True)
+
+    mask = (df_local[column] >= start_ts) & (df_local[column] <= end_ts)
+    df_local = df_local[mask]
+    return df_local.reset_index(drop=True)
+
+
+def align_with_projection_horizon(cfg: Dict[str, object]) -> Dict[str, object]:
+    """Propagate projection horizon changes across time-based input tables."""
+
+    start_ts, end_ts = _projection_horizon_bounds(cfg.get("projection_horizon", DEFAULTS["horizon"]))
+
+    production_horizon = cfg.setdefault("production_horizon", dict(DEFAULTS["production_horizon"]))
+    production_horizon["start_year"] = max(
+        _coerce_int(production_horizon.get("start_year"), start_ts.year),
+        start_ts.year,
+    )
+    production_horizon["end_year"] = min(
+        _coerce_int(production_horizon.get("end_year"), end_ts.year),
+        end_ts.year,
+    )
+    if production_horizon["end_year"] < production_horizon["start_year"]:
+        production_horizon["end_year"] = production_horizon["start_year"]
+
+    capex_df = cfg.get("capex_lines")
+    if isinstance(capex_df, pd.DataFrame) and not capex_df.empty:
+        capex_adj = capex_df.copy()
+        capex_adj["start_date"] = capex_adj["start_date"].apply(lambda v: parse_date_str(v, start_ts))
+        capex_adj["end_date"] = capex_adj["end_date"].apply(lambda v: parse_date_str(v, end_ts))
+        capex_adj.loc[capex_adj["start_date"] < start_ts, "start_date"] = start_ts
+        capex_adj.loc[capex_adj["start_date"] > end_ts, "start_date"] = end_ts
+        capex_adj.loc[capex_adj["end_date"] < start_ts, "end_date"] = start_ts
+        capex_adj.loc[capex_adj["end_date"] > end_ts, "end_date"] = end_ts
+        capex_adj.loc[capex_adj["end_date"] < capex_adj["start_date"], "end_date"] = capex_adj["start_date"]
+        capex_adj["start_date"] = capex_adj["start_date"].dt.to_period("M").dt.to_timestamp()
+        capex_adj["end_date"] = capex_adj["end_date"].dt.to_period("M").dt.to_timestamp()
+        cfg["capex_lines"] = capex_adj.reset_index(drop=True)
+
+    for table in (
+        "production_monthly",
+        "direct_costs_monthly",
+        "staff_costs_monthly",
+        "other_opex_monthly",
+        "ar_other_assets",
+        "inventory_ap",
+    ):
+        df = cfg.get(table)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            cfg[table] = _filter_dates_to_horizon(df, "date", start_ts, end_ts)
+
+    prod_annual = cfg.get("production_annual")
+    if isinstance(prod_annual, pd.DataFrame) and not prod_annual.empty and "year" in prod_annual.columns:
+        prod_annual = prod_annual.copy()
+        prod_annual["year"] = pd.to_numeric(prod_annual["year"], errors="coerce")
+        mask = prod_annual["year"].between(start_ts.year, end_ts.year)
+        cfg["production_annual"] = prod_annual[mask].reset_index(drop=True)
+
+    inflation_df = cfg.get("inflation_index")
+    if isinstance(inflation_df, pd.DataFrame) and not inflation_df.empty and "date" in inflation_df.columns:
+        filtered = _filter_dates_to_horizon(inflation_df, "date", start_ts, end_ts)
+        if filtered.empty:
+            monthly_index = pd.date_range(start_ts, end_ts, freq="MS")
+            inflation_rate = cfg.get("global_inputs", {}).get(
+                "inflation_rate", DEFAULTS["global"].get("inflation_rate", 0.0)
+            )
+            filtered = pd.DataFrame(
+                {
+                    "date": monthly_index,
+                    "cpi": (1 + inflation_rate / 12) ** np.arange(len(monthly_index)),
+                    "fx_pair": np.nan,
+                    "fx_index": np.nan,
+                }
+            )
+        cfg["inflation_index"] = filtered
+
+    return cfg
+
+
 def _validate_projection_horizon(row: pd.Series) -> None:
     start = row.get("start_year")
     end = row.get("end_year")
@@ -790,7 +900,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
     cfg["production"].setdefault("feedstock_scenario", "HYBRID")
     cfg["production"].setdefault("farm_share", 0.5)
 
-    return cfg
+    return align_with_projection_horizon(cfg)
 ###############################################################################
 # Section 5: Timeline utilities
 ###############################################################################
