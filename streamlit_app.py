@@ -503,7 +503,12 @@ def _restore_factory_default_table(table_name: str) -> pd.DataFrame:
     return _get_default_table(table_name)
 
 
-def _render_default_row_controls(table_name: str, label: str, schema, default_df: pd.DataFrame) -> None:
+def _render_default_row_controls(
+    table_name: str,
+    label: str,
+    schema,
+    default_df: pd.DataFrame,
+) -> None:
     if default_df.empty:
         st.info("No default rows defined yet – save the current table to create a baseline.")
         return
@@ -526,7 +531,7 @@ def _render_default_row_controls(table_name: str, label: str, schema, default_df
             _safe_rerun()
 
 
-def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
+def _render_default_edit_modal(table_name: str, label: str, schema, tables: "InputTables") -> None:
     edit_state = st.session_state.get(DEFAULT_EDIT_STATE_KEY)
     if not edit_state or edit_state.get("table") != table_name:
         return
@@ -594,9 +599,18 @@ def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
             for column_name, value in updated_values.items():
                 updated_df.at[row_index, column_name] = value
             _save_default_table(table_name, updated_df)
-            st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
-            st.session_state[f"default_feedback_{table_name}"] = "Default row updated."
-            _safe_rerun()
+            # Apply the refreshed defaults to the live table so downstream
+            # schedules pick up the edited baseline immediately.
+            try:
+                refreshed_defaults = _get_default_table(table_name)
+                tables.set_table(table_name, refreshed_defaults)
+            except Exception as exc:
+                st.error(f"Default saved but unable to update table: {exc}")
+            else:
+                _update_editor_state(table_name, tables)
+                st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+                st.session_state[f"default_feedback_{table_name}"] = "Default row updated and applied."
+                _safe_rerun()
 
         if st.button("Cancel", key=f"default_edit_cancel_{table_name}_{row_index}"):
             st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
@@ -868,7 +882,7 @@ def _render_table_editor(
         defaults_df = _get_default_table(table_name)
         _render_default_row_controls(table_name, label, schema, defaults_df)
 
-    _render_default_edit_modal(table_name, label, schema)
+    _render_default_edit_modal(table_name, label, schema, tables)
 
     if error_message:
         st.error(f"Validation error: {error_message}")
