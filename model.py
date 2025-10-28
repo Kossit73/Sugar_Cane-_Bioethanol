@@ -46,6 +46,13 @@ import pandas as pd
 PRODUCTS: Tuple[str, ...] = ("ethanol", "sugar", "electricity", "animal_feed")
 FEEDSTOCK_SCENARIOS: Tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
 MONTHS_IN_YEAR = 12
+RISK_MULTIPLIER_COLUMNS: Dict[str, str] = {
+    "production_multiplier": "production",
+    "labour_multiplier": "labour",
+    "price_multiplier": "price",
+    "revenue_multiplier": "revenue",
+    "yield_multiplier": "yield",
+}
 
 DEFAULTS = {
     "horizon": {"start_year": 2025, "end_year": 2035, "start_month": 1, "frequency": "monthly"},
@@ -123,8 +130,76 @@ DEFAULTS = {
     ),
     "risk_params": pd.DataFrame(
         [
-            {"driver_name": "ethanol_price", "distribution": "normal", "p1": 0.0, "p2": 0.05, "p3": np.nan, "target": "price", "applies_to": "ethanol"},
-            {"driver_name": "availability", "distribution": "normal", "p1": 0.0, "p2": 0.02, "p3": np.nan, "target": "availability", "applies_to": "global"},
+            {
+                "driver_name": "political_risk",
+                "distribution": "triangular",
+                "p1": -0.015,
+                "p2": 0.0,
+                "p3": 0.015,
+                "target": "risk",
+                "applies_to": "global",
+                "production_multiplier": 0.99,
+                "labour_multiplier": 1.02,
+                "price_multiplier": 1.005,
+                "revenue_multiplier": 0.995,
+                "yield_multiplier": 0.995,
+            },
+            {
+                "driver_name": "environmental_risk",
+                "distribution": "normal",
+                "p1": -0.025,
+                "p2": 0.012,
+                "p3": np.nan,
+                "target": "risk",
+                "applies_to": "global",
+                "production_multiplier": 0.97,
+                "labour_multiplier": 1.01,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 0.97,
+                "yield_multiplier": 0.95,
+            },
+            {
+                "driver_name": "market_risk",
+                "distribution": "normal",
+                "p1": -0.03,
+                "p2": 0.018,
+                "p3": np.nan,
+                "target": "risk",
+                "applies_to": "market",
+                "production_multiplier": 0.99,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 0.96,
+                "revenue_multiplier": 0.96,
+                "yield_multiplier": 1.0,
+            },
+            {
+                "driver_name": "ethanol_price",
+                "distribution": "normal",
+                "p1": 0.0,
+                "p2": 0.05,
+                "p3": np.nan,
+                "target": "price",
+                "applies_to": "ethanol",
+                "production_multiplier": 1.0,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 1.0,
+                "yield_multiplier": 1.0,
+            },
+            {
+                "driver_name": "availability",
+                "distribution": "normal",
+                "p1": 0.0,
+                "p2": 0.02,
+                "p3": np.nan,
+                "target": "availability",
+                "applies_to": "global",
+                "production_multiplier": 1.0,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 1.0,
+                "yield_multiplier": 1.0,
+            },
         ]
     ),
 }
@@ -424,6 +499,20 @@ def align_with_projection_horizon(cfg: Dict[str, object]) -> Dict[str, object]:
     return cfg
 
 
+def compute_risk_profile(risk_params: Optional[pd.DataFrame]) -> Dict[str, float]:
+    profile = {name: 1.0 for name in RISK_MULTIPLIER_COLUMNS.values()}
+    if isinstance(risk_params, pd.DataFrame) and not risk_params.empty:
+        for _, row in risk_params.iterrows():
+            for column, key in RISK_MULTIPLIER_COLUMNS.items():
+                if column in row and pd.notna(row[column]):
+                    try:
+                        value = float(row[column])
+                    except (TypeError, ValueError):
+                        continue
+                    profile[key] *= max(value, 0.0)
+    return profile
+
+
 def _validate_projection_horizon(row: pd.Series) -> None:
     start = row.get("start_year")
     end = row.get("end_year")
@@ -642,7 +731,33 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         columns={"date": "str", "cpi": "float", "fx_pair": "str", "fx_index": "float"},
     ),
     "risk_params": TableSchema(
-        columns={"driver_name": "str", "distribution": "str", "p1": "float", "p2": "float", "p3": "float", "target": "str", "applies_to": "str"},
+        columns={
+            "driver_name": "str",
+            "distribution": "str",
+            "p1": "float",
+            "p2": "float",
+            "p3": "float",
+            "target": "str",
+            "applies_to": "str",
+            "production_multiplier": "float",
+            "labour_multiplier": "float",
+            "price_multiplier": "float",
+            "revenue_multiplier": "float",
+            "yield_multiplier": "float",
+        },
+        defaults={
+            "distribution": "normal",
+            "p1": 0.0,
+            "p2": 0.0,
+            "p3": np.nan,
+            "target": "risk",
+            "applies_to": "global",
+            "production_multiplier": 1.0,
+            "labour_multiplier": 1.0,
+            "price_multiplier": 1.0,
+            "revenue_multiplier": 1.0,
+            "yield_multiplier": 1.0,
+        },
     ),
 }
 
@@ -946,10 +1061,16 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     prod_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
     prod_start_year = _coerce_int(prod_horizon.get("start_year"), timeline.start_year)
     prod_end_year = _coerce_int(prod_horizon.get("end_year"), timeline.end_year)
+    risk_profile = cfg.get("risk_profile", {})
+    production_factor = max(float(risk_profile.get("production", 1.0)), 0.0)
+    yield_factor = max(float(risk_profile.get("yield", 1.0)), 0.0)
+    scaling_factor = production_factor * yield_factor
 
     def _default_production_table() -> pd.DataFrame:
         base = DEFAULTS["production"]
         feedstock = base["annual_feedstock_ton"]
+        adjusted_yield = base["sugarcane_yield_ton_per_ha"] * (yield_factor if yield_factor > 0 else 1.0)
+        adjusted_yield = adjusted_yield if adjusted_yield > 0 else base["sugarcane_yield_ton_per_ha"]
         return pd.DataFrame(
             [
                 {
@@ -962,8 +1083,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
                     "boe_conversion": np.nan,
-                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
-                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                    "sugarcane_yield_ton_per_ha": adjusted_yield,
+                    "farm_area_ha": feedstock / adjusted_yield if adjusted_yield else np.nan,
                 },
                 {
                     "product": "sugar",
@@ -975,8 +1096,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
                     "boe_conversion": np.nan,
-                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
-                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                    "sugarcane_yield_ton_per_ha": adjusted_yield,
+                    "farm_area_ha": feedstock / adjusted_yield if adjusted_yield else np.nan,
                 },
                 {
                     "product": "electricity",
@@ -988,8 +1109,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
                     "boe_conversion": np.nan,
-                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
-                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                    "sugarcane_yield_ton_per_ha": adjusted_yield,
+                    "farm_area_ha": feedstock / adjusted_yield if adjusted_yield else np.nan,
                 },
                 {
                     "product": "animal_feed",
@@ -1001,8 +1122,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     "loss_factor": base["loss_factor"],
                     "startup_ramp": "0.7;0.9;1.0",
                     "boe_conversion": np.nan,
-                    "sugarcane_yield_ton_per_ha": base["sugarcane_yield_ton_per_ha"],
-                    "farm_area_ha": feedstock / base["sugarcane_yield_ton_per_ha"],
+                    "sugarcane_yield_ton_per_ha": adjusted_yield,
+                    "farm_area_ha": feedstock / adjusted_yield if adjusted_yield else np.nan,
                 },
             ]
         )
@@ -1033,6 +1154,18 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
             prod_annual = _default_production_table()
 
         prod_annual["annual_volume"] = pd.to_numeric(prod_annual["annual_volume"], errors="coerce").fillna(0.0)
+        prod_annual["annual_volume"] *= production_factor if production_factor else 0.0
+        prod_annual["annual_volume"] *= yield_factor if yield_factor else 0.0
+        if "sugarcane_yield_ton_per_ha" in prod_annual.columns:
+            prod_annual["sugarcane_yield_ton_per_ha"] = (
+                pd.to_numeric(prod_annual["sugarcane_yield_ton_per_ha"], errors="coerce").fillna(0.0)
+                * (yield_factor if yield_factor else 1.0)
+            )
+        if "farm_area_ha" in prod_annual.columns and yield_factor not in {0.0, 0}:
+            prod_annual["farm_area_ha"] = (
+                pd.to_numeric(prod_annual["farm_area_ha"], errors="coerce").fillna(0.0)
+                / yield_factor
+            )
         return prod_annual
 
     def _monthly_from_annual(source: pd.DataFrame) -> pd.DataFrame:
@@ -1084,6 +1217,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
             annual_df.loc[(annual_df["year"] < prod_start_year) | (annual_df["year"] > prod_end_year), "volume"] = 0.0
 
         raw_monthly = cfg.get("production_monthly") if isinstance(cfg.get("production_monthly"), pd.DataFrame) else None
+        monthly_from_manual = False
         if raw_monthly is not None and not raw_monthly.empty:
             monthly_df = raw_monthly.copy()
             monthly_df.columns = [normalize_key(col) if isinstance(col, str) else col for col in monthly_df.columns]
@@ -1103,8 +1237,10 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     monthly_df["volume"] = pd.to_numeric(monthly_df["volume"], errors="coerce").fillna(0.0)
                     mask = monthly_df["date"].dt.year.between(prod_start_year, prod_end_year)
                     monthly_df.loc[~mask, "volume"] = 0.0
+                    monthly_from_manual = True
         else:
             monthly_df = _monthly_from_annual(annual_df)
+            monthly_from_manual = False
     except KeyError:
         # Any unexpected column issues fall back to a fully defaulted schedule so the
         # broader model can continue executing without raising ``KeyError: 'product'``.
@@ -1124,6 +1260,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 )
         annual_df = pd.DataFrame(annual_rows)
         monthly_df = _monthly_from_annual(annual_df)
+        monthly_from_manual = False
 
     required_order = ["date", "product", "volume", "availability_override", "maintenance_downtime", "loss_override"]
     for col in required_order:
@@ -1142,6 +1279,11 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
         # ``KeyError`` branch.
         annual_df["year"] = [year for year in annual_years for _ in range(len(prod_annual))][: len(annual_df)]
 
+    monthly_df["volume"] = pd.to_numeric(monthly_df["volume"], errors="coerce").fillna(0.0)
+    annual_df["volume"] = pd.to_numeric(annual_df["volume"], errors="coerce").fillna(0.0)
+    if monthly_from_manual:
+        monthly_df["volume"] *= scaling_factor
+
     return monthly_df, annual_df
 ###############################################################################
 # Section 7: Pricing and revenue
@@ -1152,6 +1294,8 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
     monthly_index = timeline.monthly_index()
     inflation_rate = cfg["global_inputs"].get("inflation_rate", DEFAULTS["global"]["inflation_rate"])
     inflation_index = cfg.get("inflation_index")
+    risk_profile = cfg.get("risk_profile", {})
+    price_multiplier = float(risk_profile.get("price", 1.0))
     if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty:
         idx = inflation_index.copy()
         idx["date"] = pd.to_datetime(idx["date"])
@@ -1169,6 +1313,7 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
             price = base_price * ((1 + monthly_escalation) ** i)
             if params.get("price_indexation", "cpi").lower() == "cpi" and "cpi" in idx:
                 price *= idx.loc[date, "cpi"]
+            price *= price_multiplier
             records.append({"date": date, "product": product, "price": price, "uom": params.get("uom", "")})
     return pd.DataFrame(records)
 
@@ -1178,6 +1323,10 @@ def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFr
     df["price"].fillna(0.0, inplace=True)
     df["revenue"] = df["volume"] * df["price"]
     df["currency"] = cfg["global_inputs"].get("base_currency", "USD")
+    risk_profile = cfg.get("risk_profile", {})
+    revenue_multiplier = float(risk_profile.get("revenue", 1.0))
+    if not math.isclose(revenue_multiplier, 1.0):
+        df["revenue"] *= revenue_multiplier
     return df
 ###############################################################################
 # Section 8: CAPEX and depreciation
@@ -1545,6 +1694,10 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         .reset_index()
     )
     staff_costs_detail = staff_costs_detail.sort_values(["date", "dept"]).reset_index(drop=True)
+    labour_multiplier = float(cfg.get("risk_profile", {}).get("labour", 1.0))
+    if not math.isclose(labour_multiplier, 1.0):
+        for col in ("gross_pay", "benefits", "training", "other"):
+            staff_costs_detail[col] *= labour_multiplier
     for col in ("gross_pay", "benefits", "training", "other"):
         staff_costs_detail[f"{col}_per_head"] = np.where(
             staff_costs_detail["headcount"] > 0,
@@ -1961,11 +2114,11 @@ def sensitivity_tornado(cfg: Mapping[str, object], base_results: Dict[str, objec
 
 def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], iterations: int = 2000, random_seed: int = 42) -> Dict[str, object]:
     rng = np.random.default_rng(random_seed)
-    risk_params = cfg.get("risk_params")
-    if isinstance(risk_params, pd.DataFrame):
-        params = risk_params.to_dict("records")
+    risk_params_df = cfg.get("risk_params")
+    if not isinstance(risk_params_df, pd.DataFrame) or risk_params_df.empty:
+        risk_params_df = DEFAULTS["risk_params"].copy()
     else:
-        params = DEFAULTS["risk_params"].to_dict("records")
+        risk_params_df = risk_params_df.copy()
     project_npvs = []
     equity_irrs = []
     unit_margins = []
@@ -1973,7 +2126,8 @@ def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, 
 
     for _ in range(iterations):
         sample_cfg = copy.deepcopy(cfg)
-        for param in params:
+        risk_df = risk_params_df.copy().reset_index(drop=True)
+        for idx, param in risk_df.iterrows():
             dist = param.get("distribution", "normal")
             p1, p2, p3 = param.get("p1", 0.0), param.get("p2", 0.0), param.get("p3", 0.0)
             if dist == "normal":
@@ -1986,9 +2140,15 @@ def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, 
                 draw = rng.uniform(p1, p2)
             else:
                 draw = p1
-            target = param.get("target", "price")
+            target = str(param.get("target", "price")).lower()
             applies_to = param.get("applies_to", "global")
-            if target == "price" and applies_to in sample_cfg["prices"]:
+            if target == "risk":
+                for column in RISK_MULTIPLIER_COLUMNS:
+                    if column in risk_df.columns and pd.notna(param.get(column)):
+                        current = float(param.get(column, 1.0))
+                        adjustment = max(0.0, 1 + draw)
+                        risk_df.at[idx, column] = current * adjustment
+            elif target == "price" and applies_to in sample_cfg["prices"]:
                 sample_cfg["prices"][applies_to]["base_price"] *= (1 + draw)
             elif target == "availability":
                 sample_cfg["production"]["plant_availability"] *= (1 + draw)
@@ -2002,6 +2162,8 @@ def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, 
                 elif isinstance(sample_cfg["capex_lines"], list):
                     for line in sample_cfg["capex_lines"]:
                         line["amount"] *= (1 + draw)
+        sample_cfg["risk_params"] = risk_df
+        sample_cfg["risk_profile"] = compute_risk_profile(risk_df)
         result = run_model_fn(sample_cfg)
         project_npvs.append(result["metrics"].get("Project_NPV", np.nan))
         equity_irrs.append(result["metrics"].get("Equity_IRR", np.nan))
@@ -2095,6 +2257,13 @@ def break_even_analysis(statements: Dict[str, pd.DataFrame], revenue_df: pd.Data
 
 
 def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None) -> Dict[str, object]:
+    cfg = copy.deepcopy(dict(cfg))
+    risk_params = cfg.get("risk_params")
+    if not isinstance(risk_params, pd.DataFrame) or risk_params.empty:
+        risk_params = DEFAULTS["risk_params"].copy()
+        cfg["risk_params"] = risk_params
+    cfg["risk_profile"] = compute_risk_profile(risk_params)
+
     timeline = Timeline(
         start_year=int(cfg["projection_horizon"]["start_year"]),
         end_year=int(cfg["projection_horizon"]["end_year"]),
@@ -2142,6 +2311,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "metrics": valuation["metrics"],
         "dashboard": dashboard,
         "break_even": be,
+        "risk_profile": cfg.get("risk_profile", {}),
     }
     if isinstance(staff_detail, pd.DataFrame):
         results["staff_costs_detail"] = staff_detail
