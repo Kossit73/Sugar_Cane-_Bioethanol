@@ -14,7 +14,7 @@ import math
 import re
 import sys
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -136,10 +136,12 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         align_with_projection_horizon,
         build_config,
         monte_carlo,
+        parse_ramp,
         run_full_model,
         run_scenarios,
         sensitivity_tornado,
         normalize_key,
+        Timeline,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
     MODEL_IMPORT_ERROR = exc
@@ -712,6 +714,53 @@ HORIZON_SYNC_TABLES: Tuple[str, ...] = (
 )
 
 
+YEARLY_INCREMENT_CONFIG = {
+    "production_annual": {
+        "kind": "production",
+        "columns": {
+            "annual_volume": "Annual volume annual change (%)",
+        },
+    },
+    "direct_costs_monthly": {
+        "kind": "monthly",
+        "columns": {
+            "unit_price": "Unit price annual change (%)",
+            "quantity": "Quantity annual change (%)",
+        },
+        "reset_amount": True,
+    },
+    "staff_costs_monthly": {
+        "kind": "monthly",
+        "columns": {
+            "headcount": "Headcount annual change (%)",
+            "gross_pay": "Gross pay annual change (%)",
+            "benefits": "Benefits annual change (%)",
+            "training": "Training annual change (%)",
+            "other": "Other staff cost annual change (%)",
+        },
+        "per_head_map": {
+            "gross_pay": "gross_pay_per_head",
+            "benefits": "benefits_per_head",
+            "training": "training_per_head",
+            "other": "other_per_head",
+        },
+    },
+    "other_opex_monthly": {
+        "kind": "monthly",
+        "columns": {
+            "amount": "Other opex annual change (%)",
+        },
+    },
+    "inflation_index": {
+        "kind": "monthly",
+        "columns": {
+            "cpi": "CPI annual change (%)",
+            "fx_index": "FX index annual change (%)",
+        },
+    },
+}
+
+
 def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None:
     """Update time-indexed tables in the UI after horizon edits."""
 
@@ -731,18 +780,370 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
         st.warning(f"Unable to align {message}")
 
 
+def _auto_step(value: float) -> float:
+    magnitude = abs(float(value))
+    if magnitude == 0:
+        return 1.0
+    step = 10 ** math.floor(math.log10(magnitude))
+    return max(step * 0.1, 0.01)
+
+
+def _infer_date_format(template: object) -> str:
+    if isinstance(template, str):
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", template):
+            return "%Y-%m-%d"
+        if re.fullmatch(r"\d{4}-\d{2}", template):
+            return "%Y-%m"
+    return "%Y-%m-%d"
+
+
+def _format_date_like(date_value: pd.Timestamp, template: object) -> str:
+    fmt = _infer_date_format(template)
+    return date_value.strftime(fmt)
+
+
+def _growth_factor(percent: float, offset: int, mode: str) -> float:
+    if offset <= 0:
+        return 1.0
+    pct = float(percent or 0.0)
+    if mode == "increase":
+        pct = abs(pct)
+    elif mode == "decrease":
+        pct = -abs(pct)
+    elif mode == "copy":
+        pct = 0.0
+    base = 1.0 + pct / 100.0
+    if base <= 0:
+        return 0.0
+    return base ** offset
+
+
+def _apply_yearly_increment_monthly(
+    df: pd.DataFrame,
+    value_columns: Iterable[str],
+    percent_map: Dict[str, float],
+    timeline: Timeline,
+    base_year: int,
+    mode: str,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise ValueError("Add at least one row for the selected table before applying yearly increments.")
+    if "date" not in df.columns:
+        raise ValueError("The selected table does not include a 'date' column.")
+
+    working = df.copy()
+    working["__date_ts"] = pd.to_datetime(working["date"], errors="coerce")
+    working = working.dropna(subset=["__date_ts"])  # remove rows without valid dates
+    if working.empty:
+        raise ValueError("No valid dates detected in the current table.")
+
+    base_rows = working[working["__date_ts"].dt.year == int(base_year)].copy()
+    if base_rows.empty:
+        raise ValueError("No rows found for the selected base year. Update the table and try again.")
+
+    for column in value_columns:
+        if column in base_rows.columns:
+            base_rows[column] = pd.to_numeric(base_rows[column], errors="coerce").fillna(0.0)
+
+    template_sample = base_rows.iloc[0]["date"]
+    years = [year for year in timeline.annual_index() if year >= int(base_year)]
+    if not years:
+        raise ValueError("Projection horizon does not extend beyond the selected base year.")
+
+    generated_rows: List[Dict[str, object]] = []
+    for year in years:
+        offset = year - int(base_year)
+        for _, row in base_rows.iterrows():
+            new_row = row.copy()
+            new_date = row["__date_ts"].replace(year=int(year))
+            new_row["date"] = _format_date_like(new_date, template_sample)
+            for column in value_columns:
+                if column not in new_row:
+                    continue
+                base_value = float(row.get(column, 0.0) or 0.0)
+                factor = _growth_factor(percent_map.get(column, 0.0), offset, mode)
+                new_row[column] = base_value * factor
+            generated_rows.append(new_row)
+
+    result = pd.DataFrame(generated_rows)
+    if result.empty:
+        raise ValueError("No rows generated from the yearly increment helper.")
+
+    result = result.drop(columns=["__date_ts"], errors="ignore")
+    result["__sort"] = pd.to_datetime(result["date"], errors="coerce")
+    result = result.sort_values(["__sort"] + [col for col in base_rows.columns if col not in {"__date_ts", "date"}])
+    result = result.drop(columns=["__sort"], errors="ignore").reset_index(drop=True)
+
+    # Reorder columns to match the original DataFrame structure
+    result = result.reindex(columns=list(df.columns), fill_value=np.nan)
+    return result
+
+
+def _apply_yearly_increment_production(
+    df: pd.DataFrame,
+    base_values: Dict[str, float],
+    percent_map: Dict[str, float],
+    timeline: Timeline,
+    production_horizon: Mapping[str, object],
+    mode: str,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise ValueError("Add at least one product row before applying yearly increments.")
+
+    years = timeline.annual_index()
+    if not years:
+        raise ValueError("Projection horizon is not defined.")
+
+    prod_start = max(int(production_horizon.get("start_year", years[0])), years[0])
+    prod_end = min(int(production_horizon.get("end_year", years[-1])), years[-1])
+    if prod_end < prod_start:
+        raise ValueError("Production horizon is not aligned with the projection horizon.")
+
+    updated = df.copy()
+    for idx, row in updated.iterrows():
+        product = str(row.get("product", "")).strip()
+        if not product:
+            continue
+        base_volume = float(base_values.get(product, row.get("annual_volume", 0.0)) or 0.0)
+        base_volume = max(base_volume, 0.0)
+        percent = float(percent_map.get(product, 0.0) or 0.0)
+
+        volumes_by_year: List[float] = []
+        for year in years:
+            if year < prod_start or year > prod_end:
+                volumes_by_year.append(0.0)
+                continue
+            offset = year - prod_start
+            factor = _growth_factor(percent, offset, mode)
+            volumes_by_year.append(base_volume * factor)
+
+        if base_volume <= 0:
+            ramp_values = [0.0 for _ in years]
+        else:
+            ramp_values = []
+            for year, volume in zip(years, volumes_by_year):
+                if year < prod_start or year > prod_end:
+                    ramp_values.append(0.0)
+                else:
+                    ramp_values.append(volume / base_volume if base_volume else 0.0)
+
+        ramp_str = ";".join(f"{value:.6f}" for value in ramp_values)
+        updated.at[idx, "annual_volume"] = base_volume
+        updated.at[idx, "startup_ramp"] = ramp_str
+
+    return updated
+
+
+def _render_yearly_increment_helper(
+    tables: InputTables,
+    table_name: str,
+    df: pd.DataFrame,
+    timeline: Timeline,
+    production_horizon: Mapping[str, object],
+) -> None:
+    config = YEARLY_INCREMENT_CONFIG.get(table_name)
+    if not config:
+        return
+
+    helper_key = f"{table_name}_yearly_helper"
+    with st.expander("Yearly increment helper", expanded=False):
+        st.caption(
+            "Fill the first year's values and specify the annual percentage change to populate future years automatically."
+        )
+
+        if config["kind"] == "production":
+            if df.empty:
+                st.info("Add production rows before applying yearly changes.")
+                return
+
+            years = timeline.annual_index()
+            if not years:
+                st.warning("Projection horizon years are not available.")
+                return
+
+            prod_start = max(int(production_horizon.get("start_year", years[0])), years[0])
+            prod_end = min(int(production_horizon.get("end_year", years[-1])), years[-1])
+            st.write(
+                f"First production year: **{prod_start}**. Values outside {prod_start}–{prod_end} are set to zero."
+            )
+
+            base_values: Dict[str, float] = {}
+            percent_map: Dict[str, float] = {}
+            controls = []
+            for _, row in df.iterrows():
+                product = str(row.get("product", "")).strip()
+                if not product:
+                    continue
+                ramp = parse_ramp(row.get("startup_ramp"), len(years))
+                base_index = years.index(prod_start) if prod_start in years else 0
+                base_actual = float(row.get("annual_volume", 0.0) or 0.0)
+                if ramp:
+                    base_actual *= float(ramp[base_index])
+                base_actual = max(base_actual, 0.0)
+
+                base_key = f"{helper_key}_{product}_base"
+                change_key = f"{helper_key}_{product}_pct"
+
+                base_input = st.number_input(
+                    f"{product.replace('_', ' ').title()} first production year volume",
+                    min_value=0.0,
+                    value=base_actual,
+                    step=_auto_step(base_actual),
+                    format="%.4f",
+                    key=base_key,
+                )
+                pct_input = st.number_input(
+                    f"{product.replace('_', ' ').title()} annual change (%)",
+                    value=0.0,
+                    step=0.1,
+                    format="%.4f",
+                    key=change_key,
+                )
+                base_values[product] = float(base_input)
+                percent_map[product] = float(pct_input)
+                controls.append(product)
+
+            if not controls:
+                st.info("No product rows detected. Add products to the Production Volumes table first.")
+                return
+
+            action_cols = st.columns(3)
+            copy_clicked = action_cols[0].button("Copy forward", key=f"{helper_key}_copy")
+            inc_clicked = action_cols[1].button("Apply increases", key=f"{helper_key}_inc")
+            dec_clicked = action_cols[2].button("Apply decreases", key=f"{helper_key}_dec")
+
+            mode = None
+            if copy_clicked:
+                mode = "copy"
+            elif inc_clicked:
+                mode = "increase"
+            elif dec_clicked:
+                mode = "decrease"
+
+            if mode:
+                try:
+                    updated_df = _apply_yearly_increment_production(
+                        df,
+                        base_values,
+                        percent_map,
+                        timeline,
+                        production_horizon,
+                        mode,
+                    )
+                except ValueError as exc:
+                    st.error(f"Unable to apply yearly increments: {exc}")
+                else:
+                    try:
+                        tables.set_table(table_name, updated_df)
+                    except Exception as exc:
+                        st.error(f"Unable to update production table: {exc}")
+                    else:
+                        st.success("Production ramp updated from yearly changes.")
+                        _update_editor_state(table_name, tables)
+                        _safe_rerun()
+
+        else:  # monthly-style tables
+            if df.empty:
+                st.info("Add at least one row before applying yearly changes.")
+                return
+
+            years = timeline.annual_index()
+            if not years:
+                st.warning("Projection horizon years are not available.")
+                return
+
+            base_year = st.number_input(
+                "Base year",
+                min_value=int(years[0]),
+                max_value=int(years[-1]),
+                value=int(years[0]),
+                step=1,
+                key=f"{helper_key}_base_year",
+            )
+
+            percent_map = {
+                column: float(
+                    st.number_input(
+                        label,
+                        value=0.0,
+                        step=0.1,
+                        format="%.4f",
+                        key=f"{helper_key}_{column}_pct",
+                    )
+                )
+                for column, label in config["columns"].items()
+            }
+
+            action_cols = st.columns(3)
+            copy_clicked = action_cols[0].button("Copy forward", key=f"{helper_key}_copy")
+            inc_clicked = action_cols[1].button("Apply increases", key=f"{helper_key}_inc")
+            dec_clicked = action_cols[2].button("Apply decreases", key=f"{helper_key}_dec")
+
+            mode = None
+            if copy_clicked:
+                mode = "copy"
+            elif inc_clicked:
+                mode = "increase"
+            elif dec_clicked:
+                mode = "decrease"
+
+            if mode:
+                try:
+                    updated_df = _apply_yearly_increment_monthly(
+                        df,
+                        config["columns"].keys(),
+                        percent_map,
+                        timeline,
+                        int(base_year),
+                        mode,
+                    )
+                except ValueError as exc:
+                    st.error(f"Unable to apply yearly increments: {exc}")
+                else:
+                    if config.get("reset_amount") and "amount" in updated_df.columns:
+                        updated_df["amount"] = np.nan
+
+                    if table_name == "staff_costs_monthly":
+                        headcount = pd.to_numeric(updated_df.get("headcount"), errors="coerce").fillna(0.0)
+                        updated_df["headcount"] = headcount
+                        per_head_map = config.get("per_head_map", {})
+                        for total_col, per_col in per_head_map.items():
+                            if total_col in updated_df.columns:
+                                updated_df[total_col] = pd.to_numeric(
+                                    updated_df[total_col], errors="coerce"
+                                ).fillna(0.0)
+                                if per_col in updated_df.columns:
+                                    updated_df[per_col] = np.where(
+                                        headcount > 0,
+                                        updated_df[total_col] / headcount,
+                                        0.0,
+                                    )
+
+                    try:
+                        tables.set_table(table_name, updated_df)
+                    except Exception as exc:
+                        st.error(f"Unable to update table: {exc}")
+                    else:
+                        st.success("Yearly changes applied to the table.")
+                        _update_editor_state(table_name, tables)
+                        _safe_rerun()
 def _render_table_editor(
     tables: InputTables,
     table_name: str,
     label: str,
     error_message: Optional[str] = None,
     description: Optional[str] = None,
+    helper: Optional[Callable[[InputTables, str, pd.DataFrame], None]] = None,
 ) -> None:
     st.markdown(f"#### {label}")
     if description:
         st.caption(description)
     schema = INPUT_SCHEMAS[table_name]
     df = tables.ensure_table(table_name).copy()
+
+    if helper is not None:
+        helper(tables, table_name, df)
+        df = tables.ensure_table(table_name).copy()
 
     feedback_key = f"default_feedback_{table_name}"
     feedback_message = st.session_state.pop(feedback_key, None)
@@ -1274,6 +1675,12 @@ def main() -> None:
                 )
                 monte_seed = st.number_input("Monte Carlo random seed", value=42, step=1)
 
+    timeline = Timeline(
+        int(horizon["start_year"]),
+        int(horizon["end_year"]),
+        int(horizon.get("start_month", 1)),
+    )
+
     with st.spinner("Running base model..."):
         try:
             results = run_full_model(cfg)
@@ -1304,7 +1711,23 @@ def main() -> None:
             for table_name, message in sync_errors.items():
                 st.error(f"{table_name}: {message}")
         for label, table_name, description in LANDING_TABLES:
-            _render_table_editor(tables, table_name, label, sync_errors.get(table_name), description)
+            helper = None
+            if table_name in YEARLY_INCREMENT_CONFIG:
+                helper = lambda tbls, _name, df, tn=table_name: _render_yearly_increment_helper(
+                    tbls,
+                    tn,
+                    df,
+                    timeline,
+                    production_horizon,
+                )
+            _render_table_editor(
+                tables,
+                table_name,
+                label,
+                sync_errors.get(table_name),
+                description,
+                helper=helper,
+            )
 
     with summary_tab:
         st.subheader("Headline metrics")
