@@ -550,8 +550,8 @@ def _render_default_edit_modal(table_name: str, label: str, schema) -> None:
                 base_value = int(default_val) if pd.isna(current_value) else int(current_value)
                 input_value = form.number_input(
                     field_label,
-                    value=float(base_value),
-                    step=1.0,
+                    value=base_value,
+                    step=1,
                     format="%d",
                     key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
                 )
