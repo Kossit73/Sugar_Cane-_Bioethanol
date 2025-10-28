@@ -697,7 +697,6 @@ LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
     ("Debt Schedule", "debt_tranches", "Debt facilities with rates, tenors, amortisation, and IDC."),
     ("Tax Schedule", "tax_schedule", "Tax rate, incentives, timing adjustments, and loss carryforwards."),
     ("Inflation Schedule", "inflation_index", "Inflation and FX indexation curves."),
-    ("Risk Schedule", "risk_params", "Drivers for sensitivities, Monte Carlo, and scenario analysis."),
 ]
 
 
@@ -1252,6 +1251,13 @@ def main() -> None:
 
         with control_tabs[4]:
             st.markdown("### Risk and scenario options")
+            _render_table_editor(
+                tables,
+                "risk_params",
+                "Risk Schedule",
+                sync_errors.get("risk_params"),
+                "Political, environmental, and market risk multipliers for production, pricing, and labour assumptions.",
+            )
             run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
             run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
             run_scenario_analysis = st.checkbox("Run scenario comparison", value=True)
