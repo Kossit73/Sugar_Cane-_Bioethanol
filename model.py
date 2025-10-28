@@ -45,6 +45,32 @@ import pandas as pd
 
 PRODUCTS: Tuple[str, ...] = ("ethanol", "sugar", "electricity", "animal_feed")
 FEEDSTOCK_SCENARIOS: Tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
+MONTE_CARLO_DISTRIBUTIONS: Tuple[str, ...] = ("normal", "lognormal", "triangular", "uniform")
+MONTE_CARLO_VARIABLES: Tuple[str, ...] = (
+    "opex",
+    "interest_rate",
+    "capex",
+    "initial_investment",
+    "debt_schedule",
+    "production",
+    "production_ethanol",
+    "production_sugar",
+    "production_electricity",
+    "production_animal_feed",
+    "pricing",
+    "pricing_ethanol",
+    "pricing_sugar",
+    "pricing_electricity",
+    "pricing_animal_feed",
+    "revenue",
+    "sugarcane_yield",
+    "operating_cost_direct",
+    "operating_cost_staff",
+    "operating_cost_other",
+    "labour",
+    "availability",
+    "other",
+)
 MONTHS_IN_YEAR = 12
 RISK_MULTIPLIER_COLUMNS: Dict[str, str] = {
     "production_multiplier": "production",
@@ -255,7 +281,17 @@ DEFAULTS = {
     ),
     "monte_carlo_settings": pd.DataFrame(
         [
-            {"enabled": False, "iterations": 1000, "random_seed": 42},
+            {
+                "enabled": False,
+                "iterations": 1000,
+                "random_seed": 42,
+                "distribution": "normal",
+                "variable": "opex",
+                "applies_to": "global",
+                "p1": 0.0,
+                "p2": 0.05,
+                "p3": np.nan,
+            },
         ]
     ),
     "scenario_comparison": pd.DataFrame(
@@ -830,8 +866,28 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         defaults={"enabled": True, "pct_change": 0.1},
     ),
     "monte_carlo_settings": TableSchema(
-        columns={"enabled": "bool", "iterations": "int", "random_seed": "int"},
-        defaults={"enabled": False, "iterations": 1000, "random_seed": 42},
+        columns={
+            "enabled": "bool",
+            "iterations": "int",
+            "random_seed": "int",
+            "distribution": "str",
+            "variable": "str",
+            "applies_to": "str",
+            "p1": "float",
+            "p2": "float",
+            "p3": "float",
+        },
+        defaults={
+            "enabled": False,
+            "iterations": 1000,
+            "random_seed": 42,
+            "distribution": "normal",
+            "variable": "opex",
+            "applies_to": "global",
+            "p1": 0.0,
+            "p2": 0.05,
+            "p3": np.nan,
+        },
     ),
     "scenario_comparison": TableSchema(
         columns={
@@ -2263,6 +2319,319 @@ def sensitivity_tornado(cfg: Mapping[str, object], base_results: Dict[str, objec
     return tornado
 
 
+def _sample_distribution_value(
+    rng: np.random.Generator,
+    distribution: str,
+    p1: float,
+    p2: float,
+    p3: float,
+) -> float:
+    dist = (distribution or "normal").lower()
+    if dist not in MONTE_CARLO_DISTRIBUTIONS:
+        dist = "normal"
+    if dist == "normal":
+        sigma = max(p2, 0.0)
+        return rng.normal(p1, sigma)
+    if dist == "lognormal":
+        sigma = max(p2, 0.0)
+        return rng.lognormal(p1, sigma)
+    if dist == "triangular":
+        left = p1
+        mode = p2 if not math.isnan(p2) else left
+        right = p3 if not math.isnan(p3) else mode
+        if math.isnan(left):
+            left = 0.0
+        if math.isnan(mode):
+            mode = left
+        if math.isnan(right):
+            right = mode
+        if right <= left:
+            # ensure a valid range for triangular distribution
+            adjustment = max(abs(mode - left), 1e-6)
+            right = left + adjustment
+        mode = min(max(mode, left), right)
+        return rng.triangular(left, mode, right)
+    if dist == "uniform":
+        low = p1
+        high = p2
+        if math.isnan(low):
+            low = 0.0
+        if math.isnan(high):
+            high = low
+        if low == high:
+            return low
+        if high < low:
+            low, high = high, low
+        return rng.uniform(low, high)
+    return p1
+
+
+def _apply_monte_carlo_variable(sample_cfg: Dict[str, object], variable: str, draw: float, applies_to: str) -> None:
+    """Apply a Monte Carlo draw to the relevant section of the configuration."""
+
+    var_key = (variable or "").lower()
+    applies = (applies_to or "global").lower()
+    factor = 1.0 + float(draw)
+    if not np.isfinite(factor):
+        return
+    factor = max(factor, 0.0)
+
+    def _scale_capex() -> None:
+        capex_lines = sample_cfg.get("capex_lines")
+        if isinstance(capex_lines, pd.DataFrame):
+            df = capex_lines.copy()
+            if "amount" in df.columns:
+                df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0) * factor
+            sample_cfg["capex_lines"] = df
+        elif isinstance(capex_lines, list):
+            for line in capex_lines:
+                if isinstance(line, dict) and "amount" in line and line["amount"] is not None:
+                    try:
+                        line["amount"] = float(line["amount"]) * factor
+                    except (TypeError, ValueError):
+                        continue
+
+    def _scale_direct_costs() -> None:
+        direct_df = sample_cfg.get("direct_costs_monthly")
+        if isinstance(direct_df, pd.DataFrame) and not direct_df.empty:
+            df = direct_df.copy()
+            mask = pd.Series(True, index=df.index)
+            if applies in PRODUCTS and "product_link" in df.columns:
+                mask = df["product_link"].astype(str).str.lower() == applies
+            for col in ("unit_price", "quantity", "amount"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "unit_price" in df.columns:
+                df.loc[mask, "unit_price"] = df.loc[mask, "unit_price"].fillna(0.0) * factor
+            if "amount" in df.columns and "unit_price" not in df.columns:
+                df.loc[mask, "amount"] = df.loc[mask, "amount"].fillna(0.0) * factor
+            sample_cfg["direct_costs_monthly"] = _derive_direct_costs(df)
+
+    def _scale_staff_costs() -> None:
+        staff_df = sample_cfg.get("staff_costs_monthly")
+        if isinstance(staff_df, pd.DataFrame) and not staff_df.empty:
+            df = staff_df.copy()
+            mask = pd.Series(True, index=df.index)
+            if applies not in {"", "global"} and "dept" in df.columns:
+                mask = df["dept"].astype(str).str.lower() == applies
+            cost_columns = [
+                "gross_pay",
+                "benefits",
+                "training",
+                "other",
+                "gross_pay_per_head",
+                "benefits_per_head",
+                "training_per_head",
+                "other_per_head",
+            ]
+            for col in cost_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            for col in cost_columns:
+                if col in df.columns:
+                    df.loc[mask, col] = df.loc[mask, col] * factor
+            sample_cfg["staff_costs_monthly"] = df
+
+    def _scale_other_opex() -> None:
+        other_df = sample_cfg.get("other_opex_monthly")
+        if isinstance(other_df, pd.DataFrame) and not other_df.empty:
+            df = other_df.copy()
+            mask = pd.Series(True, index=df.index)
+            if applies not in {"", "global"} and "category" in df.columns:
+                mask = df["category"].astype(str).str.lower() == applies
+            if "amount" in df.columns:
+                df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+                df.loc[mask, "amount"] = df.loc[mask, "amount"] * factor
+            sample_cfg["other_opex_monthly"] = df
+
+    def _scale_production(product: Optional[str]) -> None:
+        prod_annual = sample_cfg.get("production_annual")
+        if isinstance(prod_annual, pd.DataFrame) and not prod_annual.empty:
+            df = prod_annual.copy()
+            mask = pd.Series(True, index=df.index)
+            if product and "product" in df.columns:
+                mask = df["product"].astype(str).str.lower() == product
+            if "annual_volume" in df.columns:
+                df["annual_volume"] = pd.to_numeric(df["annual_volume"], errors="coerce").fillna(0.0)
+                df.loc[mask, "annual_volume"] = df.loc[mask, "annual_volume"] * factor
+            if "availability" in df.columns and product is None and var_key == "availability":
+                df["availability"] = pd.to_numeric(df["availability"], errors="coerce").fillna(0.0)
+                df.loc[:, "availability"] = np.clip(df["availability"] * factor, 0.0, 1.0)
+            sample_cfg["production_annual"] = df
+
+        prod_monthly = sample_cfg.get("production_monthly")
+        if isinstance(prod_monthly, pd.DataFrame) and not prod_monthly.empty:
+            df_m = prod_monthly.copy()
+            mask = pd.Series(True, index=df_m.index)
+            if product and "product" in df_m.columns:
+                mask = df_m["product"].astype(str).str.lower() == product
+            if "volume" in df_m.columns:
+                df_m["volume"] = pd.to_numeric(df_m["volume"], errors="coerce").fillna(0.0)
+                df_m.loc[mask, "volume"] = df_m.loc[mask, "volume"] * factor
+            sample_cfg["production_monthly"] = df_m
+
+    def _scale_prices(product: Optional[str]) -> None:
+        price_cfg = sample_cfg.setdefault("prices", {})
+        if product:
+            if product in price_cfg:
+                params = price_cfg[product]
+            else:
+                params = price_cfg.setdefault(product, dict(DEFAULTS["prices"].get(product, {})))
+            if isinstance(params, dict):
+                params["base_price"] = float(params.get("base_price", 0.0)) * factor
+        else:
+            for prod, params in price_cfg.items():
+                if isinstance(params, dict):
+                    params["base_price"] = float(params.get("base_price", 0.0)) * factor
+
+        revenue_df = sample_cfg.get("revenue_params")
+        if isinstance(revenue_df, pd.DataFrame) and not revenue_df.empty:
+            df = revenue_df.copy()
+            mask = pd.Series(True, index=df.index)
+            if product and "product" in df.columns:
+                mask = df["product"].astype(str).str.lower() == product
+            if "base_price" in df.columns:
+                df["base_price"] = pd.to_numeric(df["base_price"], errors="coerce")
+                df.loc[mask, "base_price"] = df.loc[mask, "base_price"].fillna(0.0) * factor
+            sample_cfg["revenue_params"] = df
+
+    def _adjust_debt_rates() -> None:
+        debt_df = sample_cfg.get("debt_tranches")
+        if isinstance(debt_df, pd.DataFrame) and not debt_df.empty:
+            df = debt_df.copy()
+            for col in ("interest_rate", "base_rate", "margin"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+                    df.loc[:, col] = df[col] * factor
+            sample_cfg["debt_tranches"] = df
+        debt_cfg = sample_cfg.get("debt", {})
+        tranches = debt_cfg.get("tranches")
+        if isinstance(tranches, list):
+            for tranche in tranches:
+                if isinstance(tranche, dict):
+                    for col in ("interest_rate", "base_rate", "margin"):
+                        if col in tranche and tranche[col] is not None:
+                            try:
+                                tranche[col] = float(tranche[col]) * factor
+                            except (TypeError, ValueError):
+                                continue
+
+    def _adjust_debt_shares() -> None:
+        debt_df = sample_cfg.get("debt_tranches")
+        if isinstance(debt_df, pd.DataFrame) and not debt_df.empty and "share" in debt_df.columns:
+            df = debt_df.copy()
+            df["share"] = pd.to_numeric(df["share"], errors="coerce").fillna(0.0) * factor
+            total = df["share"].sum()
+            if total > 0:
+                df["share"] = df["share"] / total
+            sample_cfg["debt_tranches"] = df
+        debt_cfg = sample_cfg.get("debt", {})
+        tranches = debt_cfg.get("tranches")
+        if isinstance(tranches, list):
+            shares = []
+            for tranche in tranches:
+                share_val = 0.0
+                if isinstance(tranche, dict):
+                    try:
+                        share_val = float(tranche.get("share", 0.0))
+                    except (TypeError, ValueError):
+                        share_val = 0.0
+                shares.append(share_val)
+            if shares:
+                new_shares = [max(share * factor, 0.0) for share in shares]
+                total = sum(new_shares)
+                if total > 0:
+                    new_shares = [share / total for share in new_shares]
+                for tranche, share_val in zip(tranches, new_shares):
+                    if isinstance(tranche, dict):
+                        tranche["share"] = share_val
+
+    def _adjust_yield() -> None:
+        prod_defaults = sample_cfg.setdefault("production", {})
+        if "sugarcane_yield_ton_per_ha" in prod_defaults:
+            prod_defaults["sugarcane_yield_ton_per_ha"] = float(
+                prod_defaults.get("sugarcane_yield_ton_per_ha", 0.0)
+            ) * factor
+        prod_annual = sample_cfg.get("production_annual")
+        if isinstance(prod_annual, pd.DataFrame) and "sugarcane_yield_ton_per_ha" in prod_annual.columns:
+            df = prod_annual.copy()
+            df["sugarcane_yield_ton_per_ha"] = (
+                pd.to_numeric(df["sugarcane_yield_ton_per_ha"], errors="coerce").fillna(0.0) * factor
+            )
+            sample_cfg["production_annual"] = df
+
+    if var_key in {"capex", "initial_investment"}:
+        _scale_capex()
+        return
+    if var_key in {"opex"}:
+        opex_cfg = sample_cfg.setdefault("opex", {})
+        for key in ("fixed_opex_per_month", "farm_opex_per_ton", "purchase_price_per_ton"):
+            if key in opex_cfg and opex_cfg[key] is not None:
+                try:
+                    opex_cfg[key] = float(opex_cfg[key]) * factor
+                except (TypeError, ValueError):
+                    continue
+        var_costs = opex_cfg.get("other_variable_cost_per_unit")
+        if isinstance(var_costs, dict):
+            for prod in list(var_costs.keys()):
+                try:
+                    var_costs[prod] = float(var_costs[prod]) * factor
+                except (TypeError, ValueError):
+                    continue
+        _scale_direct_costs()
+        _scale_staff_costs()
+        _scale_other_opex()
+        return
+    if var_key in {"operating_cost_direct"}:
+        _scale_direct_costs()
+        return
+    if var_key in {"operating_cost_staff", "labour"}:
+        _scale_staff_costs()
+        return
+    if var_key == "operating_cost_other":
+        _scale_other_opex()
+        return
+    if var_key == "interest_rate":
+        _adjust_debt_rates()
+        return
+    if var_key == "debt_schedule":
+        _adjust_debt_shares()
+        return
+    if var_key.startswith("production_"):
+        product = var_key.split("_", 1)[1]
+        if product in PRODUCTS:
+            _scale_production(product)
+        return
+    if var_key == "production":
+        if applies in PRODUCTS:
+            _scale_production(applies)
+        else:
+            _scale_production(None)
+        return
+    if var_key.startswith("pricing_"):
+        product = var_key.split("_", 1)[1]
+        if product in PRODUCTS:
+            _scale_prices(product)
+        return
+    if var_key in {"pricing", "revenue"}:
+        if applies in PRODUCTS:
+            _scale_prices(applies)
+        else:
+            _scale_prices(None)
+        return
+    if var_key == "sugarcane_yield":
+        _adjust_yield()
+        return
+    if var_key == "availability":
+        production_cfg = sample_cfg.setdefault("production", {})
+        current = float(production_cfg.get("plant_availability", DEFAULTS["production"]["plant_availability"]))
+        production_cfg["plant_availability"] = float(np.clip(current * factor, 0.0, 1.0))
+        _scale_production(None)
+        return
+    if var_key == "other":
+        return
+
+
 def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], iterations: int = 2000, random_seed: int = 42) -> Dict[str, object]:
     rng = np.random.default_rng(random_seed)
     risk_params_df = cfg.get("risk_params")
@@ -2270,14 +2639,57 @@ def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, 
         risk_params_df = DEFAULTS["risk_params"].copy()
     else:
         risk_params_df = risk_params_df.copy()
-    project_npvs = []
-    equity_irrs = []
-    unit_margins = []
+    active_settings: List[Dict[str, object]] = []
+    monte_cfg = cfg.get("monte_carlo_settings")
+    if isinstance(monte_cfg, pd.DataFrame) and not monte_cfg.empty:
+        for _, row in monte_cfg.iterrows():
+            enabled_raw = row.get("enabled", False)
+            enabled = False
+            if isinstance(enabled_raw, str):
+                enabled = enabled_raw.strip().lower() in {"true", "1", "yes", "y"}
+            elif isinstance(enabled_raw, (bool, np.bool_)):
+                enabled = bool(enabled_raw)
+            elif isinstance(enabled_raw, (int, np.integer)):
+                enabled = enabled_raw != 0
+            elif isinstance(enabled_raw, float):
+                enabled = not math.isnan(enabled_raw) and enabled_raw != 0.0
+            if not enabled:
+                continue
+            active_settings.append(
+                {
+                    "distribution": str(row.get("distribution", "normal")),
+                    "variable": str(row.get("variable", "opex")),
+                    "applies_to": str(row.get("applies_to", "global")),
+                    "p1": _coerce_float(row.get("p1"), 0.0),
+                    "p2": _coerce_float(row.get("p2"), 0.0),
+                    "p3": _coerce_float(row.get("p3"), 0.0),
+                }
+            )
+
+    project_npvs: List[float] = []
+    equity_irrs: List[float] = []
+    unit_margins: List[float] = []
     base_price = cfg["prices"]["ethanol"]["base_price"]
 
     for _ in range(iterations):
         sample_cfg = copy.deepcopy(cfg)
         risk_df = risk_params_df.copy().reset_index(drop=True)
+        driver_draws: List[Tuple[Dict[str, object], float]] = []
+        for setting in active_settings:
+            draw = _sample_distribution_value(
+                rng,
+                str(setting.get("distribution", "normal")),
+                float(setting.get("p1", 0.0)),
+                float(setting.get("p2", 0.0)),
+                float(setting.get("p3", 0.0)),
+            )
+            driver_draws.append((setting, draw))
+            _apply_monte_carlo_variable(
+                sample_cfg,
+                str(setting.get("variable", "")),
+                draw,
+                str(setting.get("applies_to", "global")),
+            )
         for idx, param in risk_df.iterrows():
             dist = param.get("distribution", "normal")
             p1, p2, p3 = param.get("p1", 0.0), param.get("p2", 0.0), param.get("p3", 0.0)
@@ -2315,6 +2727,40 @@ def monte_carlo(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str, 
                         line["amount"] *= (1 + draw)
         sample_cfg["risk_params"] = risk_df
         sample_cfg["risk_profile"] = compute_risk_profile(risk_df)
+        risk_profile = sample_cfg.get("risk_profile", {})
+        if isinstance(risk_profile, dict):
+            for setting, draw in driver_draws:
+                factor = 1.0 + float(draw)
+                if not np.isfinite(factor):
+                    continue
+                factor = max(factor, 0.0)
+                var_name = str(setting.get("variable", "")).lower()
+                applies = str(setting.get("applies_to", "global")).lower()
+                if var_name in {"operating_cost_staff", "labour"}:
+                    risk_profile["labour"] = float(risk_profile.get("labour", 1.0)) * factor
+                if var_name in {"pricing", "pricing_ethanol", "pricing_sugar", "pricing_electricity", "pricing_animal_feed"}:
+                    risk_profile["price"] = float(risk_profile.get("price", 1.0)) * factor
+                    product = None
+                    if var_name.startswith("pricing_"):
+                        product = var_name.split("_", 1)[1]
+                    elif applies in PRODUCTS:
+                        product = applies
+                    if product in PRODUCTS:
+                        price_map: Dict[str, float] = risk_profile.setdefault("price_by_product", {})  # type: ignore[assignment]
+                        price_map[product] = price_map.get(product, 1.0) * factor
+                if var_name in {"revenue"}:
+                    risk_profile["revenue"] = float(risk_profile.get("revenue", 1.0)) * factor
+                if var_name in {
+                    "production",
+                    "production_ethanol",
+                    "production_sugar",
+                    "production_electricity",
+                    "production_animal_feed",
+                    "availability",
+                }:
+                    risk_profile["production"] = float(risk_profile.get("production", 1.0)) * factor
+                if var_name in {"sugarcane_yield"}:
+                    risk_profile["yield"] = float(risk_profile.get("yield", 1.0)) * factor
         result = run_model_fn(sample_cfg)
         project_npvs.append(result["metrics"].get("Project_NPV", np.nan))
         equity_irrs.append(result["metrics"].get("Equity_IRR", np.nan))

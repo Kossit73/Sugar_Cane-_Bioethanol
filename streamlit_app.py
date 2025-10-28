@@ -135,6 +135,8 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         InputTables,
         align_with_projection_horizon,
         build_config,
+        MONTE_CARLO_DISTRIBUTIONS,
+        MONTE_CARLO_VARIABLES,
         monte_carlo,
         parse_ramp,
         run_full_model,
@@ -153,6 +155,33 @@ if MODEL_IMPORT_ERROR is not None:
         key = _KEY_NORMALIZER.sub("_", str(value).strip().lower())
         key = re.sub(r"_+", "_", key).strip("_")
         return key
+
+    MONTE_CARLO_DISTRIBUTIONS = ("normal", "lognormal", "triangular", "uniform")
+    MONTE_CARLO_VARIABLES = (
+        "opex",
+        "interest_rate",
+        "capex",
+        "initial_investment",
+        "debt_schedule",
+        "production",
+        "production_ethanol",
+        "production_sugar",
+        "production_electricity",
+        "production_animal_feed",
+        "pricing",
+        "pricing_ethanol",
+        "pricing_sugar",
+        "pricing_electricity",
+        "pricing_animal_feed",
+        "revenue",
+        "sugarcane_yield",
+        "operating_cost_direct",
+        "operating_cost_staff",
+        "operating_cost_other",
+        "labour",
+        "availability",
+        "other",
+    )
 
 
 def _format_metric(value: object, kind: str = "number") -> str:
@@ -1137,6 +1166,7 @@ def _render_table_editor(
     error_message: Optional[str] = None,
     description: Optional[str] = None,
     helper: Optional[Callable[[InputTables, str, pd.DataFrame], None]] = None,
+    column_config: Optional[Dict[str, object]] = None,
 ) -> None:
     st.markdown(f"#### {label}")
     if description:
@@ -1233,6 +1263,7 @@ def _render_table_editor(
         num_rows="dynamic",
         use_container_width=True,
         key=state_key,
+        column_config=column_config,
     )
     if isinstance(editor, pd.DataFrame):
         editor_clean = editor.copy()
@@ -1864,12 +1895,37 @@ def main() -> None:
                     _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
 
         with scenario_sections[1]:
+            distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
+            variable_options = list(MONTE_CARLO_VARIABLES)
+            applies_options = ["global", *PRODUCTS]
+            monte_column_config = {
+                "enabled": st.column_config.CheckboxColumn("Enabled"),
+                "distribution": st.column_config.SelectboxColumn(
+                    "Probability distribution",
+                    options=distribution_options,
+                    help="Select the probability distribution used to draw this Monte Carlo driver.",
+                ),
+                "variable": st.column_config.SelectboxColumn(
+                    "Variable",
+                    options=variable_options,
+                    help="Choose which driver the sampled draw should adjust during the simulation.",
+                ),
+                "applies_to": st.column_config.SelectboxColumn(
+                    "Applies to",
+                    options=applies_options,
+                    help="Restrict the driver to a specific product or leave as global for portfolio-wide adjustments.",
+                ),
+                "p1": st.column_config.NumberColumn("P1", help="Distribution parameter 1 (mean/min)."),
+                "p2": st.column_config.NumberColumn("P2", help="Distribution parameter 2 (std/mode/max)."),
+                "p3": st.column_config.NumberColumn("P3", help="Distribution parameter 3 (triangular max)."),
+            }
             _render_table_editor(
                 tables,
                 "monte_carlo_settings",
                 "Monte Carlo settings",
                 sync_errors.get("monte_carlo_settings"),
                 "Set iterations, random seed, and enable the simulation to sample risk drivers.",
+                column_config=monte_column_config,
             )
             monte_cfg = tables.ensure_table("monte_carlo_settings").copy()
             enabled_mc = pd.Series(dtype=bool)
