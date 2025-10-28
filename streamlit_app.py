@@ -451,6 +451,9 @@ def _factory_default_frames() -> Dict[str, pd.DataFrame]:
         frames["tax_schedule"] = pd.DataFrame([DEFAULTS["tax"]])
         frames["inflation_index"] = DEFAULTS["inflation_index"].copy()
         frames["risk_params"] = DEFAULTS["risk_params"].copy()
+        frames["tornado_drivers"] = DEFAULTS["tornado_drivers"].copy()
+        frames["monte_carlo_settings"] = DEFAULTS["monte_carlo_settings"].copy()
+        frames["scenario_comparison"] = DEFAULTS["scenario_comparison"].copy()
 
         for table_name, schema in INPUT_SCHEMAS.items():
             frames.setdefault(table_name, pd.DataFrame(columns=list(schema.columns.keys())))
@@ -1659,21 +1662,6 @@ def main() -> None:
                 sync_errors.get("risk_params"),
                 "Political, environmental, and market risk multipliers for production, pricing, and labour assumptions.",
             )
-            run_tornado = st.checkbox("Compute sensitivity tornado", value=False)
-            run_monte_carlo = st.checkbox("Run Monte Carlo", value=False)
-            run_scenario_analysis = st.checkbox("Run scenario comparison", value=True)
-
-            monte_iterations = 1000
-            monte_seed = 42
-            if run_monte_carlo:
-                monte_iterations = st.slider(
-                    "Monte Carlo iterations",
-                    min_value=200,
-                    max_value=5000,
-                    value=1000,
-                    step=100,
-                )
-                monte_seed = st.number_input("Monte Carlo random seed", value=42, step=1)
 
     timeline = Timeline(
         int(horizon["start_year"]),
@@ -1821,44 +1809,141 @@ def main() -> None:
         _render_dataframe(revenue_df, "Revenue stack", key="revenue")
 
     with sensitivity_tab:
-        if run_tornado:
-            with st.spinner("Calculating sensitivity tornado..."):
-                tornado_df = sensitivity_tornado(cfg, {"metrics": metrics}, lambda c: run_full_model(c), None)
-            _render_dataframe(tornado_df, "Tornado sensitivity", key="tornado")
-        else:
-            st.info("Enable 'Compute sensitivity tornado' in the controls tabs to evaluate sensitivities.")
-
-        if run_monte_carlo:
-            with st.spinner("Running Monte Carlo simulation..."):
-                monte_results = monte_carlo(
-                    cfg,
-                    lambda c: run_full_model(c),
-                    iterations=int(monte_iterations),
-                    random_seed=int(monte_seed),
-                )
-            _render_dataframe(
-                monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"}),
-                "Monte Carlo percentiles",
-                key="monte_percentiles",
-            )
-            _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
-        else:
-            st.info("Enable 'Run Monte Carlo' in the controls tabs to sample risk drivers.")
+        st.info(
+            "Configure and execute sensitivity tornado, Monte Carlo, and scenario comparisons from the "
+            "Scenarios tab. Results are displayed alongside the configuration tables there."
+        )
 
     with scenario_tab:
-        if run_scenario_analysis:
-            scenarios = {
-                "FARM_ONLY": {"production": {"feedstock_scenario": "FARM_ONLY"}},
-                "BUY_ONLY": {"production": {"feedstock_scenario": "BUY_ONLY"}},
-                "HYBRID": {"production": {"feedstock_scenario": "HYBRID"}},
-            }
-            with st.spinner("Evaluating scenarios..."):
-                scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
-            base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
-            scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-            _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
-        else:
-            st.info("Enable 'Run scenario comparison' in the controls tabs to compare FARM/BUY/HYBRID structures.")
+        st.markdown("### Scenario analytics workspace")
+        scenario_sections = st.tabs([
+            "Sensitivity tornado",
+            "Monte Carlo simulation",
+            "Scenario comparison",
+        ])
+
+        with scenario_sections[0]:
+            _render_table_editor(
+                tables,
+                "tornado_drivers",
+                "Tornado drivers",
+                sync_errors.get("tornado_drivers"),
+                "Enable drivers and adjust percentage shocks to analyse NPV sensitivity.",
+            )
+            tornado_df_cfg = tables.ensure_table("tornado_drivers").copy()
+            if tornado_df_cfg.empty:
+                st.info("Add at least one driver row to evaluate the tornado chart.")
+            else:
+                enabled_mask = tornado_df_cfg.get("enabled", True)
+                if not isinstance(enabled_mask, pd.Series):
+                    enabled_mask = pd.Series(True, index=tornado_df_cfg.index)
+                enabled_rows = tornado_df_cfg[enabled_mask.fillna(True)]
+                enabled_rows = enabled_rows.replace({"": np.nan})
+                enabled_rows = enabled_rows.dropna(subset=["driver", "pct_change"], how="any")
+                drivers: List[Tuple[str, float]] = []
+                for _, driver_row in enabled_rows.iterrows():
+                    driver_key = str(driver_row.get("driver", "")).strip()
+                    if not driver_key:
+                        continue
+                    driver_key = normalize_key(driver_key)
+                    try:
+                        pct_change = float(driver_row.get("pct_change", 0.0))
+                    except (TypeError, ValueError):
+                        pct_change = 0.0
+                    drivers.append((driver_key, pct_change))
+                if not drivers:
+                    st.info("Enable at least one driver with a valid percentage change to run the tornado analysis.")
+                else:
+                    with st.spinner("Calculating sensitivity tornado..."):
+                        tornado_results = sensitivity_tornado(
+                            cfg,
+                            {"metrics": metrics},
+                            lambda c: run_full_model(c),
+                            drivers,
+                        )
+                    _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
+
+        with scenario_sections[1]:
+            _render_table_editor(
+                tables,
+                "monte_carlo_settings",
+                "Monte Carlo settings",
+                sync_errors.get("monte_carlo_settings"),
+                "Set iterations, random seed, and enable the simulation to sample risk drivers.",
+            )
+            monte_cfg = tables.ensure_table("monte_carlo_settings").copy()
+            enabled_mc = pd.Series(dtype=bool)
+            if not monte_cfg.empty:
+                enabled_mc = monte_cfg.get("enabled", False)
+                if not isinstance(enabled_mc, pd.Series):
+                    enabled_mc = pd.Series(False, index=monte_cfg.index)
+                enabled_mc = enabled_mc.fillna(False)
+            if monte_cfg.empty or not enabled_mc.any():
+                st.info("Enable a Monte Carlo row to execute the simulation.")
+            else:
+                active_row = monte_cfg.loc[enabled_mc].iloc[0]
+                try:
+                    iterations = int(float(active_row.get("iterations", 1000)))
+                except (TypeError, ValueError):
+                    iterations = 1000
+                iterations = max(iterations, 1)
+                try:
+                    random_seed = int(float(active_row.get("random_seed", 42)))
+                except (TypeError, ValueError):
+                    random_seed = 42
+                with st.spinner("Running Monte Carlo simulation..."):
+                    monte_results = monte_carlo(
+                        cfg,
+                        lambda c: run_full_model(c),
+                        iterations=iterations,
+                        random_seed=random_seed,
+                    )
+                percentiles = (
+                    monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"})
+                )
+                _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
+                _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+
+        with scenario_sections[2]:
+            _render_table_editor(
+                tables,
+                "scenario_comparison",
+                "Scenario definitions",
+                sync_errors.get("scenario_comparison"),
+                "Toggle and edit scenario overrides (feedstock sourcing and farm share) for comparison against the base case.",
+            )
+            scenario_cfg = tables.ensure_table("scenario_comparison").copy()
+            if scenario_cfg.empty:
+                st.info("Add scenario rows to compare against the base configuration.")
+            else:
+                enabled_flag = scenario_cfg.get("enabled", True)
+                if not isinstance(enabled_flag, pd.Series):
+                    enabled_flag = pd.Series(True, index=scenario_cfg.index)
+                active_rows = scenario_cfg[enabled_flag.fillna(True)]
+                active_rows = active_rows.replace({"": np.nan})
+                active_rows = active_rows.dropna(subset=["scenario_name"], how="any")
+                scenarios: Dict[str, Dict[str, object]] = {}
+                for _, row in active_rows.iterrows():
+                    name = str(row.get("scenario_name", "")).strip()
+                    if not name:
+                        continue
+                    override: Dict[str, object] = {}
+                    feedstock = str(row.get("feedstock_scenario", "")).strip().upper()
+                    if feedstock:
+                        override.setdefault("production", {})["feedstock_scenario"] = feedstock
+                    farm_share_val = row.get("farm_share")
+                    if pd.notna(farm_share_val):
+                        override.setdefault("production", {})["farm_share"] = float(farm_share_val)
+                    if override:
+                        scenarios[name] = override
+                if not scenarios:
+                    st.info("No active scenarios contain overrides to evaluate.")
+                else:
+                    with st.spinner("Evaluating scenarios..."):
+                        scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
+                    base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
+                    scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+                    _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
 
     st.success("Model run complete.")
 

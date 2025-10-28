@@ -244,6 +244,45 @@ DEFAULTS = {
             },
         ]
     ),
+    "tornado_drivers": pd.DataFrame(
+        [
+            {"enabled": True, "driver": "ethanol_price", "pct_change": 0.20},
+            {"enabled": True, "driver": "sugar_price", "pct_change": 0.20},
+            {"enabled": True, "driver": "availability", "pct_change": 0.05},
+            {"enabled": True, "driver": "capex", "pct_change": 0.20},
+            {"enabled": True, "driver": "debt_rate", "pct_change": 0.02},
+        ]
+    ),
+    "monte_carlo_settings": pd.DataFrame(
+        [
+            {"enabled": False, "iterations": 1000, "random_seed": 42},
+        ]
+    ),
+    "scenario_comparison": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "scenario_name": "FARM_ONLY",
+                "feedstock_scenario": "FARM_ONLY",
+                "farm_share": 1.0,
+                "notes": "All feedstock grown internally",
+            },
+            {
+                "enabled": True,
+                "scenario_name": "BUY_ONLY",
+                "feedstock_scenario": "BUY_ONLY",
+                "farm_share": 0.0,
+                "notes": "All feedstock purchased from market",
+            },
+            {
+                "enabled": True,
+                "scenario_name": "HYBRID",
+                "feedstock_scenario": "HYBRID",
+                "farm_share": 0.5,
+                "notes": "Blend of internal farming and market purchases",
+            },
+        ]
+    ),
 }
 
 ###############################################################################
@@ -786,6 +825,29 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
     "inflation_index": TableSchema(
         columns={"date": "str", "cpi": "float", "fx_pair": "str", "fx_index": "float"},
     ),
+    "tornado_drivers": TableSchema(
+        columns={"enabled": "bool", "driver": "str", "pct_change": "float"},
+        defaults={"enabled": True, "pct_change": 0.1},
+    ),
+    "monte_carlo_settings": TableSchema(
+        columns={"enabled": "bool", "iterations": "int", "random_seed": "int"},
+        defaults={"enabled": False, "iterations": 1000, "random_seed": 42},
+    ),
+    "scenario_comparison": TableSchema(
+        columns={
+            "enabled": "bool",
+            "scenario_name": "str",
+            "feedstock_scenario": "str",
+            "farm_share": "float",
+            "notes": "str",
+        },
+        defaults={
+            "enabled": True,
+            "feedstock_scenario": "HYBRID",
+            "farm_share": 0.5,
+            "notes": "",
+        },
+    ),
     "risk_params": TableSchema(
         columns={
             "driver_name": "str",
@@ -1036,7 +1098,24 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             if pd.notna(val):
                 cfg["working_capital"][key] = float(val)
 
-    for table_name in ("revenue_params", "production_annual", "production_monthly", "direct_costs_monthly", "staff_costs_monthly", "other_opex_monthly", "ar_other_assets", "inventory_ap", "debt_tranches", "tax_schedule", "inflation_index", "risk_params", "capex_lines"):
+    for table_name in (
+        "revenue_params",
+        "production_annual",
+        "production_monthly",
+        "direct_costs_monthly",
+        "staff_costs_monthly",
+        "other_opex_monthly",
+        "ar_other_assets",
+        "inventory_ap",
+        "debt_tranches",
+        "tax_schedule",
+        "inflation_index",
+        "risk_params",
+        "capex_lines",
+        "tornado_drivers",
+        "monte_carlo_settings",
+        "scenario_comparison",
+    ):
         df = tables.ensure_table(table_name)
         if not df.empty:
             cfg[table_name] = df.copy().reset_index(drop=True)
@@ -1070,6 +1149,13 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
     cfg.setdefault("production", {})
     cfg["production"].setdefault("feedstock_scenario", "HYBRID")
     cfg["production"].setdefault("farm_share", 0.5)
+
+    if not isinstance(cfg.get("tornado_drivers"), pd.DataFrame) or cfg["tornado_drivers"].empty:
+        cfg["tornado_drivers"] = DEFAULTS["tornado_drivers"].copy()
+    if not isinstance(cfg.get("monte_carlo_settings"), pd.DataFrame) or cfg["monte_carlo_settings"].empty:
+        cfg["monte_carlo_settings"] = DEFAULTS["monte_carlo_settings"].copy()
+    if not isinstance(cfg.get("scenario_comparison"), pd.DataFrame) or cfg["scenario_comparison"].empty:
+        cfg["scenario_comparison"] = DEFAULTS["scenario_comparison"].copy()
 
     return align_with_projection_horizon(cfg)
 ###############################################################################
@@ -2377,6 +2463,15 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "dashboard": dashboard,
         "break_even": be,
         "risk_profile": cfg.get("risk_profile", {}),
+        "tornado_drivers": cfg.get("tornado_drivers").copy()
+        if isinstance(cfg.get("tornado_drivers"), pd.DataFrame)
+        else cfg.get("tornado_drivers"),
+        "monte_carlo_settings": cfg.get("monte_carlo_settings").copy()
+        if isinstance(cfg.get("monte_carlo_settings"), pd.DataFrame)
+        else cfg.get("monte_carlo_settings"),
+        "scenario_comparison": cfg.get("scenario_comparison").copy()
+        if isinstance(cfg.get("scenario_comparison"), pd.DataFrame)
+        else cfg.get("scenario_comparison"),
     }
     if isinstance(staff_detail, pd.DataFrame):
         results["staff_costs_detail"] = staff_detail
