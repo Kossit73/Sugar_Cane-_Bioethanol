@@ -187,6 +187,48 @@ DEFAULTS = {
                 "yield_multiplier": 1.0,
             },
             {
+                "driver_name": "electricity_price",
+                "distribution": "normal",
+                "p1": 0.0,
+                "p2": 0.06,
+                "p3": np.nan,
+                "target": "price",
+                "applies_to": "electricity",
+                "production_multiplier": 1.0,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 1.0,
+                "yield_multiplier": 1.0,
+            },
+            {
+                "driver_name": "sugar_price",
+                "distribution": "normal",
+                "p1": 0.0,
+                "p2": 0.07,
+                "p3": np.nan,
+                "target": "price",
+                "applies_to": "sugar",
+                "production_multiplier": 1.0,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 1.0,
+                "yield_multiplier": 1.0,
+            },
+            {
+                "driver_name": "animal_feed_price",
+                "distribution": "normal",
+                "p1": 0.0,
+                "p2": 0.08,
+                "p3": np.nan,
+                "target": "price",
+                "applies_to": "animal_feed",
+                "production_multiplier": 1.0,
+                "labour_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "revenue_multiplier": 1.0,
+                "yield_multiplier": 1.0,
+            },
+            {
                 "driver_name": "availability",
                 "distribution": "normal",
                 "p1": 0.0,
@@ -499,17 +541,31 @@ def align_with_projection_horizon(cfg: Dict[str, object]) -> Dict[str, object]:
     return cfg
 
 
-def compute_risk_profile(risk_params: Optional[pd.DataFrame]) -> Dict[str, float]:
-    profile = {name: 1.0 for name in RISK_MULTIPLIER_COLUMNS.values()}
+def compute_risk_profile(risk_params: Optional[pd.DataFrame]) -> Dict[str, object]:
+    profile: Dict[str, object] = {name: 1.0 for name in RISK_MULTIPLIER_COLUMNS.values()}
+    profile["price_by_product"] = {}
     if isinstance(risk_params, pd.DataFrame) and not risk_params.empty:
         for _, row in risk_params.iterrows():
+            target = str(row.get("target", "risk")).lower()
+            applies_to = str(row.get("applies_to", "")).lower()
+            if target == "price" and applies_to in PRODUCTS:
+                multiplier = row.get("price_multiplier", 1.0)
+                try:
+                    multiplier = float(multiplier)
+                except (TypeError, ValueError):
+                    multiplier = 1.0
+                multiplier = max(multiplier, 0.0)
+                price_map: Dict[str, float] = profile.setdefault("price_by_product", {})  # type: ignore[assignment]
+                price_map[applies_to] = price_map.get(applies_to, 1.0) * (multiplier or 1.0)
+                continue
+
             for column, key in RISK_MULTIPLIER_COLUMNS.items():
                 if column in row and pd.notna(row[column]):
                     try:
                         value = float(row[column])
                     except (TypeError, ValueError):
                         continue
-                    profile[key] *= max(value, 0.0)
+                    profile[key] = float(profile.get(key, 1.0)) * max(value, 0.0)
     return profile
 
 
@@ -1296,6 +1352,9 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
     inflation_index = cfg.get("inflation_index")
     risk_profile = cfg.get("risk_profile", {})
     price_multiplier = float(risk_profile.get("price", 1.0))
+    price_by_product = {}
+    if isinstance(risk_profile, dict):
+        price_by_product = risk_profile.get("price_by_product", {}) or {}
     if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty:
         idx = inflation_index.copy()
         idx["date"] = pd.to_datetime(idx["date"])
@@ -1309,11 +1368,17 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
         base_price = params.get("base_price", DEFAULTS["prices"][product]["base_price"])
         escalation = params.get("price_escalation_pa", DEFAULTS["prices"][product]["price_escalation_pa"])
         monthly_escalation = (1 + escalation) ** (1 / 12) - 1
+        product_multiplier = 1.0
+        if isinstance(price_by_product, dict):
+            try:
+                product_multiplier = float(price_by_product.get(product, 1.0))
+            except (TypeError, ValueError):
+                product_multiplier = 1.0
         for i, date in enumerate(monthly_index):
             price = base_price * ((1 + monthly_escalation) ** i)
             if params.get("price_indexation", "cpi").lower() == "cpi" and "cpi" in idx:
                 price *= idx.loc[date, "cpi"]
-            price *= price_multiplier
+            price *= price_multiplier * product_multiplier
             records.append({"date": date, "product": product, "price": price, "uom": params.get("uom", "")})
     return pd.DataFrame(records)
 
