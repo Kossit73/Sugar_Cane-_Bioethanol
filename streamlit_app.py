@@ -14,7 +14,7 @@ import math
 import re
 import sys
 from contextlib import contextmanager
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,15 @@ def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     # purge the legacy key from earlier builds to avoid conflicts.
     st.session_state.pop(state_key, None)
     st.session_state.pop(f"editor_{table_name}", None)
+
+
+def _option_index(options: Sequence[str], value: str, default: int = 0) -> int:
+    """Return the index of ``value`` inside ``options`` with a safe fallback."""
+
+    try:
+        return options.index(value)
+    except ValueError:
+        return default if 0 <= default < len(options) else 0
 
 
 @contextmanager
@@ -1928,6 +1937,112 @@ def main() -> None:
                 column_config=monte_column_config,
             )
             monte_cfg = tables.ensure_table("monte_carlo_settings").copy()
+            if not monte_cfg.empty:
+                row_indices = list(monte_cfg.index)
+
+                def _format_driver(idx: int) -> str:
+                    row = monte_cfg.loc[idx]
+                    variable = str(row.get("variable", "driver") or "driver")
+                    distribution = str(row.get("distribution", "normal") or "normal")
+                    scope = str(row.get("applies_to", "global") or "global")
+                    return f"Row {idx + 1}: {variable} · {distribution} ({scope})"
+
+                selected_idx = st.selectbox(
+                    "Select Monte Carlo driver to edit",
+                    row_indices,
+                    format_func=_format_driver,
+                    key="monte_driver_select",
+                )
+
+                selected_row = monte_cfg.loc[selected_idx]
+                with st.form(f"monte_driver_form_{selected_idx}"):
+                    enabled_value = st.checkbox(
+                        "Enable driver",
+                        value=bool(selected_row.get("enabled", False)),
+                        key=f"monte_enabled_{selected_idx}",
+                    )
+                    iterations_value = st.number_input(
+                        "Iterations",
+                        min_value=1,
+                        value=int(selected_row.get("iterations", 1000)
+                                  if pd.notna(selected_row.get("iterations"))
+                                  else 1000),
+                        step=1,
+                        key=f"monte_iterations_{selected_idx}",
+                    )
+                    random_seed_value = st.number_input(
+                        "Random seed",
+                        value=int(selected_row.get("random_seed", 42)
+                                  if pd.notna(selected_row.get("random_seed"))
+                                  else 42),
+                        step=1,
+                        key=f"monte_seed_{selected_idx}",
+                    )
+                    distribution_value = st.selectbox(
+                        "Probability distribution type",
+                        distribution_options,
+                        index=_option_index(
+                            distribution_options,
+                            str(selected_row.get("distribution", "normal") or "normal"),
+                        ),
+                        key=f"monte_distribution_{selected_idx}",
+                    )
+                    variable_value = st.selectbox(
+                        "Variable",
+                        variable_options,
+                        index=_option_index(
+                            variable_options,
+                            str(selected_row.get("variable", "opex") or "opex"),
+                        ),
+                        key=f"monte_variable_{selected_idx}",
+                    )
+                    applies_value = st.selectbox(
+                        "Applies to",
+                        applies_options,
+                        index=_option_index(
+                            applies_options,
+                            str(selected_row.get("applies_to", "global") or "global"),
+                        ),
+                        key=f"monte_applies_{selected_idx}",
+                    )
+                    p1_value = st.number_input(
+                        "P1",
+                        value=float(selected_row.get("p1", 0.0)
+                                    if pd.notna(selected_row.get("p1"))
+                                    else 0.0),
+                        key=f"monte_p1_{selected_idx}",
+                    )
+                    p2_value = st.number_input(
+                        "P2",
+                        value=float(selected_row.get("p2", 0.05)
+                                    if pd.notna(selected_row.get("p2"))
+                                    else 0.05),
+                        key=f"monte_p2_{selected_idx}",
+                    )
+                    p3_value = st.number_input(
+                        "P3",
+                        value=float(selected_row.get("p3", 0.0)
+                                    if pd.notna(selected_row.get("p3"))
+                                    else 0.0),
+                        key=f"monte_p3_{selected_idx}",
+                    )
+                    submitted = st.form_submit_button("Save Monte Carlo driver")
+
+                if submitted:
+                    updated_cfg = monte_cfg.copy()
+                    updated_cfg.at[selected_idx, "enabled"] = bool(enabled_value)
+                    updated_cfg.at[selected_idx, "iterations"] = int(iterations_value)
+                    updated_cfg.at[selected_idx, "random_seed"] = int(random_seed_value)
+                    updated_cfg.at[selected_idx, "distribution"] = str(distribution_value)
+                    updated_cfg.at[selected_idx, "variable"] = str(variable_value)
+                    updated_cfg.at[selected_idx, "applies_to"] = str(applies_value)
+                    updated_cfg.at[selected_idx, "p1"] = float(p1_value)
+                    updated_cfg.at[selected_idx, "p2"] = float(p2_value)
+                    updated_cfg.at[selected_idx, "p3"] = float(p3_value)
+                    tables.set_table("monte_carlo_settings", updated_cfg)
+                    _update_editor_state("monte_carlo_settings", tables)
+                    st.success("Monte Carlo driver updated.")
+                    _safe_rerun()
             enabled_mc = pd.Series(dtype=bool)
             if not monte_cfg.empty:
                 enabled_mc = monte_cfg.get("enabled", False)
