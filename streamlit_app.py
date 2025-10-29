@@ -10,10 +10,12 @@ Run with:
 
 from __future__ import annotations
 
+import copy
 import math
 import re
 import sys
 from contextlib import contextmanager
+from io import BytesIO
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -300,18 +302,155 @@ _FACTORY_DEFAULT_FRAMES_CACHE: Optional[Dict[str, pd.DataFrame]] = None
 
 
 def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
-    """Render a dataframe with a download button."""
+    """Render a dataframe without exposing download controls."""
     st.subheader(title)
-    st.dataframe(df, use_container_width=True)
-    csv_data = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        f"Download {title}",
-        csv_data,
-        file_name=f"{title.lower().replace(' ', '_')}.csv",
-        mime="text/csv",
-        key=key,
+    st.dataframe(df, use_container_width=True, key=f"df_{key}")
+
+
+def _scenario_overrides_from_table(scenario_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    """Convert the scenario comparison table into override dictionaries."""
+
+    if not isinstance(scenario_df, pd.DataFrame) or scenario_df.empty:
+        return {}
+
+    working = scenario_df.copy()
+    working = working.replace({"": np.nan})
+
+    enabled = working.get("enabled", True)
+    if not isinstance(enabled, pd.Series):
+        enabled = pd.Series(True, index=working.index)
+    working = working[enabled.fillna(True)]
+    working = working.dropna(subset=["scenario_name"], how="any")
+
+    overrides: Dict[str, Dict[str, object]] = {}
+    for _, row in working.iterrows():
+        name = str(row.get("scenario_name", "")).strip()
+        if not name:
+            continue
+        override: Dict[str, object] = {}
+        production_override: Dict[str, object] = {}
+        feedstock = str(row.get("feedstock_scenario", "")).strip()
+        if feedstock:
+            production_override["feedstock_scenario"] = feedstock.upper()
+        farm_share_val = row.get("farm_share")
+        if pd.notna(farm_share_val):
+            try:
+                production_override["farm_share"] = float(farm_share_val)
+            except (TypeError, ValueError):
+                pass
+        if production_override:
+            override["production"] = production_override
+        if override:
+            overrides[name] = override
+
+    return overrides
+
+
+def _apply_scenario_override(base_cfg: Dict[str, object], override: Dict[str, object]) -> Dict[str, object]:
+    """Return a deep-copied configuration with scenario overrides applied."""
+
+    scenario_cfg = copy.deepcopy(base_cfg)
+    for section, values in override.items():
+        if isinstance(values, Mapping) and isinstance(scenario_cfg.get(section), Mapping):
+            target = copy.deepcopy(scenario_cfg.get(section))
+            for key, value in values.items():
+                target[key] = value
+            scenario_cfg[section] = target
+        else:
+            scenario_cfg[section] = values
+    return scenario_cfg
+
+
+BASE_SCENARIO_LABEL = "Base case"
+
+
+def _ensure_scenario_payload(
+    selected: str,
+    base_cfg: Dict[str, object],
+    base_results: Mapping[str, object],
+    overrides: Mapping[str, Dict[str, object]],
+) -> Tuple[Dict[str, object], Mapping[str, object]]:
+    """Return (cfg, results) for the selected scenario, caching evaluations."""
+
+    cache: Dict[str, Tuple[Dict[str, object], Mapping[str, object]]] = st.session_state.setdefault(
+        "scenario_payload_cache", {}
     )
 
+    if selected == BASE_SCENARIO_LABEL or selected not in overrides:
+        cache[BASE_SCENARIO_LABEL] = (copy.deepcopy(base_cfg), base_results)
+        st.session_state.scenario_payload_cache = cache
+        return base_cfg, base_results
+
+    if selected in cache:
+        cfg_cached, results_cached = cache[selected]
+        return cfg_cached, results_cached
+
+    override = overrides[selected]
+    scenario_cfg = _apply_scenario_override(base_cfg, override)
+    scenario_results = run_full_model(scenario_cfg)
+    cache[selected] = (scenario_cfg, scenario_results)
+    st.session_state.scenario_payload_cache = cache
+    return scenario_cfg, scenario_results
+
+
+def _generate_excel_bytes(
+    cfg: Mapping[str, object],
+    results: Mapping[str, object],
+    scenario_name: str,
+) -> bytes:
+    """Create an Excel workbook for the provided results and return its bytes."""
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
+        if isinstance(dashboard, Mapping):
+            snapshot = dashboard.get("assumptions_snapshot")
+            if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
+                snapshot.to_excel(writer, sheet_name="Summary", index=False)
+            overview = dashboard.get("overview_metrics")
+            if isinstance(overview, pd.DataFrame) and not overview.empty:
+                overview.to_excel(writer, sheet_name="Metrics", index=False)
+            annual_prod = dashboard.get("annual_production")
+            if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
+                annual_prod.to_excel(writer, sheet_name="Production", index=False)
+
+        statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+        if isinstance(statements_annual, Mapping):
+            for key in ("pnl", "cashflow", "balancesheet"):
+                df = statements_annual.get(key)
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    sheet = f"Annual_{key}"
+                    df.to_excel(writer, sheet_name=sheet, index=False)
+
+        capex_df = results.get("capex") if isinstance(results, Mapping) else None
+        if isinstance(capex_df, pd.DataFrame) and not capex_df.empty:
+            capex_df.to_excel(writer, sheet_name="CAPEX", index=False)
+
+        debt_df = results.get("debt_schedule") if isinstance(results, Mapping) else None
+        if isinstance(debt_df, pd.DataFrame) and not debt_df.empty:
+            debt_df.to_excel(writer, sheet_name="Debt", index=False)
+
+        wc_df = results.get("working_capital") if isinstance(results, Mapping) else None
+        if isinstance(wc_df, pd.DataFrame) and not wc_df.empty:
+            wc_df.to_excel(writer, sheet_name="WorkingCapital", index=False)
+
+        meta_rows: List[Dict[str, object]] = []
+        global_inputs = cfg.get("global_inputs") if isinstance(cfg, Mapping) else {}
+        if isinstance(global_inputs, Mapping):
+            meta_rows.append(
+                {
+                    "Scenario": scenario_name,
+                    "Discount rate": global_inputs.get("discount_rate"),
+                    "Corporate tax": global_inputs.get("corp_tax_rate"),
+                    "Investor share": global_inputs.get("investor_share"),
+                    "Owner share": global_inputs.get("owner_share"),
+                }
+            )
+        if meta_rows:
+            pd.DataFrame(meta_rows).to_excel(writer, sheet_name="Scenario", index=False)
+
+    buffer.seek(0)
+    return buffer.read()
 
 def _get_risk_select_options(tables: "InputTables") -> Tuple[List[str], List[str]]:
     """Return dropdown option sets for risk targets and scope fields."""
@@ -1698,6 +1837,7 @@ def main() -> None:
     sync_errors = _sync_tables_from_state(tables)
     assumptions: Dict[str, object] = {}
     cfg = build_config(assumptions, tables)
+    st.session_state.pop("scenario_payload_cache", None)
 
     horizon = cfg["projection_horizon"]
     production_horizon = cfg.get(
@@ -2007,13 +2147,88 @@ def main() -> None:
         ("DSCR_avg", "Avg DSCR", "ratio"),
     ]
 
+    scenario_table_for_download = tables.ensure_table("scenario_comparison").copy()
+    scenario_overrides = _scenario_overrides_from_table(scenario_table_for_download)
+    scenario_options: List[str] = [BASE_SCENARIO_LABEL, *list(scenario_overrides.keys())]
+
 
     with landing_tab:
-        st.subheader("Input & assumptions tables")
-        st.markdown(
-            "Review, add, or remove records from each canonical input table. Updates apply across the model "
-            "on the next run."
-        )
+        top_left, top_right = st.columns([3, 2])
+        with top_left:
+            st.subheader("Input & assumptions tables")
+            st.markdown(
+                "Review, add, or remove records from each canonical input table. Updates apply across the model "
+                "on the next run."
+            )
+        with top_right:
+            st.markdown("#### Excel model download")
+            if not scenario_options:
+                scenario_options = [BASE_SCENARIO_LABEL]
+            default_option = st.session_state.get("excel_download_selected", scenario_options[0])
+            if default_option not in scenario_options:
+                default_option = scenario_options[0]
+            selected_scenario = st.selectbox(
+                "Scenario",
+                scenario_options,
+                index=scenario_options.index(default_option),
+                key="excel_download_scenario",
+            )
+            st.session_state["excel_download_selected"] = selected_scenario
+
+            download_container = st.container()
+            excel_map: Dict[str, bytes] = st.session_state.setdefault("excel_bytes_map", {})
+            stale_keys = [key for key in excel_map if key not in scenario_options]
+            for key in stale_keys:
+                excel_map.pop(key, None)
+            st.session_state.excel_bytes_map = excel_map
+
+            scenario_cfg_payload, scenario_results_payload = _ensure_scenario_payload(
+                selected_scenario,
+                cfg,
+                results,
+                scenario_overrides,
+            )
+            cfg_for_excel = copy.deepcopy(scenario_cfg_payload)
+            metadata = cfg_for_excel.setdefault("metadata", {}) if isinstance(cfg_for_excel, dict) else {}
+            if isinstance(metadata, dict):
+                metadata["scenario"] = selected_scenario
+            st.session_state.model_results = (cfg_for_excel, scenario_results_payload)
+
+            excel_bytes = excel_map.get(selected_scenario)
+
+            with download_container:
+                if not excel_bytes:
+                    if st.button(
+                        "Prepare Excel Model",
+                        key=f"prepare_excel_{normalize_key(selected_scenario) or 'base'}",
+                    ):
+                        with st.spinner("Preparing Excel workbook..."):
+                            excel_bytes = _generate_excel_bytes(
+                                cfg_for_excel,
+                                scenario_results_payload,
+                                selected_scenario,
+                            )
+                        excel_map[selected_scenario] = excel_bytes
+                        st.session_state.excel_bytes_map = excel_map
+                if excel_bytes:
+                    file_scenario = normalize_key(selected_scenario) or "base"
+                    st.download_button(
+                        "Download Excel Model",
+                        data=excel_bytes,
+                        file_name=f"Sugarcane_Financial_Model_{file_scenario}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_excel_{file_scenario}",
+                    )
+                    if st.button(
+                        "Clear Prepared Excel",
+                        key=f"clear_excel_{normalize_key(selected_scenario) or 'base'}",
+                    ):
+                        excel_map.pop(selected_scenario, None)
+                        st.session_state.excel_bytes_map = excel_map
+                        excel_bytes = None
+                if not excel_bytes:
+                    st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
+
         if sync_errors:
             for table_name, message in sync_errors.items():
                 st.error(f"{table_name}: {message}")
@@ -2619,37 +2834,19 @@ def main() -> None:
                 "Toggle and edit scenario overrides (feedstock sourcing and farm share) for comparison against the base case.",
             )
             scenario_cfg = tables.ensure_table("scenario_comparison").copy()
-            if scenario_cfg.empty:
-                st.info("Add scenario rows to compare against the base configuration.")
+            scenario_overrides_active = _scenario_overrides_from_table(scenario_cfg)
+            if not scenario_overrides_active:
+                st.info("Add scenario rows with overrides to compare against the base configuration.")
             else:
-                enabled_flag = scenario_cfg.get("enabled", True)
-                if not isinstance(enabled_flag, pd.Series):
-                    enabled_flag = pd.Series(True, index=scenario_cfg.index)
-                active_rows = scenario_cfg[enabled_flag.fillna(True)]
-                active_rows = active_rows.replace({"": np.nan})
-                active_rows = active_rows.dropna(subset=["scenario_name"], how="any")
-                scenarios: Dict[str, Dict[str, object]] = {}
-                for _, row in active_rows.iterrows():
-                    name = str(row.get("scenario_name", "")).strip()
-                    if not name:
-                        continue
-                    override: Dict[str, object] = {}
-                    feedstock = str(row.get("feedstock_scenario", "")).strip().upper()
-                    if feedstock:
-                        override.setdefault("production", {})["feedstock_scenario"] = feedstock
-                    farm_share_val = row.get("farm_share")
-                    if pd.notna(farm_share_val):
-                        override.setdefault("production", {})["farm_share"] = float(farm_share_val)
-                    if override:
-                        scenarios[name] = override
-                if not scenarios:
-                    st.info("No active scenarios contain overrides to evaluate.")
-                else:
-                    with st.spinner("Evaluating scenarios..."):
-                        scenario_df = run_scenarios(cfg, lambda c: run_full_model(c), scenarios)
-                    base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
-                    scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-                    _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+                with st.spinner("Evaluating scenarios..."):
+                    scenario_df = run_scenarios(
+                        cfg,
+                        lambda c: run_full_model(c),
+                        scenario_overrides_active,
+                    )
+                base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
+                scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+                _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
 
     st.success("Model run complete.")
 
