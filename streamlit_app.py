@@ -692,6 +692,28 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
         return
 
     row = df.iloc[row_index]
+    risk_select_cache: Optional[Tuple[List[str], List[str]]] = None
+
+    def _field_options(column_name: str) -> Optional[List[str]]:
+        nonlocal risk_select_cache
+        col = column_name.lower()
+        if table_name == "risk_params":
+            if col == "distribution":
+                return list(RISK_DISTRIBUTION_OPTIONS)
+            if col in {"target", "applies_to"}:
+                if risk_select_cache is None:
+                    risk_select_cache = _get_risk_select_options(tables)
+                targets, applies = risk_select_cache
+                return list(targets if col == "target" else applies)
+        elif table_name == "monte_carlo_settings":
+            if col == "distribution":
+                return list(MONTE_CARLO_DISTRIBUTIONS)
+            if col == "variable":
+                return list(MONTE_CARLO_VARIABLES)
+            if col == "applies_to":
+                return ["global", *PRODUCTS]
+        return None
+
     with _modal_container(f"Edit default row {row_index + 1} – {label}") as modal_supported:
         form = st.form(key=f"default_edit_form_{table_name}_{row_index}")
         updated_values: Dict[str, object] = {}
@@ -730,16 +752,38 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
                 )
                 updated_values[column_name] = bool(input_value)
             else:
-                if current_value is None or (isinstance(current_value, float) and math.isnan(current_value)):
-                    text_value = ""
+                options = _field_options(column_name)
+                if options:
+                    default_option = schema.defaults.get(column_name)
+                    if default_option is None or (
+                        isinstance(default_option, float) and math.isnan(default_option)
+                    ):
+                        default_option = options[0] if options else ""
+                    if current_value is None or (
+                        isinstance(current_value, float) and math.isnan(current_value)
+                    ):
+                        current_option = str(default_option)
+                    else:
+                        current_option = str(current_value)
+                    index = _option_index(options, current_option, default=0)
+                    input_value = form.selectbox(
+                        field_label,
+                        options,
+                        index=index,
+                        key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                    )
+                    updated_values[column_name] = str(input_value)
                 else:
-                    text_value = str(current_value)
-                input_value = form.text_input(
-                    field_label,
-                    value=text_value,
-                    key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
-                )
-                updated_values[column_name] = input_value if input_value != "" else None
+                    if current_value is None or (isinstance(current_value, float) and math.isnan(current_value)):
+                        text_value = ""
+                    else:
+                        text_value = str(current_value)
+                    input_value = form.text_input(
+                        field_label,
+                        value=text_value,
+                        key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
+                    )
+                    updated_values[column_name] = input_value if input_value != "" else None
 
         submit_label = "Save changes" if modal_supported else "Save inline changes"
         if form.form_submit_button(submit_label, type="primary"):
