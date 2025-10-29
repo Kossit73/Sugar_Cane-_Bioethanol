@@ -146,6 +146,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         build_config,
         MONTE_CARLO_DISTRIBUTIONS,
         MONTE_CARLO_VARIABLES,
+        compute_risk_profile,
         monte_carlo,
         parse_ramp,
         run_full_model,
@@ -164,6 +165,8 @@ if MODEL_IMPORT_ERROR is not None:
         key = _KEY_NORMALIZER.sub("_", str(value).strip().lower())
         key = re.sub(r"_+", "_", key).strip("_")
         return key
+
+    PRODUCTS = ("ethanol", "sugar", "electricity", "animal_feed")
 
     MONTE_CARLO_DISTRIBUTIONS = ("normal", "lognormal", "triangular", "uniform")
     MONTE_CARLO_VARIABLES = (
@@ -191,6 +194,28 @@ if MODEL_IMPORT_ERROR is not None:
         "availability",
         "other",
     )
+
+    def compute_risk_profile(risk_params):  # pragma: no cover - fallback stub
+        return {}
+
+
+if MODEL_IMPORT_ERROR is None:
+    RISK_DISTRIBUTION_OPTIONS: Tuple[str, ...] = tuple(dict.fromkeys(MONTE_CARLO_DISTRIBUTIONS))
+    _default_targets = set(str(x).lower() for x in DEFAULTS["risk_params"].get("target", []) if pd.notna(x))
+    _default_targets.update(["risk", "price", "availability", "opex", "capex"])
+    RISK_TARGET_OPTIONS: Tuple[str, ...] = tuple(sorted(_default_targets))
+    _default_applies = {"global", "market"}
+    for col in ("applies_to",):
+        if col in DEFAULTS["risk_params"]:
+            _default_applies.update(
+                str(x).lower() for x in DEFAULTS["risk_params"][col].dropna().unique()
+            )
+    _default_applies.update(PRODUCTS)
+    RISK_APPLIES_OPTIONS: Tuple[str, ...] = tuple(sorted(_default_applies))
+else:  # pragma: no cover - fallback values when engine unavailable
+    RISK_DISTRIBUTION_OPTIONS = MONTE_CARLO_DISTRIBUTIONS
+    RISK_TARGET_OPTIONS = ("risk", "price", "availability", "opex", "capex")
+    RISK_APPLIES_OPTIONS = tuple(sorted({"global", "market", *PRODUCTS}))
 
 
 def _format_metric(value: object, kind: str = "number") -> str:
@@ -229,6 +254,85 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
         mime="text/csv",
         key=key,
     )
+
+
+def _get_risk_select_options(tables: "InputTables") -> Tuple[List[str], List[str]]:
+    """Return dropdown option sets for risk targets and scope fields."""
+
+    target_set = set(RISK_TARGET_OPTIONS)
+    applies_set = set(RISK_APPLIES_OPTIONS)
+
+    default_risk = DEFAULTS.get("risk_params")
+    sources: List[pd.DataFrame] = []
+    if isinstance(default_risk, pd.DataFrame) and not default_risk.empty:
+        sources.append(default_risk)
+    try:
+        active_risk = tables.ensure_table("risk_params")
+    except Exception:
+        active_risk = pd.DataFrame()
+    if isinstance(active_risk, pd.DataFrame) and not active_risk.empty:
+        sources.append(active_risk)
+
+    for source in sources:
+        if "target" in source:
+            target_set.update(str(val).lower() for val in source["target"].dropna().unique())
+        if "applies_to" in source:
+            applies_set.update(str(val).lower() for val in source["applies_to"].dropna().unique())
+
+    target_options = sorted(option for option in target_set if option)
+    applies_options = sorted(option for option in applies_set if option)
+    return target_options, applies_options
+
+
+def _render_risk_schedule_preview(tables: "InputTables") -> None:
+    """Display the normalised risk schedule and consolidated multipliers."""
+
+    risk_df = tables.ensure_table("risk_params").copy()
+    risk_df = risk_df.replace({"": np.nan}).dropna(how="all")
+    if risk_df.empty:
+        st.info("Add at least one risk driver above to populate the active schedule.")
+        return
+
+    risk_df = risk_df.reset_index(drop=True)
+    _render_dataframe(risk_df, "Active risk schedule", key="risk_schedule_preview")
+
+    profile = compute_risk_profile(risk_df)
+    if not isinstance(profile, dict) or not profile:
+        return
+
+    summary_rows: List[Dict[str, object]] = []
+    profile_labels = [
+        ("production", "Production multiplier"),
+        ("labour", "Labour multiplier"),
+        ("price", "Price multiplier"),
+        ("revenue", "Revenue multiplier"),
+        ("yield", "Yield multiplier"),
+    ]
+    for key_name, label in profile_labels:
+        value = profile.get(key_name)
+        if value is None:
+            continue
+        try:
+            summary_rows.append({"Metric": label, "Multiplier": float(value)})
+        except (TypeError, ValueError):  # pragma: no cover - defensive guard
+            continue
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        _render_dataframe(summary_df, "Consolidated risk multipliers", key="risk_profile_summary")
+
+    price_map = profile.get("price_by_product")
+    if isinstance(price_map, dict) and price_map:
+        price_rows: List[Dict[str, object]] = []
+        for product, value in price_map.items():
+            try:
+                multiplier = float(value)
+            except (TypeError, ValueError):
+                continue
+            product_label = str(product).replace("_", " ").title()
+            price_rows.append({"Product": product_label, "Multiplier": multiplier})
+        if price_rows:
+            price_df = pd.DataFrame(price_rows)
+            _render_dataframe(price_df, "Price multipliers by product", key="risk_profile_prices")
 
 
 def _display_default_value(value: object) -> str:
@@ -1695,13 +1799,61 @@ def main() -> None:
 
         with control_tabs[4]:
             st.markdown("### Risk and scenario options")
+            risk_targets, risk_applies = _get_risk_select_options(tables)
+            risk_column_config = {
+                "distribution": st.column_config.SelectboxColumn(
+                    "Distribution",
+                    options=list(RISK_DISTRIBUTION_OPTIONS),
+                    help="Probability distribution used when sampling this risk driver.",
+                ),
+                "target": st.column_config.SelectboxColumn(
+                    "Target",
+                    options=risk_targets,
+                    help="Choose whether the draw scales general risk multipliers, prices, availability, opex, or capex.",
+                ),
+                "applies_to": st.column_config.SelectboxColumn(
+                    "Applies to",
+                    options=risk_applies,
+                    help="Restrict the driver to a specific product/segment or leave as global.",
+                ),
+                "p1": st.column_config.NumberColumn("P1", help="Distribution parameter 1 (e.g., mean or minimum)."),
+                "p2": st.column_config.NumberColumn("P2", help="Distribution parameter 2 (e.g., stdev or mode)."),
+                "p3": st.column_config.NumberColumn("P3", help="Distribution parameter 3 (e.g., triangular maximum)."),
+                "production_multiplier": st.column_config.NumberColumn(
+                    "Production multiplier",
+                    min_value=0.0,
+                    help="Baseline production multiplier applied before any sampled draw.",
+                ),
+                "labour_multiplier": st.column_config.NumberColumn(
+                    "Labour multiplier",
+                    min_value=0.0,
+                    help="Baseline labour cost multiplier applied before any sampled draw.",
+                ),
+                "price_multiplier": st.column_config.NumberColumn(
+                    "Price multiplier",
+                    min_value=0.0,
+                    help="Baseline price multiplier applied before any sampled draw.",
+                ),
+                "revenue_multiplier": st.column_config.NumberColumn(
+                    "Revenue multiplier",
+                    min_value=0.0,
+                    help="Baseline revenue multiplier applied before any sampled draw.",
+                ),
+                "yield_multiplier": st.column_config.NumberColumn(
+                    "Yield multiplier",
+                    min_value=0.0,
+                    help="Baseline yield multiplier applied before any sampled draw.",
+                ),
+            }
             _render_table_editor(
                 tables,
                 "risk_params",
                 "Risk Schedule",
                 sync_errors.get("risk_params"),
                 "Political, environmental, and market risk multipliers for production, pricing, and labour assumptions.",
+                column_config=risk_column_config,
             )
+            _render_risk_schedule_preview(tables)
 
     timeline = Timeline(
         int(horizon["start_year"]),
