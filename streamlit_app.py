@@ -146,6 +146,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         build_config,
         MONTE_CARLO_DISTRIBUTIONS,
         MONTE_CARLO_VARIABLES,
+        MONTE_CARLO_VARIABLE_LABELS,
         compute_risk_profile,
         monte_carlo,
         parse_ramp,
@@ -169,31 +170,33 @@ if MODEL_IMPORT_ERROR is not None:
     PRODUCTS = ("ethanol", "sugar", "electricity", "animal_feed")
 
     MONTE_CARLO_DISTRIBUTIONS = ("normal", "lognormal", "triangular", "uniform")
-    MONTE_CARLO_VARIABLES = (
-        "opex",
-        "interest_rate",
-        "capex",
-        "initial_investment",
-        "debt_schedule",
-        "production",
-        "production_ethanol",
-        "production_sugar",
-        "production_electricity",
-        "production_animal_feed",
-        "pricing",
-        "pricing_ethanol",
-        "pricing_sugar",
-        "pricing_electricity",
-        "pricing_animal_feed",
-        "revenue",
-        "sugarcane_yield",
-        "operating_cost_direct",
-        "operating_cost_staff",
-        "operating_cost_other",
-        "labour",
-        "availability",
-        "other",
+    MONTE_CARLO_VARIABLE_ITEMS = (
+        ("opex", "Operating expenditure (all)"),
+        ("interest_rate", "Interest rate"),
+        ("capex", "Total CAPEX"),
+        ("initial_investment", "Initial Investment (CAPEX)"),
+        ("debt_schedule", "Debt schedule"),
+        ("production", "Production volumes (all products)"),
+        ("production_ethanol", "Production volumes (annual) – Ethanol"),
+        ("production_sugar", "Production volumes (annual) – Sugar"),
+        ("production_electricity", "Production volumes (annual) – Electricity"),
+        ("production_animal_feed", "Production volumes (annual) – Animal feed"),
+        ("pricing", "Pricing (all products)"),
+        ("pricing_ethanol", "Pricing – Ethanol"),
+        ("pricing_sugar", "Pricing – Sugar"),
+        ("pricing_electricity", "Pricing – Electricity"),
+        ("pricing_animal_feed", "Pricing – Animal feed"),
+        ("revenue", "Revenue"),
+        ("sugarcane_yield", "Sugarcane yield"),
+        ("operating_cost_direct", "Operating Costs - Direct"),
+        ("operating_cost_staff", "Operating Costs - Staff"),
+        ("operating_cost_other", "Operating Costs - Other Opex"),
+        ("labour", "Labour costs"),
+        ("availability", "Plant availability"),
+        ("other", "Other"),
     )
+    MONTE_CARLO_VARIABLES = tuple(key for key, _ in MONTE_CARLO_VARIABLE_ITEMS)
+    MONTE_CARLO_VARIABLE_LABELS = {key: label for key, label in MONTE_CARLO_VARIABLE_ITEMS}
 
     def compute_risk_profile(risk_params):  # pragma: no cover - fallback stub
         return {}
@@ -216,6 +219,10 @@ else:  # pragma: no cover - fallback values when engine unavailable
     RISK_DISTRIBUTION_OPTIONS = MONTE_CARLO_DISTRIBUTIONS
     RISK_TARGET_OPTIONS = ("risk", "price", "availability", "opex", "capex")
     RISK_APPLIES_OPTIONS = tuple(sorted({"global", "market", *PRODUCTS}))
+
+MONTE_CARLO_VARIABLE_LABEL_TO_KEY: Dict[str, str] = {
+    label: key for key, label in MONTE_CARLO_VARIABLE_LABELS.items()
+}
 
 
 def _format_metric(value: object, kind: str = "number") -> str:
@@ -709,7 +716,7 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
             if col == "distribution":
                 return list(MONTE_CARLO_DISTRIBUTIONS)
             if col == "variable":
-                return list(MONTE_CARLO_VARIABLES)
+                return list(MONTE_CARLO_VARIABLE_LABELS.values())
             if col == "applies_to":
                 return ["global", *PRODUCTS]
         return None
@@ -755,16 +762,22 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
                 options = _field_options(column_name)
                 if options:
                     default_option = schema.defaults.get(column_name)
-                    if default_option is None or (
-                        isinstance(default_option, float) and math.isnan(default_option)
-                    ):
-                        default_option = options[0] if options else ""
-                    if current_value is None or (
-                        isinstance(current_value, float) and math.isnan(current_value)
-                    ):
-                        current_option = str(default_option)
+                    if table_name == "monte_carlo_settings" and column_name.lower() == "variable":
+                        default_label = MONTE_CARLO_VARIABLE_LABELS.get(str(default_option), options[0])
+                        current_option = MONTE_CARLO_VARIABLE_LABELS.get(
+                            str(current_value), default_label
+                        )
                     else:
-                        current_option = str(current_value)
+                        if default_option is None or (
+                            isinstance(default_option, float) and math.isnan(default_option)
+                        ):
+                            default_option = options[0] if options else ""
+                        if current_value is None or (
+                            isinstance(current_value, float) and math.isnan(current_value)
+                        ):
+                            current_option = str(default_option)
+                        else:
+                            current_option = str(current_value)
                     index = _option_index(options, current_option, default=0)
                     input_value = form.selectbox(
                         field_label,
@@ -772,7 +785,12 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
                         index=index,
                         key=f"default_edit_field_{table_name}_{row_index}_{column_name}",
                     )
-                    updated_values[column_name] = str(input_value)
+                    if table_name == "monte_carlo_settings" and column_name.lower() == "variable":
+                        updated_values[column_name] = MONTE_CARLO_VARIABLE_LABEL_TO_KEY.get(
+                            str(input_value), str(input_value)
+                        )
+                    else:
+                        updated_values[column_name] = str(input_value)
                 else:
                     if current_value is None or (isinstance(current_value, float) and math.isnan(current_value)):
                         text_value = ""
@@ -1415,8 +1433,14 @@ def _render_table_editor(
     # using the old key to avoid Streamlit policy violations on render.
     st.session_state.pop(f"editor_{table_name}", None)
 
+    display_df = df.copy()
+    if table_name == "monte_carlo_settings" and "variable" in display_df.columns:
+        display_df["variable"] = display_df["variable"].map(MONTE_CARLO_VARIABLE_LABELS).fillna(
+            display_df["variable"].astype(str)
+        )
+
     editor = st.data_editor(
-        df,
+        display_df,
         num_rows="dynamic",
         use_container_width=True,
         key=state_key,
@@ -1441,6 +1465,11 @@ def _render_table_editor(
             editor_clean = editor_clean.drop(columns=drop_columns)
         if rename_map:
             editor_clean = editor_clean.rename(columns=rename_map)
+
+        if table_name == "monte_carlo_settings" and "variable" in editor_clean.columns:
+            editor_clean["variable"] = editor_clean["variable"].map(MONTE_CARLO_VARIABLE_LABEL_TO_KEY).fillna(
+                editor_clean["variable"]
+            )
 
         canonical_cols = list(schema.columns.keys())
         editor_clean = editor_clean.reindex(columns=canonical_cols, fill_value=np.nan)
@@ -2101,7 +2130,8 @@ def main() -> None:
 
         with scenario_sections[1]:
             distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
-            variable_options = list(MONTE_CARLO_VARIABLES)
+            variable_label_map = dict(MONTE_CARLO_VARIABLE_LABELS)
+            variable_options = list(variable_label_map.values())
             applies_options = ["global", *PRODUCTS]
             monte_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
@@ -2138,7 +2168,8 @@ def main() -> None:
 
                 def _format_driver(idx: int) -> str:
                     row = monte_cfg.loc[idx]
-                    variable = str(row.get("variable", "driver") or "driver")
+                    variable_key = str(row.get("variable", "driver") or "driver")
+                    variable = variable_label_map.get(variable_key, variable_key)
                     distribution = str(row.get("distribution", "normal") or "normal")
                     scope = str(row.get("applies_to", "global") or "global")
                     return f"Row {idx + 1}: {variable} · {distribution} ({scope})"
@@ -2183,13 +2214,12 @@ def main() -> None:
                         ),
                         key=f"monte_distribution_{selected_idx}",
                     )
+                    selected_key = str(selected_row.get("variable", "") or "")
+                    selected_label = variable_label_map.get(selected_key, variable_options[0])
                     variable_value = st.selectbox(
                         "Variable",
                         variable_options,
-                        index=_option_index(
-                            variable_options,
-                            str(selected_row.get("variable", "opex") or "opex"),
-                        ),
+                        index=_option_index(variable_options, selected_label),
                         key=f"monte_variable_{selected_idx}",
                     )
                     applies_value = st.selectbox(
@@ -2230,7 +2260,9 @@ def main() -> None:
                     updated_cfg.at[selected_idx, "iterations"] = int(iterations_value)
                     updated_cfg.at[selected_idx, "random_seed"] = int(random_seed_value)
                     updated_cfg.at[selected_idx, "distribution"] = str(distribution_value)
-                    updated_cfg.at[selected_idx, "variable"] = str(variable_value)
+                    updated_cfg.at[selected_idx, "variable"] = MONTE_CARLO_VARIABLE_LABEL_TO_KEY.get(
+                        str(variable_value), str(variable_value)
+                    )
                     updated_cfg.at[selected_idx, "applies_to"] = str(applies_value)
                     updated_cfg.at[selected_idx, "p1"] = float(p1_value)
                     updated_cfg.at[selected_idx, "p2"] = float(p2_value)

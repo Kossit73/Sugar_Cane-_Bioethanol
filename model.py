@@ -46,31 +46,33 @@ import pandas as pd
 PRODUCTS: Tuple[str, ...] = ("ethanol", "sugar", "electricity", "animal_feed")
 FEEDSTOCK_SCENARIOS: Tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
 MONTE_CARLO_DISTRIBUTIONS: Tuple[str, ...] = ("normal", "lognormal", "triangular", "uniform")
-MONTE_CARLO_VARIABLES: Tuple[str, ...] = (
-    "opex",
-    "interest_rate",
-    "capex",
-    "initial_investment",
-    "debt_schedule",
-    "production",
-    "production_ethanol",
-    "production_sugar",
-    "production_electricity",
-    "production_animal_feed",
-    "pricing",
-    "pricing_ethanol",
-    "pricing_sugar",
-    "pricing_electricity",
-    "pricing_animal_feed",
-    "revenue",
-    "sugarcane_yield",
-    "operating_cost_direct",
-    "operating_cost_staff",
-    "operating_cost_other",
-    "labour",
-    "availability",
-    "other",
+MONTE_CARLO_VARIABLE_ITEMS: Tuple[Tuple[str, str], ...] = (
+    ("opex", "Operating expenditure (all)"),
+    ("interest_rate", "Interest rate"),
+    ("capex", "Total CAPEX"),
+    ("initial_investment", "Initial Investment (CAPEX)"),
+    ("debt_schedule", "Debt schedule"),
+    ("production", "Production volumes (all products)"),
+    ("production_ethanol", "Production volumes (annual) – Ethanol"),
+    ("production_sugar", "Production volumes (annual) – Sugar"),
+    ("production_electricity", "Production volumes (annual) – Electricity"),
+    ("production_animal_feed", "Production volumes (annual) – Animal feed"),
+    ("pricing", "Pricing (all products)"),
+    ("pricing_ethanol", "Pricing – Ethanol"),
+    ("pricing_sugar", "Pricing – Sugar"),
+    ("pricing_electricity", "Pricing – Electricity"),
+    ("pricing_animal_feed", "Pricing – Animal feed"),
+    ("revenue", "Revenue"),
+    ("sugarcane_yield", "Sugarcane yield"),
+    ("operating_cost_direct", "Operating Costs - Direct"),
+    ("operating_cost_staff", "Operating Costs - Staff"),
+    ("operating_cost_other", "Operating Costs - Other Opex"),
+    ("labour", "Labour costs"),
+    ("availability", "Plant availability"),
+    ("other", "Other"),
 )
+MONTE_CARLO_VARIABLES: Tuple[str, ...] = tuple(key for key, _ in MONTE_CARLO_VARIABLE_ITEMS)
+MONTE_CARLO_VARIABLE_LABELS: Dict[str, str] = {key: label for key, label in MONTE_CARLO_VARIABLE_ITEMS}
 MONTHS_IN_YEAR = 12
 RISK_MULTIPLIER_COLUMNS: Dict[str, str] = {
     "production_multiplier": "production",
