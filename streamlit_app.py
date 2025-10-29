@@ -148,11 +148,15 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         MONTE_CARLO_VARIABLES,
         MONTE_CARLO_VARIABLE_LABELS,
         compute_risk_profile,
+        decision_tree_analysis,
+        metaheuristic_optimize,
         monte_carlo,
+        neural_forecast_production,
         parse_ramp,
         run_full_model,
         run_scenarios,
         sensitivity_tornado,
+        statistical_forecast,
         normalize_key,
         Timeline,
     )
@@ -201,6 +205,18 @@ if MODEL_IMPORT_ERROR is not None:
     def compute_risk_profile(risk_params):  # pragma: no cover - fallback stub
         return {}
 
+    def metaheuristic_optimize(*args, **kwargs):  # pragma: no cover - fallback stub
+        return pd.DataFrame()
+
+    def neural_forecast_production(*args, **kwargs):  # pragma: no cover - fallback stub
+        return pd.DataFrame(columns=["date", "product", "forecast_volume"])
+
+    def statistical_forecast(*args, **kwargs):  # pragma: no cover - fallback stub
+        return {"historical": pd.DataFrame(), "forecast": pd.DataFrame(), "residual_std": np.nan, "equipment_failure_risk": np.nan}
+
+    def decision_tree_analysis(*args, **kwargs):  # pragma: no cover - fallback stub
+        return {"paths": pd.DataFrame(), "expected_metric": np.nan, "objective": "Project_NPV", "total_probability": 0.0}
+
 
 if MODEL_IMPORT_ERROR is None:
     RISK_DISTRIBUTION_OPTIONS: Tuple[str, ...] = tuple(dict.fromkeys(MONTE_CARLO_DISTRIBUTIONS))
@@ -224,6 +240,29 @@ MONTE_CARLO_VARIABLE_LABEL_TO_KEY: Dict[str, str] = {
     label: key for key, label in MONTE_CARLO_VARIABLE_LABELS.items()
 }
 
+OPTIMIZER_VARIABLE_OPTIONS: Dict[str, str] = {
+    "ethanol_price": "Ethanol price multiplier",
+    "sugar_price": "Sugar price multiplier",
+    "electricity_price": "Electricity tariff multiplier",
+    "animal_feed_price": "Animal feed price multiplier",
+    "availability": "Plant availability multiplier",
+    "capex": "Total CAPEX multiplier",
+    "opex": "Operating cost multiplier",
+    "debt_rate": "Debt rate shift",
+}
+
+STATISTICAL_SERIES_OPTIONS: Dict[str, str] = {
+    "revenue": "Revenue",
+    "cogs": "Cost of goods sold",
+    "opex": "Operating expenditure",
+    "ebitda": "EBITDA",
+    "staff_costs": "Staff costs",
+    "production_ethanol": "Production – Ethanol",
+    "production_sugar": "Production – Sugar",
+    "production_electricity": "Production – Electricity",
+    "production_animal_feed": "Production – Animal feed",
+}
+
 
 def _format_metric(value: object, kind: str = "number") -> str:
     """Format metric values for display in metric cards."""
@@ -242,6 +281,17 @@ def _format_metric(value: object, kind: str = "number") -> str:
             return str(int(round(value)))
         return f"{value:,.2f}"
     return str(value)
+
+
+def _metric_kind(metric_name: str) -> str:
+    key = str(metric_name or "").lower()
+    if "irr" in key:
+        return "percent"
+    if "npv" in key or "value" in key:
+        return "currency"
+    if "dscr" in key or "ratio" in key:
+        return "ratio"
+    return "number"
 
 
 DEFAULT_TABLE_STORE_KEY = "table_defaults_store"
@@ -603,6 +653,10 @@ def _factory_default_frames() -> Dict[str, pd.DataFrame]:
         frames["tornado_drivers"] = DEFAULTS["tornado_drivers"].copy()
         frames["monte_carlo_settings"] = DEFAULTS["monte_carlo_settings"].copy()
         frames["scenario_comparison"] = DEFAULTS["scenario_comparison"].copy()
+        frames["optimizer_settings"] = DEFAULTS["optimizer_settings"].copy()
+        frames["neural_forecast_settings"] = DEFAULTS["neural_forecast_settings"].copy()
+        frames["statistical_forecast_settings"] = DEFAULTS["statistical_forecast_settings"].copy()
+        frames["decision_tree_paths"] = DEFAULTS["decision_tree_paths"].copy()
 
         for table_name, schema in INPUT_SCHEMAS.items():
             frames.setdefault(table_name, pd.DataFrame(columns=list(schema.columns.keys())))
@@ -2074,10 +2128,263 @@ def main() -> None:
         _render_dataframe(revenue_df, "Revenue stack", key="revenue")
 
     with sensitivity_tab:
-        st.info(
-            "Configure and execute sensitivity tornado, Monte Carlo, and scenario comparisons from the "
-            "Scenarios tab. Results are displayed alongside the configuration tables there."
+        st.subheader("Advanced sensitivity analytics")
+        sensitivity_sections = st.tabs(
+            [
+                "Metaheuristic optimiser",
+                "Neural forecasts",
+                "Statistical forecasts",
+                "Decision tree",
+            ]
         )
+
+        with sensitivity_sections[0]:
+            optimizer_column_config = {
+                "enabled": st.column_config.CheckboxColumn("Enabled"),
+                "variable": st.column_config.SelectboxColumn(
+                    "Variable",
+                    options=list(OPTIMIZER_VARIABLE_OPTIONS.keys()),
+                    format_func=lambda key: OPTIMIZER_VARIABLE_OPTIONS.get(key, key.replace("_", " ").title()),
+                ),
+                "lower_bound": st.column_config.NumberColumn("Lower bound"),
+                "upper_bound": st.column_config.NumberColumn("Upper bound"),
+                "notes": st.column_config.TextColumn("Notes"),
+            }
+            _render_table_editor(
+                tables,
+                "optimizer_settings",
+                "Optimizer variables",
+                sync_errors.get("optimizer_settings"),
+                "Define variable bounds for the metaheuristic optimiser.",
+                column_config=optimizer_column_config,
+            )
+
+            optimizer_table = tables.ensure_table("optimizer_settings").copy()
+            enabled_mask = optimizer_table.get("enabled", True)
+            if not isinstance(enabled_mask, pd.Series):
+                enabled_mask = pd.Series(True, index=optimizer_table.index)
+            optimizer_active = optimizer_table[enabled_mask.fillna(True)]
+            if optimizer_active.empty:
+                st.info("Add at least one enabled variable to run the optimiser.")
+            else:
+                objective_options = list(metrics.keys())
+                default_objective = "Project_NPV" if "Project_NPV" in objective_options else objective_options[0]
+                selected_objective = st.selectbox(
+                    "Objective metric",
+                    objective_options,
+                    index=objective_options.index(default_objective),
+                )
+                iterations = int(
+                    st.number_input("Iterations", min_value=1, value=10, step=1, key="optimizer_iterations")
+                )
+                population = int(
+                    st.number_input("Population size", min_value=2, value=6, step=1, key="optimizer_population")
+                )
+                seed_value = st.number_input("Random seed (optional)", value=42, step=1, key="optimizer_seed")
+                if st.button("Run metaheuristic optimisation", key="run_optimizer"):
+                    with st.spinner("Running optimisation across variable bounds..."):
+                        optimiser_results = metaheuristic_optimize(
+                            cfg,
+                            metrics,
+                            lambda c: run_full_model(c),
+                            optimizer_active,
+                            selected_objective,
+                            iterations=iterations,
+                            population=population,
+                            seed=int(seed_value),
+                        )
+                    if optimiser_results.empty:
+                        st.info("Optimiser did not produce any results with the current configuration.")
+                    else:
+                        _render_dataframe(
+                            optimiser_results,
+                            f"Optimiser results – {selected_objective}",
+                            key="optimizer_results",
+                        )
+                        best_row = optimiser_results.sort_values("objective", ascending=False).iloc[0]
+                        metric_kind = _metric_kind(selected_objective)
+                        st.metric(
+                            f"Best {selected_objective}",
+                            _format_metric(best_row.get("objective"), metric_kind),
+                            delta=_format_metric(best_row.get("delta_vs_base"), metric_kind),
+                        )
+
+        with sensitivity_sections[1]:
+            neural_column_config = {
+                "enabled": st.column_config.CheckboxColumn("Enabled"),
+                "product": st.column_config.SelectboxColumn(
+                    "Product",
+                    options=list(PRODUCTS),
+                    format_func=lambda key: key.replace("_", " ").title(),
+                ),
+                "lookback_months": st.column_config.NumberColumn("Lookback (months)", min_value=3, step=1),
+                "forecast_months": st.column_config.NumberColumn("Forecast horizon (months)", min_value=1, step=1),
+                "hidden_units": st.column_config.NumberColumn("Hidden units", min_value=1, step=1),
+                "learning_rate": st.column_config.NumberColumn("Learning rate", min_value=0.0001, step=0.0001, format="%.4f"),
+                "epochs": st.column_config.NumberColumn("Epochs", min_value=50, step=50),
+            }
+            _render_table_editor(
+                tables,
+                "neural_forecast_settings",
+                "Neural forecasting settings",
+                sync_errors.get("neural_forecast_settings"),
+                "Configure neural network parameters to forecast production volumes.",
+                column_config=neural_column_config,
+            )
+
+            neural_cfg = tables.ensure_table("neural_forecast_settings").copy()
+            enabled_mask = neural_cfg.get("enabled", True)
+            if not isinstance(enabled_mask, pd.Series):
+                enabled_mask = pd.Series(True, index=neural_cfg.index)
+            neural_active = neural_cfg[enabled_mask.fillna(True)]
+            if neural_active.empty:
+                st.info("Enable at least one neural forecast configuration to generate projections.")
+            elif st.button("Run neural forecasts", key="run_neural"):
+                for idx, row in neural_active.iterrows():
+                    product_key = str(row.get("product", "ethanol") or "ethanol")
+                    lookback_val = int(row.get("lookback_months", 12) or 12)
+                    horizon_val = int(row.get("forecast_months", 12) or 12)
+                    hidden_units = int(row.get("hidden_units", 8) or 8)
+                    learning_rate = float(row.get("learning_rate", 0.01) or 0.01)
+                    epochs_val = int(row.get("epochs", 300) or 300)
+                    with st.spinner(f"Forecasting {product_key.title()} volumes..."):
+                        forecast_df = neural_forecast_production(
+                            results,
+                            product_key,
+                            lookback=lookback_val,
+                            horizon=horizon_val,
+                            hidden_units=hidden_units,
+                            learning_rate=learning_rate,
+                            epochs=epochs_val,
+                            seed=int(idx + 1),
+                        )
+                    if forecast_df.empty:
+                        st.warning(f"No forecast generated for {product_key.title()} (insufficient data).")
+                    else:
+                        _render_dataframe(
+                            forecast_df,
+                            f"Neural forecast – {product_key.title()}",
+                            key=f"neural_{idx}",
+                        )
+
+        with sensitivity_sections[2]:
+            stat_column_config = {
+                "enabled": st.column_config.CheckboxColumn("Enabled"),
+                "series": st.column_config.SelectboxColumn(
+                    "Series",
+                    options=list(STATISTICAL_SERIES_OPTIONS.keys()),
+                    format_func=lambda key: STATISTICAL_SERIES_OPTIONS.get(key, key.replace("_", " ").title()),
+                ),
+                "alpha": st.column_config.NumberColumn("Alpha", min_value=0.01, max_value=1.0, format="%.2f"),
+                "forecast_months": st.column_config.NumberColumn("Forecast horizon (months)", min_value=1, step=1),
+            }
+            _render_table_editor(
+                tables,
+                "statistical_forecast_settings",
+                "Statistical forecast settings",
+                sync_errors.get("statistical_forecast_settings"),
+                "Set exponential-smoothing parameters for demand and cost forecasting.",
+                column_config=stat_column_config,
+            )
+
+            stat_cfg = tables.ensure_table("statistical_forecast_settings").copy()
+            enabled_mask = stat_cfg.get("enabled", True)
+            if not isinstance(enabled_mask, pd.Series):
+                enabled_mask = pd.Series(True, index=stat_cfg.index)
+            stat_active = stat_cfg[enabled_mask.fillna(True)]
+            if stat_active.empty:
+                st.info("Enable at least one statistical series to forecast.")
+            elif st.button("Run statistical forecasts", key="run_statistical"):
+                for idx, row in stat_active.iterrows():
+                    series_key = str(row.get("series", "revenue") or "revenue")
+                    alpha_val = float(row.get("alpha", 0.3) or 0.3)
+                    horizon_val = int(row.get("forecast_months", 12) or 12)
+                    with st.spinner(f"Forecasting {STATISTICAL_SERIES_OPTIONS.get(series_key, series_key)}..."):
+                        forecast_result = statistical_forecast(
+                            results,
+                            series_key,
+                            alpha=alpha_val,
+                            horizon=horizon_val,
+                        )
+                    historical_df = forecast_result.get("historical", pd.DataFrame())
+                    forecast_df = forecast_result.get("forecast", pd.DataFrame())
+                    if historical_df.empty and forecast_df.empty:
+                        st.warning(f"No data available for {STATISTICAL_SERIES_OPTIONS.get(series_key, series_key)}.")
+                        continue
+                    if not historical_df.empty:
+                        _render_dataframe(
+                            historical_df,
+                            f"Historical series – {STATISTICAL_SERIES_OPTIONS.get(series_key, series_key)}",
+                            key=f"stat_hist_{idx}",
+                        )
+                    if not forecast_df.empty:
+                        _render_dataframe(
+                            forecast_df,
+                            f"Forecast – {STATISTICAL_SERIES_OPTIONS.get(series_key, series_key)}",
+                            key=f"stat_forecast_{idx}",
+                        )
+                    st.caption(
+                        f"Residual standard deviation: {forecast_result.get('residual_std', 0.0):.2f} · "
+                        f"Equipment failure risk proxy: {forecast_result.get('equipment_failure_risk', 0.0):.2%}"
+                    )
+
+        with sensitivity_sections[3]:
+            decision_column_config = {
+                "enabled": st.column_config.CheckboxColumn("Enabled"),
+                "path_name": st.column_config.TextColumn("Path name"),
+                "probability": st.column_config.NumberColumn("Probability", min_value=0.0, max_value=1.0, format="%.2f"),
+                "ethanol_price_multiplier": st.column_config.NumberColumn("Ethanol price multiplier", format="%.3f"),
+                "sugar_price_multiplier": st.column_config.NumberColumn("Sugar price multiplier", format="%.3f"),
+                "electricity_price_multiplier": st.column_config.NumberColumn("Electricity price multiplier", format="%.3f"),
+                "animal_feed_price_multiplier": st.column_config.NumberColumn("Animal feed price multiplier", format="%.3f"),
+                "capex_multiplier": st.column_config.NumberColumn("CAPEX multiplier", format="%.3f"),
+                "opex_multiplier": st.column_config.NumberColumn("Opex multiplier", format="%.3f"),
+                "debt_rate_shift": st.column_config.NumberColumn("Debt rate shift", format="%.4f"),
+                "notes": st.column_config.TextColumn("Notes"),
+            }
+            _render_table_editor(
+                tables,
+                "decision_tree_paths",
+                "Decision tree paths",
+                sync_errors.get("decision_tree_paths"),
+                "Define scenario branches with probabilities and multipliers for pricing, CAPEX, and OPEX.",
+                column_config=decision_column_config,
+            )
+
+            decision_table = tables.ensure_table("decision_tree_paths").copy()
+            if decision_table.empty:
+                st.info("Add decision paths to evaluate expected outcomes.")
+            else:
+                objective_options = list(metrics.keys())
+                default_objective = "Project_NPV" if "Project_NPV" in objective_options else objective_options[0]
+                selected_objective = st.selectbox(
+                    "Objective metric",
+                    objective_options,
+                    index=objective_options.index(default_objective),
+                    key="decision_objective",
+                )
+                if st.button("Evaluate decision tree", key="run_decision_tree"):
+                    with st.spinner("Evaluating decision tree paths..."):
+                        decision_result = decision_tree_analysis(
+                            cfg,
+                            lambda c: run_full_model(c),
+                            decision_table,
+                            objective=selected_objective,
+                        )
+                    paths_df = decision_result.get("paths", pd.DataFrame())
+                    if paths_df.empty:
+                        st.info("No active decision paths with valid probabilities were found.")
+                    else:
+                        _render_dataframe(paths_df, "Decision tree evaluation", key="decision_tree_results")
+                        metric_kind = _metric_kind(selected_objective)
+                        st.metric(
+                            f"Expected {selected_objective}",
+                            _format_metric(decision_result.get("expected_metric"), metric_kind),
+                        )
+                        st.caption(
+                            f"Total probability weight: {decision_result.get('total_probability', 0.0):.2f}"
+                        )
+
 
     with scenario_tab:
         st.markdown("### Scenario analytics workspace")

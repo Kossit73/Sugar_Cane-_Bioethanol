@@ -321,6 +321,84 @@ DEFAULTS = {
             },
         ]
     ),
+    "optimizer_settings": pd.DataFrame(
+        [
+            {"enabled": True, "variable": "ethanol_price", "lower_bound": 0.85, "upper_bound": 1.15, "notes": "Scale ethanol tariff"},
+            {"enabled": True, "variable": "capex", "lower_bound": 0.85, "upper_bound": 1.15, "notes": "Adjust total project CAPEX"},
+            {"enabled": False, "variable": "debt_rate", "lower_bound": -0.02, "upper_bound": 0.02, "notes": "Shift debt interest rate"},
+        ]
+    ),
+    "neural_forecast_settings": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "product": "ethanol",
+                "lookback_months": 12,
+                "forecast_months": 12,
+                "hidden_units": 8,
+                "learning_rate": 0.01,
+                "epochs": 300,
+            },
+            {
+                "enabled": False,
+                "product": "sugar",
+                "lookback_months": 12,
+                "forecast_months": 12,
+                "hidden_units": 8,
+                "learning_rate": 0.01,
+                "epochs": 300,
+            },
+        ]
+    ),
+    "statistical_forecast_settings": pd.DataFrame(
+        [
+            {"enabled": True, "series": "revenue", "alpha": 0.3, "forecast_months": 12},
+            {"enabled": True, "series": "cogs", "alpha": 0.3, "forecast_months": 12},
+        ]
+    ),
+    "decision_tree_paths": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "path_name": "Upside demand",
+                "probability": 0.35,
+                "ethanol_price_multiplier": 1.1,
+                "sugar_price_multiplier": 1.05,
+                "electricity_price_multiplier": 1.02,
+                "animal_feed_price_multiplier": 1.03,
+                "capex_multiplier": 1.0,
+                "opex_multiplier": 1.0,
+                "debt_rate_shift": -0.005,
+                "notes": "Higher pricing environment",
+            },
+            {
+                "enabled": True,
+                "path_name": "Base case",
+                "probability": 0.40,
+                "ethanol_price_multiplier": 1.0,
+                "sugar_price_multiplier": 1.0,
+                "electricity_price_multiplier": 1.0,
+                "animal_feed_price_multiplier": 1.0,
+                "capex_multiplier": 1.0,
+                "opex_multiplier": 1.0,
+                "debt_rate_shift": 0.0,
+                "notes": "Central outlook",
+            },
+            {
+                "enabled": True,
+                "path_name": "Downside",
+                "probability": 0.25,
+                "ethanol_price_multiplier": 0.9,
+                "sugar_price_multiplier": 0.92,
+                "electricity_price_multiplier": 0.95,
+                "animal_feed_price_multiplier": 0.9,
+                "capex_multiplier": 1.05,
+                "opex_multiplier": 1.08,
+                "debt_rate_shift": 0.01,
+                "notes": "Pricing pressure and cost inflation",
+            },
+        ]
+    ),
 }
 
 ###############################################################################
@@ -903,6 +981,71 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "enabled": True,
             "feedstock_scenario": "HYBRID",
             "farm_share": 0.5,
+            "notes": "",
+        },
+    ),
+    "optimizer_settings": TableSchema(
+        columns={
+            "enabled": "bool",
+            "variable": "str",
+            "lower_bound": "float",
+            "upper_bound": "float",
+            "notes": "str",
+        },
+        defaults={"enabled": True, "lower_bound": 0.9, "upper_bound": 1.1, "notes": ""},
+    ),
+    "neural_forecast_settings": TableSchema(
+        columns={
+            "enabled": "bool",
+            "product": "str",
+            "lookback_months": "int",
+            "forecast_months": "int",
+            "hidden_units": "int",
+            "learning_rate": "float",
+            "epochs": "int",
+        },
+        defaults={
+            "enabled": True,
+            "lookback_months": 12,
+            "forecast_months": 12,
+            "hidden_units": 8,
+            "learning_rate": 0.01,
+            "epochs": 300,
+        },
+    ),
+    "statistical_forecast_settings": TableSchema(
+        columns={
+            "enabled": "bool",
+            "series": "str",
+            "alpha": "float",
+            "forecast_months": "int",
+        },
+        defaults={"enabled": True, "alpha": 0.3, "forecast_months": 12},
+    ),
+    "decision_tree_paths": TableSchema(
+        columns={
+            "enabled": "bool",
+            "path_name": "str",
+            "probability": "float",
+            "ethanol_price_multiplier": "float",
+            "sugar_price_multiplier": "float",
+            "electricity_price_multiplier": "float",
+            "animal_feed_price_multiplier": "float",
+            "capex_multiplier": "float",
+            "opex_multiplier": "float",
+            "debt_rate_shift": "float",
+            "notes": "str",
+        },
+        defaults={
+            "enabled": True,
+            "probability": 0.33,
+            "ethanol_price_multiplier": 1.0,
+            "sugar_price_multiplier": 1.0,
+            "electricity_price_multiplier": 1.0,
+            "animal_feed_price_multiplier": 1.0,
+            "capex_multiplier": 1.0,
+            "opex_multiplier": 1.0,
+            "debt_rate_shift": 0.0,
             "notes": "",
         },
     ),
@@ -2274,6 +2417,597 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
 ###############################################################################
 # Section 14: Sensitivity, Monte Carlo, Goal Seek, Scenarios
 ###############################################################################
+
+
+OPTIMIZATION_VARIABLE_LIBRARY: Dict[str, Dict[str, object]] = {
+    "ethanol_price": {"label": "Ethanol price multiplier", "mode": "scale", "bounds": (0.8, 1.2)},
+    "sugar_price": {"label": "Sugar price multiplier", "mode": "scale", "bounds": (0.8, 1.2)},
+    "electricity_price": {"label": "Electricity tariff multiplier", "mode": "scale", "bounds": (0.8, 1.25)},
+    "animal_feed_price": {"label": "Animal feed price multiplier", "mode": "scale", "bounds": (0.8, 1.25)},
+    "availability": {"label": "Plant availability multiplier", "mode": "scale", "bounds": (0.8, 1.05)},
+    "capex": {"label": "Total CAPEX multiplier", "mode": "scale", "bounds": (0.8, 1.2)},
+    "opex": {"label": "Operating cost multiplier", "mode": "scale", "bounds": (0.85, 1.2)},
+    "debt_rate": {"label": "Debt interest rate shift", "mode": "shift", "bounds": (-0.03, 0.03)},
+}
+
+DECISION_TREE_COLUMN_MAP: Dict[str, str] = {
+    "ethanol_price_multiplier": "ethanol_price",
+    "sugar_price_multiplier": "sugar_price",
+    "electricity_price_multiplier": "electricity_price",
+    "animal_feed_price_multiplier": "animal_feed_price",
+    "capex_multiplier": "capex",
+    "opex_multiplier": "opex",
+    "debt_rate_shift": "debt_rate",
+}
+
+
+@dataclass
+class OptimizationVariableSpec:
+    name: str
+    label: str
+    bounds: Tuple[float, float]
+    mode: Literal["scale", "shift"]
+    base: object
+
+    def clip(self, value: float) -> float:
+        low, high = self.bounds
+        if low > high:
+            low, high = high, low
+        return float(min(max(value, low), high))
+
+    def apply(self, cfg_copy: Dict[str, object], value: float) -> None:
+        value = self.clip(value)
+        if self.name in {"ethanol_price", "sugar_price", "electricity_price", "animal_feed_price"}:
+            product = self.name.replace("_price", "")
+            base_price = float(self.base) if self.base is not None else 0.0
+            cfg_copy.setdefault("prices", {}).setdefault(product, {})
+            cfg_copy["prices"][product]["base_price"] = base_price * value
+            return
+        if self.name == "availability":
+            base_availability = float(self.base) if self.base is not None else DEFAULTS["production"]["plant_availability"]
+            cfg_copy.setdefault("production", {})
+            cfg_copy["production"]["plant_availability"] = min(max(base_availability * value, 0.0), 1.0)
+            return
+        if self.name == "capex":
+            if isinstance(self.base, pd.DataFrame):
+                df = self.base.copy()
+                if "amount" in df.columns:
+                    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0) * value
+                cfg_copy["capex_lines"] = df
+            elif isinstance(self.base, list):
+                new_lines: List[Dict[str, object]] = []
+                for line in self.base:
+                    new_line = copy.deepcopy(line)
+                    if isinstance(new_line, dict) and "amount" in new_line and new_line["amount"] is not None:
+                        try:
+                            new_line["amount"] = float(new_line["amount"]) * value
+                        except (TypeError, ValueError):
+                            pass
+                    new_lines.append(new_line)
+                cfg_copy["capex_lines"] = new_lines
+            return
+        if self.name == "opex":
+            base_mapping = self.base if isinstance(self.base, dict) else {}
+            fixed = float(base_mapping.get("fixed_opex_per_month", DEFAULTS["opex"]["fixed_opex_per_month"]))
+            var_map = copy.deepcopy(base_mapping.get("other_variable_cost_per_unit", DEFAULTS["opex"]["other_variable_cost_per_unit"]))
+            cfg_copy.setdefault("opex", {})
+            cfg_copy["opex"]["fixed_opex_per_month"] = fixed * value
+            cfg_copy["opex"]["other_variable_cost_per_unit"] = {k: float(v) * value for k, v in var_map.items()}
+            return
+        if self.name == "debt_rate":
+            delta = value if self.mode == "shift" else value
+            debt_df = cfg_copy.get("debt_tranches")
+            if isinstance(debt_df, pd.DataFrame) and not debt_df.empty:
+                df = debt_df.copy()
+                if "interest_rate" in df.columns:
+                    df["interest_rate"] = pd.to_numeric(df["interest_rate"], errors="coerce").fillna(0.0) + delta
+                cfg_copy["debt_tranches"] = df
+            else:
+                tranches = cfg_copy.get("debt", {}).get("tranches", [])
+                if isinstance(tranches, list):
+                    for idx, tranche in enumerate(tranches):
+                        base_rate = 0.0
+                        if isinstance(self.base, list) and idx < len(self.base):
+                            base_rate = float(self.base[idx])
+                        elif isinstance(tranche, dict) and "interest_rate" in tranche:
+                            try:
+                                base_rate = float(tranche["interest_rate"])
+                            except (TypeError, ValueError):
+                                base_rate = 0.0
+                        if isinstance(tranche, dict):
+                            tranche["interest_rate"] = base_rate + delta
+
+
+def _extract_optimizer_base(cfg: Mapping[str, object], key: str) -> object:
+    if key in {"ethanol_price", "sugar_price", "electricity_price", "animal_feed_price"}:
+        product = key.replace("_price", "")
+        price_cfg = cfg.get("prices", {})
+        base_price = None
+        if isinstance(price_cfg, Mapping):
+            product_cfg = price_cfg.get(product, {})
+            if isinstance(product_cfg, Mapping):
+                base_price = product_cfg.get("base_price")
+        if base_price is None:
+            base_price = DEFAULTS["prices"][product]["base_price"]
+        return float(base_price)
+    if key == "availability":
+        production_cfg = cfg.get("production", {})
+        if isinstance(production_cfg, Mapping):
+            base_availability = production_cfg.get("plant_availability")
+            if base_availability is not None:
+                try:
+                    return float(base_availability)
+                except (TypeError, ValueError):
+                    pass
+        return float(DEFAULTS["production"]["plant_availability"])
+    if key == "capex":
+        capex_lines = cfg.get("capex_lines")
+        if isinstance(capex_lines, pd.DataFrame):
+            return capex_lines.copy()
+        if isinstance(capex_lines, list):
+            return copy.deepcopy(capex_lines)
+        return pd.DataFrame(columns=["item_name", "amount"])
+    if key == "opex":
+        opex_cfg = cfg.get("opex", {}) if isinstance(cfg, Mapping) else {}
+        if not isinstance(opex_cfg, Mapping):
+            opex_cfg = {}
+        base_map = {
+            "fixed_opex_per_month": float(
+                opex_cfg.get("fixed_opex_per_month", DEFAULTS["opex"]["fixed_opex_per_month"])
+            ),
+            "other_variable_cost_per_unit": copy.deepcopy(
+                opex_cfg.get("other_variable_cost_per_unit", DEFAULTS["opex"]["other_variable_cost_per_unit"])
+            ),
+        }
+        return base_map
+    if key == "debt_rate":
+        debt_df = cfg.get("debt_tranches")
+        rates: List[float] = []
+        if isinstance(debt_df, pd.DataFrame) and not debt_df.empty and "interest_rate" in debt_df.columns:
+            rates = pd.to_numeric(debt_df["interest_rate"], errors="coerce").fillna(0.0).tolist()
+        else:
+            tranches = cfg.get("debt", {}).get("tranches", []) if isinstance(cfg, Mapping) else []
+            if isinstance(tranches, list):
+                for tranche in tranches:
+                    if isinstance(tranche, Mapping):
+                        try:
+                            rates.append(float(tranche.get("interest_rate", 0.0)))
+                        except (TypeError, ValueError):
+                            rates.append(0.0)
+        if not rates:
+            rates = [DEFAULTS["debt"]["tranches"][0].get("interest_rate", 0.1)]
+        return rates
+    return None
+
+
+def _make_optimizer_spec(cfg: Mapping[str, object], key: str, lower: float, upper: float) -> OptimizationVariableSpec:
+    definition = OPTIMIZATION_VARIABLE_LIBRARY[key]
+    bounds = (float(lower), float(upper))
+    base_value = _extract_optimizer_base(cfg, key)
+    return OptimizationVariableSpec(
+        name=key,
+        label=definition["label"],
+        bounds=bounds,
+        mode=definition["mode"],
+        base=base_value,
+    )
+
+
+def build_optimizer_specs(
+    cfg: Mapping[str, object],
+    variable_table: Optional[pd.DataFrame] = None,
+) -> List[OptimizationVariableSpec]:
+    specs: List[OptimizationVariableSpec] = []
+    base_cfg = copy.deepcopy(cfg)
+
+    def _coerce_float(value: object) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            val = float(value)
+            if np.isnan(val):
+                return None
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    if isinstance(variable_table, pd.DataFrame) and not variable_table.empty:
+        for _, row in variable_table.iterrows():
+            if bool(row.get("enabled", True)) is False:
+                continue
+            variable_key = str(row.get("variable", "")).strip().lower()
+            if not variable_key:
+                continue
+            if variable_key not in OPTIMIZATION_VARIABLE_LIBRARY:
+                continue
+            default_bounds = OPTIMIZATION_VARIABLE_LIBRARY[variable_key]["bounds"]
+            lower = _coerce_float(row.get("lower_bound"))
+            upper = _coerce_float(row.get("upper_bound"))
+            lo, hi = default_bounds
+            if lower is not None:
+                lo = lower
+            if upper is not None:
+                hi = upper
+            if lo == hi:
+                hi = lo + (abs(lo) * 0.05 if lo != 0 else 0.05)
+            if lo > hi:
+                lo, hi = hi, lo
+            spec = _make_optimizer_spec(base_cfg, variable_key, lo, hi)
+            specs.append(spec)
+    else:
+        for key, definition in OPTIMIZATION_VARIABLE_LIBRARY.items():
+            lo, hi = definition["bounds"]
+            specs.append(_make_optimizer_spec(base_cfg, key, lo, hi))
+
+    return specs
+
+
+def metaheuristic_optimize(
+    cfg: Mapping[str, object],
+    base_metrics: Mapping[str, object],
+    run_model_fn: Callable[[Mapping[str, object]], Mapping[str, object]],
+    variable_table: Optional[pd.DataFrame] = None,
+    objective: str = "Project_NPV",
+    iterations: int = 10,
+    population: int = 6,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
+    specs = build_optimizer_specs(cfg, variable_table)
+    if not specs:
+        return pd.DataFrame()
+
+    try:
+        base_metric = float(base_metrics.get(objective, np.nan))
+    except Exception:
+        base_metric = float("nan")
+
+    rng = np.random.default_rng(seed)
+    population_size = max(population, len(specs))
+
+    def _random_candidate() -> Dict[str, float]:
+        return {spec.name: rng.uniform(spec.bounds[0], spec.bounds[1]) for spec in specs}
+
+    population_vectors: List[Dict[str, float]] = [_random_candidate() for _ in range(population_size)]
+    records: List[Dict[str, object]] = []
+    for iteration in range(max(1, iterations)):
+        evaluated: List[Tuple[Dict[str, float], float]] = []
+        for candidate in population_vectors:
+            cfg_candidate = copy.deepcopy(cfg)
+            for spec in specs:
+                spec.apply(cfg_candidate, candidate[spec.name])
+            result = run_model_fn(cfg_candidate)
+            metric_value = result.get("metrics", {}).get(objective, np.nan)
+            evaluated.append((candidate, metric_value))
+            row: Dict[str, object] = {
+                "iteration": iteration,
+                "objective": metric_value,
+                "delta_vs_base": metric_value - base_metric if np.isfinite(metric_value) and np.isfinite(base_metric) else np.nan,
+            }
+            for spec in specs:
+                suffix = "delta" if spec.mode == "shift" else "factor"
+                row[f"{spec.name}_{suffix}"] = candidate[spec.name]
+            records.append(row)
+
+        evaluated.sort(key=lambda item: (float("-inf") if not np.isfinite(item[1]) else item[1]), reverse=True)
+        elite_count = max(1, population_size // 2)
+        elites = [candidate for candidate, _ in evaluated[:elite_count]] or [population_vectors[0]]
+        new_population: List[Dict[str, float]] = elites.copy()
+        while len(new_population) < population_size:
+            parent = elites[rng.integers(0, len(elites))]
+            child = parent.copy()
+            for spec in specs:
+                span = spec.bounds[1] - spec.bounds[0]
+                perturb = rng.normal(0.0, span * 0.1)
+                child[spec.name] = spec.clip(child[spec.name] + perturb)
+            new_population.append(child)
+        population_vectors = new_population
+
+    results_df = pd.DataFrame(records)
+    if not results_df.empty:
+        results_df = results_df.sort_values(["iteration", "objective"], ascending=[True, False]).reset_index(drop=True)
+    return results_df
+
+
+class SimpleMLP:
+    def __init__(
+        self,
+        input_size: int,
+        hidden_units: int = 8,
+        learning_rate: float = 0.01,
+        epochs: int = 300,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.input_size = input_size
+        self.hidden_units = max(1, hidden_units)
+        self.learning_rate = max(1e-5, float(learning_rate))
+        self.epochs = max(10, int(epochs))
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.normal(scale=0.1, size=(self.input_size, self.hidden_units))
+        self.b1 = np.zeros(self.hidden_units)
+        self.W2 = rng.normal(scale=0.1, size=(self.hidden_units, 1))
+        self.b2 = np.zeros(1)
+        self.x_mean = np.zeros(self.input_size)
+        self.x_std = np.ones(self.input_size)
+        self.y_mean = 0.0
+        self.y_std = 1.0
+
+    @staticmethod
+    def _activation(x: np.ndarray) -> np.ndarray:
+        return np.tanh(x)
+
+    @staticmethod
+    def _activation_derivative(x: np.ndarray) -> np.ndarray:
+        return 1.0 - np.tanh(x) ** 2
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> None:
+        if X.size == 0:
+            return
+        self.x_mean = X.mean(axis=0)
+        self.x_std = X.std(axis=0)
+        self.x_std[self.x_std == 0] = 1.0
+        X_norm = (X - self.x_mean) / self.x_std
+        self.y_mean = y.mean()
+        self.y_std = y.std() if y.std() > 0 else 1.0
+        y_norm = (y - self.y_mean) / self.y_std
+
+        for _ in range(self.epochs):
+            z1 = X_norm @ self.W1 + self.b1
+            a1 = self._activation(z1)
+            z2 = a1 @ self.W2 + self.b2
+            y_pred = z2.reshape(-1)
+            error = y_pred - y_norm
+            grad_W2 = a1.T @ error[:, None] / len(X_norm)
+            grad_b2 = error.mean()
+            delta1 = (error[:, None] @ self.W2.T) * self._activation_derivative(z1)
+            grad_W1 = X_norm.T @ delta1 / len(X_norm)
+            grad_b1 = delta1.mean(axis=0)
+
+            self.W2 -= self.learning_rate * grad_W2
+            self.b2 -= self.learning_rate * grad_b2
+            self.W1 -= self.learning_rate * grad_W1
+            self.b1 -= self.learning_rate * grad_b1
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        X_norm = (X - self.x_mean) / self.x_std
+        z1 = X_norm @ self.W1 + self.b1
+        a1 = self._activation(z1)
+        z2 = a1 @ self.W2 + self.b2
+        y_pred = z2.reshape(-1)
+        return y_pred * self.y_std + self.y_mean
+
+
+def neural_forecast_production(
+    results: Mapping[str, object],
+    product: str,
+    lookback: int = 12,
+    horizon: int = 12,
+    hidden_units: int = 8,
+    learning_rate: float = 0.01,
+    epochs: int = 300,
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
+    production_df = results.get("production_monthly")
+    if not isinstance(production_df, pd.DataFrame) or production_df.empty:
+        return pd.DataFrame(columns=["date", "product", "forecast_volume"])
+
+    df = production_df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["product"] = df["product"].astype(str).str.lower()
+    product_key = product.lower()
+    df = df[df["product"] == product_key].sort_values("date")
+    if df.empty:
+        return pd.DataFrame(columns=["date", "product", "forecast_volume"])
+
+    lookback = max(3, int(lookback))
+    horizon = max(1, int(horizon))
+    values = df["volume"].astype(float).values
+    if len(values) < lookback + 2:
+        avg = float(values.mean()) if len(values) else 0.0
+        future_dates = pd.date_range(df["date"].iloc[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+        return pd.DataFrame({"date": future_dates, "product": product_key, "forecast_volume": np.full(horizon, avg)})
+
+    X = []
+    y = []
+    for idx in range(lookback, len(values)):
+        X.append(values[idx - lookback : idx])
+        y.append(values[idx])
+    X_arr = np.asarray(X)
+    y_arr = np.asarray(y)
+
+    mlp = SimpleMLP(
+        input_size=lookback,
+        hidden_units=hidden_units,
+        learning_rate=learning_rate,
+        epochs=epochs,
+        seed=seed,
+    )
+    mlp.fit(X_arr, y_arr)
+
+    history = list(values)
+    future_dates = pd.date_range(df["date"].iloc[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    forecasts: List[float] = []
+    for _ in range(horizon):
+        input_vec = np.asarray(history[-lookback:])
+        predicted = float(mlp.predict(input_vec)[0])
+        predicted = max(predicted, 0.0)
+        forecasts.append(predicted)
+        history.append(predicted)
+
+    return pd.DataFrame({"date": future_dates, "product": product_key, "forecast_volume": forecasts})
+
+
+def _series_from_statements(results: Mapping[str, object], column: str) -> pd.Series:
+    statements = results.get("statements_monthly")
+    if isinstance(statements, Mapping):
+        pnl = statements.get("pnl")
+        if isinstance(pnl, pd.DataFrame) and column in pnl.columns:
+            df = pnl.copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"])
+            if df.empty:
+                return pd.Series(dtype=float)
+            return df.set_index("date")[column].astype(float)
+    return pd.Series(dtype=float)
+
+
+def _series_staff_costs(results: Mapping[str, object]) -> pd.Series:
+    staff_detail = results.get("staff_costs_detail")
+    if isinstance(staff_detail, pd.DataFrame) and not staff_detail.empty:
+        df = staff_detail.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        if df.empty:
+            return pd.Series(dtype=float)
+        grouped = df.groupby("date")["total_cost"].sum().sort_index()
+        return grouped.astype(float)
+    return pd.Series(dtype=float)
+
+
+def _series_production(results: Mapping[str, object], product: str) -> pd.Series:
+    prod = results.get("production_monthly")
+    if isinstance(prod, pd.DataFrame) and not prod.empty:
+        df = prod.copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df["product"] = df["product"].astype(str).str.lower()
+        df = df[df["product"] == product]
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df.set_index("date")["volume"].astype(float)
+    return pd.Series(dtype=float)
+
+
+STATISTICAL_SERIES_LIBRARY: Dict[str, Callable[[Mapping[str, object]], pd.Series]] = {
+    "revenue": lambda res: _series_from_statements(res, "Revenue"),
+    "cogs": lambda res: _series_from_statements(res, "COGS"),
+    "opex": lambda res: _series_from_statements(res, "Opex"),
+    "ebitda": lambda res: _series_from_statements(res, "EBITDA"),
+    "staff_costs": _series_staff_costs,
+    "production_ethanol": lambda res: _series_production(res, "ethanol"),
+    "production_sugar": lambda res: _series_production(res, "sugar"),
+    "production_electricity": lambda res: _series_production(res, "electricity"),
+    "production_animal_feed": lambda res: _series_production(res, "animal_feed"),
+}
+
+
+def statistical_forecast(
+    results: Mapping[str, object],
+    series_key: str,
+    alpha: float = 0.3,
+    horizon: int = 12,
+) -> Dict[str, object]:
+    extractor = STATISTICAL_SERIES_LIBRARY.get(series_key)
+    if extractor is None:
+        return {"historical": pd.DataFrame(), "forecast": pd.DataFrame(), "residual_std": np.nan, "equipment_failure_risk": np.nan}
+
+    series = extractor(results)
+    if series is None or series.empty:
+        return {"historical": pd.DataFrame(), "forecast": pd.DataFrame(), "residual_std": np.nan, "equipment_failure_risk": np.nan}
+
+    series = series.sort_index()
+    history_df = series.reset_index()
+    history_df.columns = ["date", "value"]
+
+    values = series.values.astype(float)
+    alpha = min(max(alpha, 0.01), 1.0)
+    level = values[0]
+    residuals: List[float] = []
+    for actual in values:
+        forecast_val = level
+        residuals.append(actual - forecast_val)
+        level = alpha * actual + (1 - alpha) * level
+
+    residuals_arr = np.asarray(residuals[1:])
+    residual_std = float(residuals_arr.std(ddof=1)) if residuals_arr.size > 1 else 0.0
+    conf_int = 1.96 * residual_std
+
+    start_date = series.index[-1] + pd.offsets.MonthBegin(1)
+    future_dates = pd.date_range(start_date, periods=max(1, int(horizon)), freq="MS")
+    forecasts = np.full(len(future_dates), level)
+    lower = np.maximum(forecasts - conf_int, 0.0)
+    upper = forecasts + conf_int
+    forecast_df = pd.DataFrame({"date": future_dates, "forecast": forecasts, "lower": lower, "upper": upper})
+
+    risk_profile = results.get("risk_profile", {})
+    production_multiplier = float(risk_profile.get("production", 1.0)) if isinstance(risk_profile, Mapping) else 1.0
+    equipment_failure_risk = max(0.0, 1.0 - production_multiplier)
+
+    return {
+        "historical": history_df,
+        "forecast": forecast_df,
+        "residual_std": residual_std,
+        "equipment_failure_risk": equipment_failure_risk,
+    }
+
+
+def decision_tree_analysis(
+    cfg: Mapping[str, object],
+    run_model_fn: Callable[[Mapping[str, object]], Mapping[str, object]],
+    paths_table: Optional[pd.DataFrame],
+    objective: str = "Project_NPV",
+) -> Dict[str, object]:
+    if not isinstance(paths_table, pd.DataFrame) or paths_table.empty:
+        return {"paths": pd.DataFrame(), "expected_metric": np.nan, "objective": objective, "total_probability": 0.0}
+
+    specs = {spec.name: spec for spec in build_optimizer_specs(cfg)}
+    rows: List[Dict[str, object]] = []
+    total_probability = 0.0
+    expected_metric = 0.0
+
+    for _, path_row in paths_table.iterrows():
+        if bool(path_row.get("enabled", True)) is False:
+            continue
+        try:
+            probability = float(path_row.get("probability", np.nan))
+        except (TypeError, ValueError):
+            probability = np.nan
+        if not np.isfinite(probability) or probability <= 0:
+            continue
+
+        cfg_candidate = copy.deepcopy(cfg)
+        applied: Dict[str, object] = {}
+        for column, spec_name in DECISION_TREE_COLUMN_MAP.items():
+            if column not in path_row or spec_name not in specs:
+                continue
+            value = path_row.get(column)
+            try:
+                value_float = float(value)
+            except (TypeError, ValueError):
+                continue
+            specs[spec_name].apply(cfg_candidate, value_float)
+            suffix = "delta" if specs[spec_name].mode == "shift" else "factor"
+            applied[f"{spec_name}_{suffix}"] = value_float
+
+        result = run_model_fn(cfg_candidate)
+        metric_value = result.get("metrics", {}).get(objective, np.nan)
+        row_record = {
+            "path_name": path_row.get("path_name", "Path"),
+            "probability": probability,
+            "metric": metric_value,
+            "notes": path_row.get("notes", ""),
+        }
+        row_record.update(applied)
+        rows.append(row_record)
+
+        if np.isfinite(metric_value):
+            total_probability += probability
+            expected_metric += probability * metric_value
+
+    if total_probability > 0:
+        expected_metric /= total_probability
+    else:
+        expected_metric = float("nan")
+
+    paths_df = pd.DataFrame(rows)
+    return {
+        "paths": paths_df,
+        "expected_metric": expected_metric,
+        "objective": objective,
+        "total_probability": total_probability,
+    }
 
 
 def sensitivity_tornado(cfg: Mapping[str, object], base_results: Dict[str, object], run_model_fn: Callable[[Mapping[str, object]], Dict[str, object]], drivers: Optional[List[Tuple[str, float]]] = None) -> pd.DataFrame:
