@@ -2032,23 +2032,28 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         staff_costs["headcount"] = 0.0
 
     for col in ("gross_pay", "benefits", "training", "other", "headcount"):
-        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
+        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce")
 
+    headcount_series = staff_costs["headcount"].fillna(0.0)
     cost_components = ("gross_pay", "benefits", "training", "other")
     for col in cost_components:
         per_head_col = f"{col}_per_head"
         if per_head_col in staff_costs.columns:
-            staff_costs[per_head_col] = pd.to_numeric(
+            per_head_values = pd.to_numeric(
                 staff_costs[per_head_col], errors="coerce"
-            ).fillna(0.0)
+            )
         else:
-            staff_costs[per_head_col] = 0.0
+            per_head_values = pd.Series(np.nan, index=staff_costs.index)
+        staff_costs[per_head_col] = per_head_values
 
-        per_head_values = staff_costs[per_head_col]
-        computed_totals = per_head_values * staff_costs["headcount"]
-        totals = staff_costs[col]
-        use_per_head = per_head_values > 0
+        totals = pd.to_numeric(staff_costs[col], errors="coerce")
+        totals = totals.fillna(0.0)
+        computed_totals = per_head_values.fillna(0.0) * headcount_series
+        use_per_head = per_head_values.notna() & (
+            (per_head_values != 0) | (totals == 0)
+        )
         staff_costs[col] = np.where(use_per_head, computed_totals, totals)
+        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
 
     staff_costs_detail = (
         staff_costs.groupby(["date", "dept", "currency"], dropna=False)[
