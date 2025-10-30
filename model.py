@@ -615,14 +615,26 @@ def _filter_dates_to_horizon(
         return df
 
     df_local = df.copy()
-    df_local[column] = pd.to_datetime(df_local[column], errors="coerce")
-    df_local = df_local[pd.notna(df_local[column])]
-    if df_local.empty:
+    converted = pd.to_datetime(df_local[column], errors="coerce")
+    valid_mask = converted.notna()
+
+    if not valid_mask.any():
+        # No parsable dates – retain the original rows so users can continue
+        # editing values (e.g. newly added rows awaiting a date entry).
         return df_local.reset_index(drop=True)
 
-    mask = (df_local[column] >= start_ts) & (df_local[column] <= end_ts)
-    df_local = df_local[mask]
-    return df_local.reset_index(drop=True)
+    valid = df_local[valid_mask].copy()
+    valid[column] = converted[valid_mask]
+    within_mask = (valid[column] >= start_ts) & (valid[column] <= end_ts)
+    valid = valid[within_mask]
+
+    invalid = df_local[~valid_mask].copy()
+
+    if invalid.empty:
+        return valid.reset_index(drop=True)
+
+    combined = pd.concat([valid, invalid]).sort_index()
+    return combined.reset_index(drop=True)
 
 
 def align_with_projection_horizon(cfg: Dict[str, object]) -> Dict[str, object]:
