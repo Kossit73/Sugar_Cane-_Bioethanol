@@ -1581,7 +1581,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                 monthly_df = _monthly_from_annual(annual_df)
             else:
                 monthly_df = monthly_df.rename(columns={col: col for col in required_cols})
-                monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+                monthly_df["date"] = pd.to_datetime(monthly_df["date"], errors="coerce")
                 monthly_df["product"] = monthly_df["product"].astype(str).str.strip()
                 monthly_df = monthly_df[monthly_df["product"] != ""]
                 monthly_df = monthly_df[monthly_df["product"].str.lower() != "nan"]
@@ -1623,7 +1623,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
             monthly_df[col] = np.nan if col != "date" else pd.NaT
     monthly_df = monthly_df[required_order]
 
-    monthly_df["date"] = pd.to_datetime(monthly_df["date"])
+    monthly_df["date"] = pd.to_datetime(monthly_df["date"], errors="coerce")
     monthly_df = monthly_df[monthly_df["date"].isin(monthly_index)]
     monthly_df = monthly_df.sort_values(["date", "product"]).reset_index(drop=True)
 
@@ -1656,7 +1656,7 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
         price_by_product = risk_profile.get("price_by_product", {}) or {}
     if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty:
         idx = inflation_index.copy()
-        idx["date"] = pd.to_datetime(idx["date"])
+        idx["date"] = pd.to_datetime(idx["date"], errors="coerce")
         idx = idx.set_index("date").reindex(monthly_index).ffill().bfill()
     else:
         idx = pd.DataFrame(index=monthly_index, data={"cpi": (1 + inflation_rate / 12) ** np.arange(len(monthly_index))})
@@ -1703,12 +1703,12 @@ def parse_date_str(value: object, default: pd.Timestamp) -> pd.Timestamp:
     if isinstance(value, (pd.Timestamp, np.datetime64)):
         return pd.Timestamp(value)
     if isinstance(value, str) and value:
-        try:
-            if len(value) == 7 and value.count("-") == 1:
-                value = value + "-01"
-            return pd.to_datetime(value)
-        except Exception:
+        if len(value) == 7 and value.count("-") == 1:
+            value = value + "-01"
+        parsed = pd.to_datetime(value, errors="coerce")
+        if pd.isna(parsed):
             return default
+        return pd.Timestamp(parsed)
     if isinstance(value, (int, float)) and not math.isnan(value):
         year = int(value)
         return pd.Timestamp(year=year, month=1, day=1)
@@ -1987,7 +1987,7 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     direct_costs = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame()
     if isinstance(direct_costs, pd.DataFrame) and not direct_costs.empty:
         direct_costs = direct_costs.copy()
-        direct_costs["date"] = pd.to_datetime(direct_costs["date"])
+        direct_costs["date"] = pd.to_datetime(direct_costs["date"], errors="coerce")
     else:
         direct_costs = pd.DataFrame({
             "date": monthly_index,
@@ -2004,7 +2004,7 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     )
     if isinstance(staff_costs, pd.DataFrame) and not staff_costs.empty:
         staff_costs = staff_costs.copy()
-        staff_costs["date"] = pd.to_datetime(staff_costs["date"])
+        staff_costs["date"] = pd.to_datetime(staff_costs["date"], errors="coerce")
     else:
         staff_costs = pd.DataFrame(
             {
@@ -2087,7 +2087,7 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     other_opex = cfg.get("other_opex_monthly") if "other_opex_monthly" in cfg else pd.DataFrame()
     if isinstance(other_opex, pd.DataFrame) and not other_opex.empty:
         other_opex = other_opex.copy()
-        other_opex["date"] = pd.to_datetime(other_opex["date"])
+        other_opex["date"] = pd.to_datetime(other_opex["date"], errors="coerce")
     else:
         other_opex = pd.DataFrame({"date": monthly_index, "amount": DEFAULTS["opex"]["fixed_opex_per_month"]})
     other_opex_total = other_opex.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=DEFAULTS["opex"]["fixed_opex_per_month"])
@@ -2165,7 +2165,7 @@ def aggregate_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = monthly_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["year"] = df["date"].dt.year
 
     numeric_cols = df.select_dtypes(include=[float, int, np.number]).columns.tolist()
@@ -3630,7 +3630,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         })
     else:
         cost_df = cost_df.copy()
-        cost_df["date"] = pd.to_datetime(cost_df["date"])
+        cost_df["date"] = pd.to_datetime(cost_df["date"], errors="coerce")
     cost_df = _derive_direct_costs(cost_df)
     wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
 
