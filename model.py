@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import importlib
 import itertools
 import json
 import math
@@ -4247,8 +4248,25 @@ def export_csv(results: Mapping[str, object], out_dir: Path) -> None:
                     subvalue.to_csv(out_dir / f"{key}_{subkey}.csv", index=False)
 
 
+def resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
+    """Return the first available Excel writer engine from the preferred list."""
+
+    for engine in preferred:
+        module = "openpyxl" if engine == "openpyxl" else engine
+        try:
+            importlib.import_module(module)
+            return engine
+        except ImportError:
+            continue
+    raise RuntimeError(
+        "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
+        "Install one of them to enable workbook downloads."
+    )
+
+
 def build_excel_pack(results: Mapping[str, object], path: Path) -> None:
-    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+    engine = resolve_excel_engine()
+    with pd.ExcelWriter(path, engine=engine) as writer:
         results["dashboard"]["assumptions_snapshot"].to_excel(writer, sheet_name="Summary", index=False)
         for key in ("pnl", "cashflow", "balancesheet"):
             results["statements_annual"][key].to_excel(writer, sheet_name=f"Annual_{key}", index=False)
@@ -4336,7 +4354,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if export_dir is not None:
         export_csv(results, export_dir)
     if args.excel_pack:
-        build_excel_pack(results, Path(args.excel_pack))
+        try:
+            build_excel_pack(results, Path(args.excel_pack))
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
 
     print("Key Metrics:")
     for key, value in results["metrics"].items():

@@ -162,6 +162,7 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         statistical_forecast,
         normalize_key,
         Timeline,
+        resolve_excel_engine,
     )
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
     MODEL_IMPORT_ERROR = exc
@@ -204,6 +205,19 @@ if MODEL_IMPORT_ERROR is not None:
     )
     MONTE_CARLO_VARIABLES = tuple(key for key, _ in MONTE_CARLO_VARIABLE_ITEMS)
     MONTE_CARLO_VARIABLE_LABELS = {key: label for key, label in MONTE_CARLO_VARIABLE_ITEMS}
+
+    def resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
+        for engine in preferred:
+            module = "openpyxl" if engine == "openpyxl" else engine
+            try:
+                importlib.import_module(module)
+                return engine
+            except ImportError:
+                continue
+        raise RuntimeError(
+            "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
+            "Install one of them to enable workbook downloads."
+        )
 
     def compute_risk_profile(risk_params):  # pragma: no cover - fallback stub
         return {}
@@ -402,24 +416,6 @@ def _ensure_scenario_payload(
     return scenario_cfg, scenario_results
 
 
-def _resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
-    """Return the first available Excel writer engine from the preferred list."""
-
-    for engine in preferred:
-        module = engine
-        if engine == "openpyxl":
-            module = "openpyxl"
-        try:
-            importlib.import_module(module)
-            return engine
-        except ImportError:
-            continue
-    raise RuntimeError(
-        "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
-        "Install one of them to enable workbook downloads."
-    )
-
-
 def _generate_excel_bytes(
     cfg: Mapping[str, object],
     results: Mapping[str, object],
@@ -428,7 +424,7 @@ def _generate_excel_bytes(
     """Create an Excel workbook for the provided results and return its bytes."""
 
     buffer = BytesIO()
-    engine = _resolve_excel_engine()
+    engine = resolve_excel_engine()
     with pd.ExcelWriter(buffer, engine=engine) as writer:
         dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
         if isinstance(dashboard, Mapping):
