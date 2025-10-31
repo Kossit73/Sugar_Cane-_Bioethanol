@@ -242,6 +242,14 @@ MONTE_CARLO_VARIABLE_LABEL_TO_KEY: Dict[str, str] = {
     label: key for key, label in MONTE_CARLO_VARIABLE_LABELS.items()
 }
 
+PRODUCT_DISPLAY_NAMES: Dict[str, str] = {
+    "ethanol": "Bioethanol",
+    "sugar": "Sugar",
+    "electricity": "Electricity",
+    "animal_feed": "Animal feed",
+}
+
+
 OPTIMIZER_VARIABLE_OPTIONS: Dict[str, str] = {
     "ethanol_price": "Ethanol price multiplier",
     "sugar_price": "Sugar price multiplier",
@@ -796,6 +804,7 @@ def _factory_default_frames() -> Dict[str, pd.DataFrame]:
         frames["neural_forecast_settings"] = DEFAULTS["neural_forecast_settings"].copy()
         frames["statistical_forecast_settings"] = DEFAULTS["statistical_forecast_settings"].copy()
         frames["decision_tree_paths"] = DEFAULTS["decision_tree_paths"].copy()
+        frames["break_even_inputs"] = DEFAULTS["break_even_inputs"].copy()
 
         for table_name, schema in INPUT_SCHEMAS.items():
             frames.setdefault(table_name, pd.DataFrame(columns=list(schema.columns.keys())))
@@ -2341,6 +2350,324 @@ def main() -> None:
         revenue_df = results["revenue"].copy()
         revenue_df["date"] = pd.to_datetime(revenue_df["date"])
         _render_dataframe(revenue_df, "Revenue stack", key="revenue")
+
+        st.markdown("### Break-even analysis")
+        be_results = results.get("break_even", {})
+        per_product_be = (
+            be_results.get("per_product")
+            if isinstance(be_results, dict)
+            and isinstance(be_results.get("per_product"), pd.DataFrame)
+            else pd.DataFrame()
+        )
+        overall_be = be_results.get("overall") if isinstance(be_results, dict) else {}
+
+        break_even_inputs_table = tables.ensure_table("break_even_inputs").copy()
+        default_break_even = DEFAULTS["break_even_inputs"].copy()
+        default_break_even["product"] = (
+            default_break_even["product"].astype(str).str.strip().str.lower()
+        )
+
+        if not break_even_inputs_table.empty:
+            break_even_inputs_table["product"] = (
+                break_even_inputs_table["product"].astype(str).str.strip().str.lower()
+            )
+            if "product" in break_even_inputs_table.columns:
+                break_even_inputs_table = (
+                    break_even_inputs_table.dropna(subset=["product"])
+                    .drop_duplicates(subset=["product"], keep="last")
+                    .reset_index(drop=True)
+                )
+        else:
+            break_even_inputs_table = default_break_even.copy()
+            try:
+                tables.set_table("break_even_inputs", break_even_inputs_table)
+            except Exception as exc:
+                st.warning(f"Break-even defaults not applied due to validation error: {exc}")
+            else:
+                _update_editor_state("break_even_inputs", tables)
+
+        def _be_value_changed(old: object, new: object) -> bool:
+            if pd.isna(old) and pd.isna(new):
+                return False
+            if pd.isna(old) or pd.isna(new):
+                return True
+            try:
+                return not math.isclose(float(old), float(new), rel_tol=1e-6, abs_tol=1e-4)
+            except (TypeError, ValueError):
+                return True
+
+        break_even_tabs = st.tabs([PRODUCT_DISPLAY_NAMES.get(p, p.replace("_", " ").title()) for p in PRODUCTS])
+        break_even_updated = False
+
+        for tab, product in zip(break_even_tabs, PRODUCTS):
+            with tab:
+                label = PRODUCT_DISPLAY_NAMES.get(product, product.replace("_", " ").title())
+                st.markdown(f"#### {label} break-even inputs")
+
+                mask = break_even_inputs_table.get("product", pd.Series(dtype=str)) == product
+                if mask.any():
+                    row_index = break_even_inputs_table.index[mask][0]
+                    row_series = break_even_inputs_table.loc[row_index]
+                else:
+                    default_row = default_break_even[default_break_even["product"] == product]
+                    if default_row.empty:
+                        row_series = pd.Series(
+                            {
+                                "product": product,
+                                "unit_price": np.nan,
+                                "variable_cost_per_unit": np.nan,
+                                "fixed_cost": 0.0,
+                                "reference_volume": np.nan,
+                            }
+                        )
+                    else:
+                        row_series = default_row.iloc[0]
+                    row_index = None
+
+                unit_price_default = float(row_series.get("unit_price", np.nan))
+                if not np.isfinite(unit_price_default):
+                    unit_price_default = 0.0
+                variable_cost_default = float(row_series.get("variable_cost_per_unit", np.nan))
+                if not np.isfinite(variable_cost_default):
+                    variable_cost_default = 0.0
+                fixed_cost_default = float(row_series.get("fixed_cost", 0.0) or 0.0)
+                reference_volume_default = row_series.get("reference_volume", np.nan)
+
+                actual_volume = 0.0
+                if isinstance(per_product_be, pd.DataFrame) and not per_product_be.empty:
+                    product_match = per_product_be[per_product_be["product"] == product]
+                    if not product_match.empty:
+                        actual_volume = float(product_match.iloc[0].get("actual_volume", 0.0))
+
+                col_inputs_left, col_inputs_right = st.columns(2)
+                with col_inputs_left:
+                    price_step = max(abs(unit_price_default) * 0.05, 0.01)
+                    unit_price_val = st.number_input(
+                        "Unit price",
+                        value=float(unit_price_default),
+                        step=price_step,
+                        format="%.4f",
+                        key=f"break_even_unit_price_{product}",
+                    )
+                    variable_step = max(abs(variable_cost_default) * 0.05, 0.01)
+                    variable_cost_val = st.number_input(
+                        "Variable cost per unit",
+                        value=float(variable_cost_default),
+                        step=variable_step,
+                        format="%.4f",
+                        key=f"break_even_variable_cost_{product}",
+                    )
+                with col_inputs_right:
+                    fixed_step = max(abs(fixed_cost_default) * 0.1, 1000.0)
+                    fixed_cost_val = st.number_input(
+                        "Fixed cost allocation",
+                        value=float(fixed_cost_default),
+                        min_value=0.0,
+                        step=fixed_step,
+                        format="%.2f",
+                        key=f"break_even_fixed_cost_{product}",
+                    )
+                    reference_default = reference_volume_default
+                    if not np.isfinite(reference_default) or reference_default <= 0:
+                        reference_default = actual_volume if actual_volume > 0 else 0.0
+                    volume_step = max(abs(reference_default) * 0.1, 1.0)
+                    reference_volume_val = st.number_input(
+                        "Reference production volume",
+                        value=float(reference_default),
+                        min_value=0.0,
+                        step=volume_step,
+                        format="%.2f",
+                        key=f"break_even_reference_volume_{product}",
+                    )
+
+                new_record = {
+                    "product": product,
+                    "unit_price": float(unit_price_val),
+                    "variable_cost_per_unit": float(variable_cost_val),
+                    "fixed_cost": float(fixed_cost_val),
+                    "reference_volume": float(reference_volume_val),
+                }
+
+                changed = row_index is None
+                if not changed and row_index is not None:
+                    for field, value in new_record.items():
+                        existing = break_even_inputs_table.at[row_index, field]
+                        if _be_value_changed(existing, value):
+                            changed = True
+                            break
+
+                if changed:
+                    if row_index is not None:
+                        for field, value in new_record.items():
+                            break_even_inputs_table.at[row_index, field] = value
+                    else:
+                        break_even_inputs_table = pd.concat(
+                            [break_even_inputs_table, pd.DataFrame([new_record])],
+                            ignore_index=True,
+                        )
+                    break_even_updated = True
+
+                if isinstance(per_product_be, pd.DataFrame) and not per_product_be.empty:
+                    product_match = per_product_be[per_product_be["product"] == product]
+                else:
+                    product_match = pd.DataFrame()
+
+                if not product_match.empty:
+                    result_row = product_match.iloc[0]
+                    unit_table = pd.DataFrame(
+                        [
+                            {"Metric": "Unit of measure", "Value": result_row.get("unit_of_measure", "")},
+                            {"Metric": "Unit price", "Value": result_row.get("unit_price")},
+                            {
+                                "Metric": "Variable cost per unit",
+                                "Value": result_row.get("variable_cost_per_unit"),
+                            },
+                            {
+                                "Metric": "Contribution margin per unit",
+                                "Value": result_row.get("contribution_margin_per_unit"),
+                            },
+                            {
+                                "Metric": "Actual average price",
+                                "Value": result_row.get("actual_average_price"),
+                            },
+                        ]
+                    )
+                    st.dataframe(
+                        unit_table,
+                        use_container_width=True,
+                        key=f"break_even_unit_table_{product}",
+                    )
+
+                    margin_percent = result_row.get("margin_of_safety_percent")
+                    if np.isfinite(margin_percent):
+                        margin_percent_display = margin_percent * 100.0
+                    else:
+                        margin_percent_display = np.nan
+                    reference_ratio = result_row.get("break_even_vs_reference")
+                    if np.isfinite(reference_ratio):
+                        reference_ratio_display = reference_ratio * 100.0
+                    else:
+                        reference_ratio_display = np.nan
+
+                    production_table = pd.DataFrame(
+                        [
+                            {"Metric": "Fixed cost allocation", "Value": result_row.get("fixed_cost")},
+                            {"Metric": "Break-even volume (units)", "Value": result_row.get("break_even_units")},
+                            {"Metric": "Reference volume", "Value": result_row.get("reference_volume")},
+                            {"Metric": "Actual volume", "Value": result_row.get("actual_volume")},
+                            {
+                                "Metric": "Break-even vs reference (%)",
+                                "Value": reference_ratio_display,
+                            },
+                            {
+                                "Metric": "Margin of safety (units)",
+                                "Value": result_row.get("margin_of_safety_units"),
+                            },
+                            {
+                                "Metric": "Margin of safety (%)",
+                                "Value": margin_percent_display,
+                            },
+                            {
+                                "Metric": "Break-even revenue",
+                                "Value": result_row.get("break_even_revenue"),
+                            },
+                            {
+                                "Metric": "Actual revenue",
+                                "Value": result_row.get("actual_revenue"),
+                            },
+                        ]
+                    )
+                    st.dataframe(
+                        production_table,
+                        use_container_width=True,
+                        key=f"break_even_production_table_{product}",
+                    )
+                else:
+                    st.info("No break-even results available for this product. Adjust inputs and rerun the model.")
+
+        if break_even_updated:
+            try:
+                tables.set_table("break_even_inputs", break_even_inputs_table)
+            except Exception as exc:
+                st.warning(f"Break-even inputs not saved due to validation error: {exc}")
+            else:
+                _update_editor_state("break_even_inputs", tables)
+                _safe_rerun()
+
+        if isinstance(per_product_be, pd.DataFrame) and not per_product_be.empty:
+            summary_cols = [
+                "product",
+                "unit_price",
+                "variable_cost_per_unit",
+                "contribution_margin_per_unit",
+                "fixed_cost",
+                "break_even_units",
+                "reference_volume",
+                "actual_volume",
+                "break_even_revenue",
+                "actual_revenue",
+                "margin_of_safety_percent",
+                "break_even_vs_reference",
+            ]
+            available_cols = [col for col in summary_cols if col in per_product_be.columns]
+            summary_df = per_product_be[available_cols].copy()
+            summary_df["product"] = summary_df["product"].map(PRODUCT_DISPLAY_NAMES).fillna(
+                summary_df["product"].str.replace("_", " ").str.title()
+            )
+            if "margin_of_safety_percent" in summary_df:
+                summary_df["margin_of_safety_percent"] = summary_df["margin_of_safety_percent"] * 100.0
+            if "break_even_vs_reference" in summary_df:
+                summary_df["break_even_vs_reference"] = summary_df["break_even_vs_reference"] * 100.0
+            summary_df = summary_df.rename(
+                columns={
+                    "product": "Product",
+                    "unit_price": "Unit price",
+                    "variable_cost_per_unit": "Variable cost per unit",
+                    "contribution_margin_per_unit": "Contribution margin per unit",
+                    "fixed_cost": "Fixed cost",
+                    "break_even_units": "Break-even units",
+                    "reference_volume": "Reference volume",
+                    "actual_volume": "Actual volume",
+                    "break_even_revenue": "Break-even revenue",
+                    "actual_revenue": "Actual revenue",
+                    "margin_of_safety_percent": "Margin of safety (%)",
+                    "break_even_vs_reference": "Break-even vs reference (%)",
+                }
+            )
+            _render_dataframe(summary_df, "Break-even summary by product", key="break_even_summary")
+
+        if isinstance(overall_be, dict) and overall_be:
+            overall_table = pd.DataFrame(
+                [
+                    {
+                        "Metric": "Total fixed costs",
+                        "Value": overall_be.get("fixed_costs_total"),
+                    },
+                    {
+                        "Metric": "Variable cost per unit",
+                        "Value": overall_be.get("variable_cost_per_unit"),
+                    },
+                    {
+                        "Metric": "Average price",
+                        "Value": overall_be.get("average_price"),
+                    },
+                    {
+                        "Metric": "Break-even volume (total)",
+                        "Value": overall_be.get("break_even_volume"),
+                    },
+                    {
+                        "Metric": "Margin of safety (%)",
+                        "Value": overall_be.get("margin_of_safety", np.nan) * 100.0
+                        if overall_be.get("margin_of_safety") is not None
+                        else np.nan,
+                    },
+                ]
+            )
+            st.dataframe(
+                overall_table,
+                use_container_width=True,
+                key="break_even_overall_table",
+            )
 
     with sensitivity_tab:
         st.subheader("Advanced sensitivity analytics")

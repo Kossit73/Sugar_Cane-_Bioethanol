@@ -401,6 +401,49 @@ DEFAULTS = {
     ),
 }
 
+
+def _build_default_break_even_inputs() -> pd.DataFrame:
+    """Construct default break-even inputs per product using base assumptions."""
+
+    production_defaults = DEFAULTS["production"]
+    price_defaults = DEFAULTS["prices"]
+    variable_defaults = DEFAULTS["opex"].get("other_variable_cost_per_unit", {})
+    feedstock = float(production_defaults.get("annual_feedstock_ton", 0.0) or 0.0)
+    availability = float(production_defaults.get("plant_availability", 1.0) or 1.0)
+    loss_factor = float(production_defaults.get("loss_factor", 0.0) or 0.0)
+    effective_factor = availability * (1.0 - loss_factor)
+    fixed_total = float(DEFAULTS["opex"].get("fixed_opex_per_month", 0.0) or 0.0) * MONTHS_IN_YEAR
+    fixed_per_product = fixed_total / max(len(PRODUCTS), 1)
+
+    conversion_map = {
+        "ethanol": production_defaults.get("ethanol_litre_per_ton", 0.0),
+        "sugar": production_defaults.get("sugar_ton_per_ton_cane", 0.0),
+        "electricity": production_defaults.get("electricity_mwh_per_ton_cane", 0.0),
+        "animal_feed": production_defaults.get("animal_feed_ton_per_ton_cane", 0.0),
+    }
+
+    records: List[Dict[str, object]] = []
+    for product in PRODUCTS:
+        conversion = float(conversion_map.get(product, 0.0) or 0.0)
+        reference_volume = feedstock * conversion * effective_factor
+        price_info = price_defaults.get(product, {})
+        unit_price = float(price_info.get("base_price", 0.0) or 0.0)
+        variable_cost = float(variable_defaults.get(product, 0.0) or 0.0)
+        records.append(
+            {
+                "product": product,
+                "unit_price": unit_price,
+                "variable_cost_per_unit": variable_cost,
+                "fixed_cost": fixed_per_product,
+                "reference_volume": reference_volume,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+DEFAULTS["break_even_inputs"] = _build_default_break_even_inputs()
+
 ###############################################################################
 # Section 1: Excel Loader
 ###############################################################################
@@ -758,6 +801,16 @@ def _validate_production_horizon(row: pd.Series) -> None:
         raise ValueError("production end_year must be >= start_year")
 
 
+def _validate_break_even_inputs(row: pd.Series) -> None:
+    product = str(row.get("product", "")).strip().lower()
+    if product == "":
+        raise ValueError("break-even inputs require a product identifier")
+    if product not in PRODUCTS:
+        raise ValueError(
+            "product must be one of: " + ", ".join(PRODUCTS)
+        )
+
+
 def _derive_direct_costs(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure direct cost lines carry a calculated amount from unit rates."""
 
@@ -932,6 +985,22 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "revenue_share": "float",
         },
         defaults={"price_escalation_pa": 0.0, "price_indexation": "cpi", "revenue_share": 1.0},
+    ),
+    "break_even_inputs": TableSchema(
+        columns={
+            "product": "str",
+            "unit_price": "float",
+            "variable_cost_per_unit": "float",
+            "fixed_cost": "float",
+            "reference_volume": "float",
+        },
+        defaults={
+            "unit_price": np.nan,
+            "variable_cost_per_unit": np.nan,
+            "fixed_cost": 0.0,
+            "reference_volume": np.nan,
+        },
+        validators=[_validate_break_even_inputs],
     ),
     "production_annual": TableSchema(
         columns={
@@ -1298,6 +1367,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "tax": dict(DEFAULTS["tax"]),
         "risk_params": DEFAULTS["risk_params"].copy(),
         "inflation_index": DEFAULTS["inflation_index"].copy(),
+        "break_even_inputs": DEFAULTS["break_even_inputs"].copy(),
     }
 
     for key, value in assumptions.items():
@@ -1382,6 +1452,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
 
     for table_name in (
         "revenue_params",
+        "break_even_inputs",
         "production_annual",
         "production_monthly",
         "direct_costs_monthly",
@@ -3637,20 +3708,222 @@ def run_scenarios(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str
 ###############################################################################
 
 
-def break_even_analysis(statements: Dict[str, pd.DataFrame], revenue_df: pd.DataFrame, production_df: pd.DataFrame) -> Dict[str, object]:
-    pnl = statements["pnl"].copy()
-    fixed_costs = pnl["Opex"].mean() + pnl["Depreciation"].mean()
-    variable_cost_per_unit = (pnl["COGS"].sum() - fixed_costs * len(pnl)) / max(production_df["volume"].sum(), 1.0)
-    average_price = revenue_df["revenue"].sum() / max(production_df["volume"].sum(), 1.0)
-    break_even_volume = fixed_costs / max(average_price - variable_cost_per_unit, 1e-6)
-    margin_of_safety = 1 - break_even_volume / (production_df["volume"].sum() / len(statements["pnl"]))
-    return {
-        "fixed_costs": fixed_costs,
+def break_even_analysis(
+    statements: Dict[str, pd.DataFrame],
+    revenue_df: pd.DataFrame,
+    production_df: pd.DataFrame,
+    break_even_inputs: Optional[pd.DataFrame] = None,
+    price_config: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> Dict[str, object]:
+    pnl = statements.get("pnl", pd.DataFrame()).copy()
+    if pnl.empty or "COGS" not in pnl:
+        return {"overall": {}, "per_product": pd.DataFrame(), "inputs": pd.DataFrame()}
+
+    production_local = production_df.copy() if isinstance(production_df, pd.DataFrame) else pd.DataFrame()
+    if not production_local.empty:
+        production_local = production_local.copy()
+        if "product" in production_local.columns:
+            production_local["product"] = (
+                production_local["product"].astype(str).str.strip().str.lower()
+            )
+        if "volume" in production_local.columns:
+            production_local["volume"] = pd.to_numeric(
+                production_local["volume"], errors="coerce"
+            ).fillna(0.0)
+    else:
+        production_local = pd.DataFrame(columns=["product", "volume"])
+
+    revenue_local = revenue_df.copy() if isinstance(revenue_df, pd.DataFrame) else pd.DataFrame()
+    if not revenue_local.empty:
+        revenue_local = revenue_local.copy()
+        if "product" in revenue_local.columns:
+            revenue_local["product"] = (
+                revenue_local["product"].astype(str).str.strip().str.lower()
+            )
+        if "revenue" in revenue_local.columns:
+            revenue_local["revenue"] = pd.to_numeric(
+                revenue_local["revenue"], errors="coerce"
+            ).fillna(0.0)
+    else:
+        revenue_local = pd.DataFrame(columns=["product", "revenue"])
+
+    total_volume = float(production_local.get("volume", pd.Series(dtype=float)).sum())
+    total_periods = max(len(pnl), 1)
+    total_fixed_costs = float((pnl.get("Opex", 0.0) + pnl.get("Depreciation", 0.0)).sum())
+    total_cogs = float(pnl.get("COGS", 0.0).sum())
+    variable_cost_per_unit = (total_cogs - total_fixed_costs) / max(total_volume, 1.0)
+    average_price = revenue_local.get("revenue", pd.Series(dtype=float)).sum() / max(total_volume, 1.0)
+    contribution_margin = average_price - variable_cost_per_unit
+    break_even_volume = total_fixed_costs / max(contribution_margin, 1e-6)
+    average_period_volume = total_volume / max(total_periods, 1)
+    if average_period_volume > 0:
+        margin_of_safety = 1 - break_even_volume / max(average_period_volume, 1e-6)
+    else:
+        margin_of_safety = np.nan
+
+    default_inputs_df = DEFAULTS["break_even_inputs"].copy()
+    default_inputs_df["product"] = (
+        default_inputs_df["product"].astype(str).str.strip().str.lower()
+    )
+    default_map = {
+        row["product"]: row
+        for _, row in default_inputs_df.iterrows()
+    }
+
+    if isinstance(break_even_inputs, pd.DataFrame) and not break_even_inputs.empty:
+        inputs_df = break_even_inputs.copy()
+    else:
+        inputs_df = pd.DataFrame(columns=default_inputs_df.columns)
+
+    inputs_df = inputs_df.replace({"": np.nan})
+    if "product" in inputs_df.columns:
+        inputs_df["product"] = (
+            inputs_df["product"].astype(str).str.strip().str.lower()
+        )
+    required_cols = [
+        "product",
+        "unit_price",
+        "variable_cost_per_unit",
+        "fixed_cost",
+        "reference_volume",
+    ]
+    for col in required_cols:
+        if col not in inputs_df.columns:
+            inputs_df[col] = np.nan
+
+    sanitized_records: List[Dict[str, object]] = []
+    for product in PRODUCTS:
+        candidate = inputs_df[inputs_df["product"] == product].tail(1)
+        if not candidate.empty:
+            record = candidate.iloc[0].to_dict()
+        elif product in default_map:
+            record = default_map[product].to_dict()
+        else:
+            record = {
+                "product": product,
+                "unit_price": np.nan,
+                "variable_cost_per_unit": np.nan,
+                "fixed_cost": 0.0,
+                "reference_volume": np.nan,
+            }
+        record["product"] = product
+        sanitized_records.append(record)
+
+    inputs_used = pd.DataFrame(sanitized_records)
+    for col in ["unit_price", "variable_cost_per_unit", "fixed_cost", "reference_volume"]:
+        inputs_used[col] = pd.to_numeric(inputs_used[col], errors="coerce")
+
+    production_totals = (
+        production_local.groupby("product")["volume"].sum()
+        if "product" in production_local.columns
+        else pd.Series(dtype=float)
+    )
+    revenue_totals = (
+        revenue_local.groupby("product")["revenue"].sum()
+        if "product" in revenue_local.columns
+        else pd.Series(dtype=float)
+    )
+
+    unit_map: Dict[str, str] = {}
+    if isinstance(price_config, Mapping):
+        for product in PRODUCTS:
+            price_info = price_config.get(product, {})
+            unit_map[product] = (
+                str(price_info.get("uom", "")) if isinstance(price_info, Mapping) else ""
+            )
+
+    per_product_records: List[Dict[str, object]] = []
+    for _, row in inputs_used.iterrows():
+        product = str(row.get("product", "")).strip().lower()
+        if product not in PRODUCTS:
+            continue
+        unit_price = float(row.get("unit_price", np.nan))
+        variable_cost = float(row.get("variable_cost_per_unit", np.nan))
+        fixed_cost = float(row.get("fixed_cost", 0.0) or 0.0)
+        reference_volume = float(row.get("reference_volume", np.nan))
+        actual_volume = float(production_totals.get(product, 0.0))
+        if not np.isfinite(reference_volume) or reference_volume <= 0:
+            reference_volume = actual_volume if actual_volume > 0 else np.nan
+
+        contribution = unit_price - variable_cost if np.isfinite(unit_price) and np.isfinite(variable_cost) else np.nan
+        if contribution is None or not np.isfinite(contribution) or contribution <= 0:
+            break_even_units = np.nan
+        else:
+            break_even_units = fixed_cost / contribution if contribution != 0 else np.nan
+
+        break_even_revenue = (
+            break_even_units * unit_price if np.isfinite(break_even_units) and np.isfinite(unit_price) else np.nan
+        )
+        actual_revenue = float(revenue_totals.get(product, 0.0))
+        actual_average_price = (
+            actual_revenue / actual_volume if actual_volume > 0 else np.nan
+        )
+        margin_units = (
+            actual_volume - break_even_units
+            if np.isfinite(actual_volume) and np.isfinite(break_even_units)
+            else np.nan
+        )
+        if np.isfinite(margin_units) and actual_volume > 0:
+            margin_percent = margin_units / actual_volume
+        else:
+            margin_percent = np.nan
+        if np.isfinite(break_even_units) and reference_volume and np.isfinite(reference_volume) and reference_volume > 0:
+            break_even_vs_reference = break_even_units / reference_volume
+        else:
+            break_even_vs_reference = np.nan
+
+        per_product_records.append(
+            {
+                "product": product,
+                "unit_of_measure": unit_map.get(product, ""),
+                "unit_price": unit_price,
+                "variable_cost_per_unit": variable_cost,
+                "contribution_margin_per_unit": contribution,
+                "fixed_cost": fixed_cost,
+                "break_even_units": break_even_units,
+                "reference_volume": reference_volume,
+                "actual_volume": actual_volume,
+                "actual_average_price": actual_average_price,
+                "break_even_revenue": break_even_revenue,
+                "actual_revenue": actual_revenue,
+                "margin_of_safety_units": margin_units,
+                "margin_of_safety_percent": margin_percent,
+                "break_even_vs_reference": break_even_vs_reference,
+            }
+        )
+
+    per_product_df = pd.DataFrame(per_product_records)
+    numeric_columns = [
+        "unit_price",
+        "variable_cost_per_unit",
+        "contribution_margin_per_unit",
+        "fixed_cost",
+        "break_even_units",
+        "reference_volume",
+        "actual_volume",
+        "actual_average_price",
+        "break_even_revenue",
+        "actual_revenue",
+        "margin_of_safety_units",
+        "margin_of_safety_percent",
+        "break_even_vs_reference",
+    ]
+    for col in numeric_columns:
+        if col in per_product_df.columns:
+            per_product_df[col] = pd.to_numeric(per_product_df[col], errors="coerce")
+
+    per_product_df = per_product_df.sort_values("product").reset_index(drop=True)
+
+    overall = {
+        "fixed_costs_total": total_fixed_costs,
         "variable_cost_per_unit": variable_cost_per_unit,
         "average_price": average_price,
         "break_even_volume": break_even_volume,
         "margin_of_safety": margin_of_safety,
+        "total_volume": total_volume,
     }
+
+    return {"overall": overall, "per_product": per_product_df, "inputs": inputs_used}
 ###############################################################################
 # Section 16: Model orchestration
 ###############################################################################
@@ -3693,7 +3966,14 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
     valuation = project_cashflows(statements, cfg, timeline)
     dashboard = build_dashboard(cfg, statements, production_monthly, revenue_df, valuation, out_dir=export_dir)
-    be = break_even_analysis(statements, revenue_df, production_monthly)
+    be_inputs_cfg = cfg.get("break_even_inputs") if isinstance(cfg.get("break_even_inputs"), pd.DataFrame) else None
+    be = break_even_analysis(
+        statements,
+        revenue_df,
+        production_monthly,
+        break_even_inputs=be_inputs_cfg,
+        price_config=cfg.get("prices"),
+    )
 
     results = {
         "config": cfg,
@@ -3711,6 +3991,11 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "metrics": valuation["metrics"],
         "dashboard": dashboard,
         "break_even": be,
+        "break_even_inputs": (
+            be.get("inputs").copy()
+            if isinstance(be, dict) and isinstance(be.get("inputs"), pd.DataFrame)
+            else be_inputs_cfg,
+        ),
         "risk_profile": cfg.get("risk_profile", {}),
         "tornado_drivers": cfg.get("tornado_drivers").copy()
         if isinstance(cfg.get("tornado_drivers"), pd.DataFrame)
