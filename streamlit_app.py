@@ -11,6 +11,7 @@ Run with:
 from __future__ import annotations
 
 import copy
+import importlib
 import math
 import re
 import sys
@@ -401,6 +402,24 @@ def _ensure_scenario_payload(
     return scenario_cfg, scenario_results
 
 
+def _resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
+    """Return the first available Excel writer engine from the preferred list."""
+
+    for engine in preferred:
+        module = engine
+        if engine == "openpyxl":
+            module = "openpyxl"
+        try:
+            importlib.import_module(module)
+            return engine
+        except ImportError:
+            continue
+    raise RuntimeError(
+        "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
+        "Install one of them to enable workbook downloads."
+    )
+
+
 def _generate_excel_bytes(
     cfg: Mapping[str, object],
     results: Mapping[str, object],
@@ -409,7 +428,8 @@ def _generate_excel_bytes(
     """Create an Excel workbook for the provided results and return its bytes."""
 
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+    engine = _resolve_excel_engine()
+    with pd.ExcelWriter(buffer, engine=engine) as writer:
         dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
         if isinstance(dashboard, Mapping):
             snapshot = dashboard.get("assumptions_snapshot")
@@ -2212,13 +2232,18 @@ def main() -> None:
                         key=f"prepare_excel_{normalize_key(selected_scenario) or 'base'}",
                     ):
                         with st.spinner("Preparing Excel workbook..."):
-                            excel_bytes = _generate_excel_bytes(
-                                cfg_for_excel,
-                                scenario_results_payload,
-                                selected_scenario,
-                            )
-                        excel_map[selected_scenario] = excel_bytes
-                        st.session_state.excel_bytes_map = excel_map
+                            try:
+                                excel_bytes = _generate_excel_bytes(
+                                    cfg_for_excel,
+                                    scenario_results_payload,
+                                    selected_scenario,
+                                )
+                            except RuntimeError as exc:
+                                st.error(str(exc))
+                                excel_bytes = None
+                            else:
+                                excel_map[selected_scenario] = excel_bytes
+                                st.session_state.excel_bytes_map = excel_map
                 if excel_bytes:
                     file_scenario = normalize_key(selected_scenario) or "base"
                     st.download_button(
