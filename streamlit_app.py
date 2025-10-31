@@ -26,6 +26,15 @@ import streamlit as st
 from streamlit.errors import StreamlitAPIException
 from pandas.testing import assert_frame_equal
 
+try:  # Matplotlib is optional but required for chart rendering
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+except Exception:  # pragma: no cover - runtime fallback when matplotlib missing
+    plt = None
+    mdates = None
+
+_MATPLOTLIB_WARNING_SHOWN = False
+
 
 def _streamlit_runtime_exists() -> bool:
     """Return True when executed inside an active Streamlit runtime."""
@@ -338,6 +347,590 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     st.dataframe(df, use_container_width=True, key=f"df_{key}")
 
 
+def _ensure_matplotlib() -> bool:
+    """Return True when matplotlib is available, showing guidance otherwise."""
+
+    global _MATPLOTLIB_WARNING_SHOWN
+
+    if plt is None:
+        if not _MATPLOTLIB_WARNING_SHOWN:
+            st.info(
+                "Matplotlib is required to display charts. Install it with "
+                "`pip install matplotlib` and reload the app."
+            )
+            _MATPLOTLIB_WARNING_SHOWN = True
+        return False
+    return True
+
+
+def _finalize_plot(fig) -> None:
+    """Render and close a matplotlib figure inside Streamlit."""
+
+    if fig is None:
+        return
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _friendly_label(label: str) -> str:
+    return label.replace("_", " ").title()
+
+
+def _render_horizon_timeline_chart(
+    horizon: Mapping[str, object],
+    production_horizon: Mapping[str, object],
+) -> None:
+    if not _ensure_matplotlib():
+        return
+
+    try:
+        proj_start = pd.Timestamp(
+            year=int(horizon.get("start_year", 0) or 0),
+            month=int(horizon.get("start_month", 1) or 1),
+            day=1,
+        )
+        proj_end = pd.Timestamp(year=int(horizon.get("end_year", 0) or 0), month=12, day=31)
+    except Exception:
+        st.info("Projection horizon is incomplete; add start and end years to view the timeline.")
+        return
+
+    try:
+        prod_start = pd.Timestamp(year=int(production_horizon.get("start_year", proj_start.year)), month=1, day=1)
+        prod_end = pd.Timestamp(year=int(production_horizon.get("end_year", proj_end.year)), month=12, day=31)
+    except Exception:
+        prod_start = proj_start
+        prod_end = proj_end
+
+    bars = [
+        ("Projection horizon", proj_start, proj_end, "#1f77b4"),
+        ("Production horizon", prod_start, prod_end, "#2ca02c"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(8, 2.6))
+    yticks: List[int] = []
+    ylabels: List[str] = []
+
+    for idx, (label, start, end, color) in enumerate(bars):
+        if end < start:
+            continue
+        width = max((end - start).days, 1)
+        left = mdates.date2num(start) if mdates else start.toordinal()
+        ax.barh(idx, width, left=left, color=color, alpha=0.75)
+        ax.text(left, idx, label, va="center", ha="left", fontsize=9, color="white", weight="bold")
+        yticks.append(idx)
+        ylabels.append(label)
+
+    if not yticks:
+        plt.close(fig)
+        st.info("Unable to chart the horizons because start/end dates are missing.")
+        return
+
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([])
+    ax.set_xlabel("Year")
+    if mdates:
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    ax.set_title("Projection vs production horizon")
+    _finalize_plot(fig)
+
+
+def _render_stacked_columns(
+    df: pd.DataFrame,
+    x_col: str,
+    value_cols: Sequence[str],
+    title: str,
+    ylabel: str = "Value",
+) -> None:
+    if not _ensure_matplotlib() or df.empty:
+        if df.empty:
+            st.info(f"No data available for {title.lower()}.")
+        return
+
+    data = df.copy()
+    data = data[[x_col, *value_cols]].fillna(0.0)
+    x_labels = data[x_col].astype(str).tolist()
+    bottom = np.zeros(len(data))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for col in value_cols:
+        values = data[col].astype(float).to_numpy()
+        ax.bar(x_labels, values, bottom=bottom, label=_friendly_label(col))
+        bottom += values
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel(_friendly_label(x_col))
+    ax.legend()
+    ax.set_xticklabels(x_labels, rotation=45, ha="right")
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    _finalize_plot(fig)
+
+
+def _render_line_chart(
+    df: pd.DataFrame,
+    x_col: str,
+    value_cols: Sequence[str],
+    title: str,
+    ylabel: str = "Value",
+    secondary: Optional[str] = None,
+) -> None:
+    if not _ensure_matplotlib() or df.empty:
+        if df.empty:
+            st.info(f"No data available for {title.lower()}.")
+        return
+
+    data = df.copy()
+    data[x_col] = pd.to_datetime(data[x_col], errors="coerce")
+    data = data.dropna(subset=[x_col])
+    data = data.sort_values(x_col)
+    if data.empty:
+        st.info(f"No valid dates available for {title.lower()}.")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for col in value_cols:
+        ax.plot(data[x_col], data[col], label=_friendly_label(col))
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Date")
+    if mdates:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    if secondary and secondary in data.columns:
+        ax2 = ax.twinx()
+        ax2.plot(data[x_col], data[secondary], color="black", linestyle="--", label=_friendly_label(secondary))
+        ax2.set_ylabel(_friendly_label(secondary))
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc="upper left")
+    else:
+        ax.legend(loc="upper left")
+
+    _finalize_plot(fig)
+
+
+def _render_area_chart(
+    df: pd.DataFrame,
+    x_col: str,
+    value_cols: Sequence[str],
+    title: str,
+    ylabel: str = "Value",
+    invert_columns: Optional[Sequence[str]] = None,
+) -> None:
+    if not _ensure_matplotlib() or df.empty:
+        if df.empty:
+            st.info(f"No data available for {title.lower()}.")
+        return
+
+    invert_columns = tuple(invert_columns or [])
+    data = df.copy()
+    data[x_col] = pd.to_datetime(data[x_col], errors="coerce")
+    data = data.dropna(subset=[x_col])
+    data = data.sort_values(x_col)
+    if data.empty:
+        st.info(f"No valid dates available for {title.lower()}.")
+        return
+
+    stack_values = []
+    labels: List[str] = []
+    for col in value_cols:
+        series = data[col].astype(float).fillna(0.0)
+        if col in invert_columns:
+            series = -series
+        stack_values.append(series.to_numpy())
+        labels.append(_friendly_label(col))
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.stackplot(data[x_col], *stack_values, labels=labels, alpha=0.85)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("Date")
+    if mdates:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.legend(loc="upper left")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    _finalize_plot(fig)
+
+
+def _render_grouped_bar_chart(
+    df: pd.DataFrame,
+    category_col: str,
+    value_map: Mapping[str, str],
+    title: str,
+    ylabel: str = "Value",
+) -> None:
+    if not _ensure_matplotlib() or df.empty:
+        if df.empty:
+            st.info(f"No data available for {title.lower()}.")
+        return
+
+    categories = df[category_col].astype(str).tolist()
+    metrics = list(value_map.keys())
+    values = [df[col].astype(float).fillna(0.0).to_numpy() for col in metrics if col in df.columns]
+    if not values:
+        st.info(f"The required fields are missing for {title.lower()}.")
+        return
+
+    x = np.arange(len(categories))
+    width = 0.8 / max(len(values), 1)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for idx, col in enumerate(metrics):
+        if col not in df.columns:
+            continue
+        ax.bar(x + idx * width, df[col].astype(float).fillna(0.0), width, label=value_map[col])
+
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x + width * (len(values) - 1) / 2)
+    ax.set_xticklabels(categories, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+    _finalize_plot(fig)
+
+
+def _render_scatter_chart(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    category_col: str,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> None:
+    if not _ensure_matplotlib() or df.empty:
+        if df.empty:
+            st.info(f"No data available for {title.lower()}.")
+        return
+
+    data = df.dropna(subset=[x_col, y_col]).copy()
+    if data.empty:
+        st.info(f"Insufficient data to render {title.lower()}.")
+        return
+
+    categories = data[category_col].astype(str).unique()
+    colors = plt.cm.tab10(np.linspace(0, 1, len(categories))) if plt else []
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for color, category in zip(colors, categories):
+        mask = data[category_col].astype(str) == category
+        ax.scatter(data.loc[mask, x_col], data.loc[mask, y_col], color=color, label=category.title())
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    _finalize_plot(fig)
+
+
+def _render_working_capital_chart(df: pd.DataFrame) -> None:
+    columns = [col for col in ("accounts_receivable", "inventory", "accounts_payable") if col in df.columns]
+    if not columns:
+        st.info("Working capital components are not available.")
+        return
+    _render_area_chart(
+        df,
+        "date",
+        columns,
+        "Working capital components",
+        ylabel="Amount",
+        invert_columns=["accounts_payable"],
+    )
+
+
+def _render_dscr_trend_chart(df: pd.DataFrame) -> None:
+    if "DSCR" not in df.columns or "debt_service" not in df.columns:
+        st.info("DSCR information is unavailable for charting.")
+        return
+    _render_line_chart(
+        df,
+        "date",
+        ["DSCR"],
+        "DSCR vs debt service",
+        ylabel="DSCR",
+        secondary="debt_service",
+    )
+
+
+def _render_debt_waterfall_chart(df: pd.DataFrame) -> None:
+    required = [col for col in ("interest", "principal") if col in df.columns]
+    if not required:
+        st.info("Debt service summary is not available.")
+        return
+    _render_stacked_columns(df, "year", required, "Annual debt service breakdown", ylabel="Amount")
+
+
+def _render_cost_structure_chart(df: pd.DataFrame) -> None:
+    value_cols = [col for col in ("DirectCosts", "StaffCosts", "OtherOpexCosts") if col in df.columns]
+    if not value_cols:
+        st.info("Cost structure data is unavailable.")
+        return
+    _render_stacked_columns(df, "year", value_cols, "Annual operating cost structure", ylabel="Amount")
+
+
+def _render_labour_area_chart(df: pd.DataFrame) -> None:
+    value_cols = [col for col in ("gross_pay", "benefits", "training", "other") if col in df.columns]
+    if not value_cols:
+        st.info("Labour cost components are unavailable.")
+        return
+    _render_area_chart(df, "date", value_cols, "Labour cost composition", ylabel="Amount")
+
+
+def _render_break_even_bar_chart(df: pd.DataFrame) -> None:
+    if not {"product", "actual_volume", "break_even_units"}.issubset(df.columns):
+        st.info("Break-even comparison data is unavailable.")
+        return
+    summary = df[["product", "actual_volume", "break_even_units"]].copy()
+    summary = summary.replace({"": np.nan}).dropna(subset=["product"])
+    if summary.empty:
+        st.info("No break-even data to chart.")
+        return
+    _render_grouped_bar_chart(
+        summary,
+        "product",
+        {"actual_volume": "Actual volume", "break_even_units": "Break-even volume"},
+        "Actual vs break-even volumes",
+        ylabel="Units",
+    )
+
+
+def _render_cumulative_cash_chart(df: pd.DataFrame) -> None:
+    if not {"project_cumulative", "equity_cumulative"}.issubset(df.columns):
+        st.info("Cumulative cash flow data is unavailable.")
+        return
+    _render_line_chart(
+        df,
+        "date",
+        ["project_cumulative", "equity_cumulative"],
+        "Cumulative project and equity cash flows",
+        ylabel="Amount",
+    )
+
+
+def _render_revenue_vs_production_scatter(df: pd.DataFrame) -> None:
+    if not {"volume", "revenue", "product"}.issubset(df.columns):
+        st.info("Revenue vs production data is unavailable.")
+        return
+    _render_scatter_chart(
+        df,
+        "volume",
+        "revenue",
+        "product",
+        "Revenue vs production",
+        xlabel="Production volume",
+        ylabel="Revenue",
+    )
+
+
+def _render_pnl_chart(df: pd.DataFrame) -> None:
+    columns = [col for col in ("Revenue", "EBITDA", "NetIncome") if col in df.columns]
+    if not columns:
+        st.info("P&L drivers are unavailable for charting.")
+        return
+    _render_line_chart(df, "date", columns, "Monthly income statement drivers", ylabel="Amount")
+
+
+def _render_cashflow_chart(df: pd.DataFrame) -> None:
+    columns = [col for col in ("CFO", "CFI", "CFF", "NetCashFlow") if col in df.columns]
+    if not columns:
+        st.info("Cash flow components are unavailable for charting.")
+        return
+    _render_line_chart(df, "date", columns, "Monthly cash flow components", ylabel="Amount")
+
+
+def _render_balance_sheet_chart(df: pd.DataFrame) -> None:
+    columns = [col for col in ("TotalAssets", "TotalLiabilities", "Equity") if col in df.columns]
+    if not columns:
+        st.info("Balance sheet totals are unavailable for charting.")
+        return
+    _render_line_chart(df, "date", columns, "Balance sheet trend", ylabel="Amount")
+
+
+def _render_break_even_comparison_chart(df: pd.DataFrame) -> None:
+    if df.empty or not {"product", "break_even_revenue", "reference_volume"}.issubset(df.columns):
+        st.info("Break-even revenue data is unavailable.")
+        return
+    subset = df[["product", "break_even_revenue", "reference_volume"]].copy()
+    subset.rename(columns={"break_even_revenue": "Break-even revenue", "reference_volume": "Reference volume"}, inplace=True)
+    _render_grouped_bar_chart(
+        subset,
+        "product",
+        {"Break-even revenue": "Break-even revenue", "Reference volume": "Reference volume"},
+        "Break-even revenue vs reference volume",
+        ylabel="Value",
+    )
+
+
+def _render_tornado_chart(df: pd.DataFrame) -> None:
+    if df.empty or not {"driver", "scenario", "delta"}.issubset(df.columns):
+        st.info("Tornado analysis did not return usable data.")
+        return
+
+    pivot = df.pivot_table(index="driver", columns="scenario", values="delta", aggfunc="first").fillna(0.0)
+    if pivot.empty:
+        st.info("Tornado analysis results are empty.")
+        return
+
+    bars = pivot.loc[:, sorted(pivot.columns)]
+    plot_df = bars.reset_index().rename(columns={"driver": "Driver"})
+    _render_grouped_bar_chart(
+        plot_df,
+        "Driver",
+        {col: f"{col} delta" for col in bars.columns},
+        "Tornado sensitivity (Δ Project NPV)",
+        ylabel="Delta",
+    )
+
+
+def _render_monte_carlo_histograms(samples: pd.DataFrame) -> None:
+    if not _ensure_matplotlib() or samples.empty:
+        if samples.empty:
+            st.info("Monte Carlo samples are empty.")
+        return
+
+    metrics = [col for col in ("Project_NPV", "Equity_IRR", "Unit_Margin") if col in samples.columns]
+    if not metrics:
+        st.info("Monte Carlo outputs do not include the expected metrics.")
+        return
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 4))
+    if len(metrics) == 1:
+        axes = [axes]
+    for ax, metric in zip(axes, metrics):
+        ax.hist(samples[metric].dropna(), bins=30, color="#1f77b4", alpha=0.7)
+        ax.set_title(_friendly_label(metric))
+        ax.set_xlabel(_friendly_label(metric))
+        ax.set_ylabel("Frequency")
+        ax.grid(True, linestyle="--", alpha=0.3)
+    fig.suptitle("Monte Carlo outcome distribution")
+    _finalize_plot(fig)
+
+
+def _render_decision_tree_chart(df: pd.DataFrame, objective: str) -> None:
+    if df.empty or not {"path_name", "metric", "probability"}.issubset(df.columns):
+        st.info("Decision tree results lack the required columns.")
+        return
+
+    data = df[["path_name", "metric", "probability"]].copy()
+    if data.empty:
+        st.info("Decision tree produced no active paths.")
+        return
+
+    if not _ensure_matplotlib():
+        return
+
+    fig, ax1 = plt.subplots(figsize=(8, 4))
+    x = np.arange(len(data))
+    width = 0.35
+    ax1.bar(x - width / 2, data["metric"], width, color="#1f77b4", label=objective)
+    ax1.set_ylabel(_friendly_label(objective))
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(data["path_name"], rotation=45, ha="right")
+    ax1.grid(axis="y", linestyle="--", alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.bar(x + width / 2, data["probability"], width, color="#ff7f0e", alpha=0.6, label="Probability")
+    ax2.set_ylabel("Probability")
+
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines + lines2, labels + labels2, loc="upper right")
+    ax1.set_title("Decision tree payoffs and probabilities")
+    _finalize_plot(fig)
+
+
+def _render_scenario_metric_chart(df: pd.DataFrame) -> None:
+    if df.empty or "scenario" not in df.columns:
+        st.info("Scenario metrics are unavailable for charting.")
+        return
+    metrics = [col for col in ("Project_NPV", "Project_IRR", "Equity_IRR", "Payback_Year", "DSCR_min") if col in df.columns]
+    if not metrics:
+        st.info("Scenario metrics table does not include the expected KPIs.")
+        return
+    plot_df = df[["scenario", *metrics]].copy()
+    _render_grouped_bar_chart(
+        plot_df,
+        "scenario",
+        {metric: _friendly_label(metric) for metric in metrics},
+        "Scenario KPI comparison",
+        ylabel="Value",
+    )
+
+
+def _render_scenario_cashflow_stack(results_map: Mapping[str, Mapping[str, object]]) -> None:
+    records: List[pd.Series] = []
+    for scenario, res in results_map.items():
+        cash = res.get("statements_annual", {}).get("cashflow") if isinstance(res.get("statements_annual"), Mapping) else None
+        if isinstance(cash, pd.DataFrame) and not cash.empty:
+            totals = cash[[col for col in ("CFO", "CFI", "CFF") if col in cash.columns]].sum()
+            totals["scenario"] = scenario
+            records.append(totals)
+    if not records:
+        st.info("Cash flow statements are unavailable for the selected scenarios.")
+        return
+    df = pd.DataFrame(records).fillna(0.0)
+    _render_stacked_columns(df, "scenario", [col for col in df.columns if col != "scenario"], "Scenario cash flow composition", ylabel="Amount")
+
+
+def _render_scenario_dscr_chart(results_map: Mapping[str, Mapping[str, object]]) -> None:
+    frames = []
+    for scenario, res in results_map.items():
+        dashboard = res.get("dashboard") if isinstance(res, Mapping) else None
+        dscr = dashboard.get("dscr_trend") if isinstance(dashboard, Mapping) else None
+        if isinstance(dscr, pd.DataFrame) and not dscr.empty and "DSCR" in dscr.columns:
+            frame = dscr[["date", "DSCR"]].copy()
+            frame["scenario"] = scenario
+            frames.append(frame)
+    if not frames:
+        st.info("DSCR trends are unavailable for the selected scenarios.")
+        return
+    data = pd.concat(frames, ignore_index=True)
+    if not _ensure_matplotlib():
+        return
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data = data.dropna(subset=["date"]).sort_values("date")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for scenario, group in data.groupby("scenario"):
+        ax.plot(group["date"], group["DSCR"], label=scenario)
+    ax.set_title("DSCR trend by scenario")
+    ax.set_ylabel("DSCR")
+    ax.set_xlabel("Date")
+    if mdates:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    _finalize_plot(fig)
+
+
+def _render_scenario_scatter_chart(results_map: Mapping[str, Mapping[str, object]]) -> None:
+    frames = []
+    for scenario, res in results_map.items():
+        dashboard = res.get("dashboard") if isinstance(res, Mapping) else None
+        rev_prod = dashboard.get("revenue_vs_production") if isinstance(dashboard, Mapping) else None
+        if isinstance(rev_prod, pd.DataFrame) and not rev_prod.empty:
+            frame = rev_prod[["product", "volume", "revenue"]].copy()
+            frame["scenario"] = scenario
+            frames.append(frame)
+    if not frames:
+        st.info("Revenue vs production data is unavailable for the selected scenarios.")
+        return
+    data = pd.concat(frames, ignore_index=True)
+    if not _ensure_matplotlib():
+        return
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for scenario, group in data.groupby("scenario"):
+        ax.scatter(group["volume"], group["revenue"], label=scenario)
+    ax.set_title("Scenario revenue vs production")
+    ax.set_xlabel("Volume")
+    ax.set_ylabel("Revenue")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend()
+    _finalize_plot(fig)
 def _scenario_overrides_from_table(scenario_df: pd.DataFrame) -> Dict[str, Dict[str, object]]:
     """Convert the scenario comparison table into override dictionaries."""
 
@@ -2267,6 +2860,104 @@ def main() -> None:
                 if not excel_bytes:
                     st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
 
+        st.markdown("### Horizon overview")
+        _render_horizon_timeline_chart(horizon, production_horizon)
+
+        st.markdown("### Assumption-driven visuals")
+        st.caption("Charts below reflect the current input schedules and help validate annualised assumptions.")
+
+        prod_annual_df = results.get("production_annual") if isinstance(results, Mapping) else None
+        if isinstance(prod_annual_df, pd.DataFrame) and not prod_annual_df.empty:
+            prod_chart = (
+                prod_annual_df.pivot(index="year", columns="product", values="volume").fillna(0.0).reset_index()
+            )
+            prod_chart.rename(columns={"year": "Year"}, inplace=True)
+            value_cols = [col for col in prod_chart.columns if col != "Year"]
+            if value_cols:
+                _render_stacked_columns(prod_chart, "Year", value_cols, "Annual production by product", ylabel="Volume")
+
+        direct_input = tables.ensure_table("direct_costs_monthly").copy()
+        if not direct_input.empty and "amount" in direct_input.columns:
+            direct_input["date"] = pd.to_datetime(direct_input["date"], errors="coerce")
+            direct_input = direct_input.dropna(subset=["date"])
+            if not direct_input.empty:
+                direct_input["year"] = direct_input["date"].dt.year
+                direct_input["cost_type"] = direct_input.get("cost_type", "").astype(str).replace("", "Unspecified")
+                direct_year = (
+                    direct_input.groupby(["year", "cost_type"], dropna=False)["amount"].sum().unstack(fill_value=0.0).reset_index()
+                )
+                direct_year.rename(columns={"year": "Year"}, inplace=True)
+                value_cols = [col for col in direct_year.columns if col != "Year"]
+                if value_cols:
+                    _render_stacked_columns(
+                        direct_year,
+                        "Year",
+                        value_cols,
+                        "Annual direct costs by type",
+                        ylabel="Amount",
+                    )
+
+        staff_input = tables.ensure_table("staff_costs_monthly").copy()
+        if not staff_input.empty:
+            staff_input["date"] = pd.to_datetime(staff_input["date"], errors="coerce")
+            staff_input = staff_input.dropna(subset=["date"])
+            if not staff_input.empty:
+                staff_input["year"] = staff_input["date"].dt.year
+                staff_year = (
+                    staff_input.groupby("year")[[col for col in ("gross_pay", "benefits", "training", "other") if col in staff_input.columns]]
+                    .sum()
+                    .reset_index()
+                )
+                staff_year.rename(columns={"year": "Year"}, inplace=True)
+                value_cols = [col for col in staff_year.columns if col != "Year"]
+                if value_cols:
+                    _render_stacked_columns(
+                        staff_year,
+                        "Year",
+                        value_cols,
+                        "Annual staff cost components",
+                        ylabel="Amount",
+                    )
+
+        other_input = tables.ensure_table("other_opex_monthly").copy()
+        if not other_input.empty and "amount" in other_input.columns:
+            other_input["date"] = pd.to_datetime(other_input["date"], errors="coerce")
+            other_input = other_input.dropna(subset=["date"])
+            if not other_input.empty:
+                other_input["year"] = other_input["date"].dt.year
+                other_input["category"] = other_input.get("category", "").astype(str).replace("", "Unspecified")
+                other_year = (
+                    other_input.groupby(["year", "category"], dropna=False)["amount"].sum().unstack(fill_value=0.0).reset_index()
+                )
+                other_year.rename(columns={"year": "Year"}, inplace=True)
+                value_cols = [col for col in other_year.columns if col != "Year"]
+                if value_cols:
+                    _render_stacked_columns(
+                        other_year,
+                        "Year",
+                        value_cols,
+                        "Annual other opex by category",
+                        ylabel="Amount",
+                    )
+
+        inflation_input = tables.ensure_table("inflation_index").copy()
+        if not inflation_input.empty:
+            inflation_input["date"] = pd.to_datetime(inflation_input["date"], errors="coerce")
+            inflation_input = inflation_input.dropna(subset=["date"])
+            if not inflation_input.empty:
+                inflation_input["year"] = inflation_input["date"].dt.year
+                value_cols = [col for col in ("cpi", "fx_index") if col in inflation_input.columns]
+                if value_cols:
+                    inflation_year = inflation_input.groupby("year")[value_cols].mean().reset_index()
+                    inflation_year.rename(columns={"year": "Year"}, inplace=True)
+                    _render_stacked_columns(
+                        inflation_year,
+                        "Year",
+                        value_cols,
+                        "Average inflation and FX indices",
+                        ylabel="Index",
+                    )
+
         if sync_errors:
             for table_name, message in sync_errors.items():
                 st.error(f"{table_name}: {message}")
@@ -2315,6 +3006,38 @@ def main() -> None:
             cash_chart = annual_cashflow.set_index("year")[["CFO", "CFI", "CFF", "NetCashFlow"]]
             st.bar_chart(cash_chart)
 
+        wc_trend = dashboard.get("working_capital_trend")
+        if isinstance(wc_trend, pd.DataFrame) and not wc_trend.empty:
+            _render_working_capital_chart(wc_trend)
+
+        dscr_trend = dashboard.get("dscr_trend")
+        if isinstance(dscr_trend, pd.DataFrame) and not dscr_trend.empty:
+            _render_dscr_trend_chart(dscr_trend)
+
+        debt_summary = dashboard.get("debt_service_summary")
+        if isinstance(debt_summary, pd.DataFrame) and not debt_summary.empty:
+            _render_debt_waterfall_chart(debt_summary)
+
+        cost_structure_annual = dashboard.get("cost_structure_annual")
+        if isinstance(cost_structure_annual, pd.DataFrame) and not cost_structure_annual.empty:
+            _render_cost_structure_chart(cost_structure_annual)
+
+        labour_summary = dashboard.get("labour_summary")
+        if isinstance(labour_summary, pd.DataFrame) and not labour_summary.empty:
+            _render_labour_area_chart(labour_summary)
+
+        break_even_products = dashboard.get("break_even_per_product")
+        if isinstance(break_even_products, pd.DataFrame) and not break_even_products.empty:
+            _render_break_even_bar_chart(break_even_products)
+
+        cumulative_cf = dashboard.get("cumulative_cashflows")
+        if isinstance(cumulative_cf, pd.DataFrame) and not cumulative_cf.empty:
+            _render_cumulative_cash_chart(cumulative_cf)
+
+        revenue_vs_production = dashboard.get("revenue_vs_production")
+        if isinstance(revenue_vs_production, pd.DataFrame) and not revenue_vs_production.empty:
+            _render_revenue_vs_production_scatter(revenue_vs_production)
+
         staff_monthly = results.get("staff_costs_detail")
         if isinstance(staff_monthly, pd.DataFrame) and not staff_monthly.empty:
             staff_monthly_view = staff_monthly.copy()
@@ -2354,6 +3077,15 @@ def main() -> None:
                 safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
                 _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
                 _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
+                if key == "pnl" and isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty:
+                    _render_pnl_chart(monthly_df)
+                if key == "cashflow" and isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty:
+                    _render_cashflow_chart(monthly_df)
+                    cumulative_cf = dashboard.get("cumulative_cashflows")
+                    if isinstance(cumulative_cf, pd.DataFrame) and not cumulative_cf.empty:
+                        _render_cumulative_cash_chart(cumulative_cf)
+                if key == "balancesheet" and isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty:
+                    _render_balance_sheet_chart(monthly_df)
 
     with production_tab:
         prod_monthly = results["production_monthly"].copy()
@@ -2373,12 +3105,46 @@ def main() -> None:
         else:
             prod_annual = pd.DataFrame(columns=["year", *PRODUCTS])
         _render_dataframe(prod_annual, "Annual production", key="production_annual")
+        if not prod_monthly.empty:
+            monthly_chart = (
+                prod_monthly.groupby(["date", "product"], as_index=False)["volume"].sum().pivot(
+                    index="date", columns="product", values="volume"
+                )
+            )
+            monthly_chart = monthly_chart.fillna(0.0).reset_index()
+            value_cols = [col for col in monthly_chart.columns if col != "date"]
+            if value_cols:
+                _render_line_chart(monthly_chart, "date", value_cols, "Monthly production trends", ylabel="Volume")
+        if not prod_annual.empty:
+            value_cols = [col for col in prod_annual.columns if col != "year"]
+            if value_cols:
+                annual_chart = prod_annual.rename(columns={"year": "Year"})
+                _render_stacked_columns(annual_chart, "Year", value_cols, "Annual production totals", ylabel="Volume")
         price_curves = results["price_curves"].copy()
         price_curves["date"] = pd.to_datetime(price_curves["date"])
         _render_dataframe(price_curves, "Price curves", key="price_curves")
+        if not price_curves.empty:
+            price_chart = (
+                price_curves.pivot_table(index="date", columns="product", values="price", aggfunc="mean")
+                .fillna(0.0)
+                .reset_index()
+            )
+            value_cols = [col for col in price_chart.columns if col != "date"]
+            if value_cols:
+                _render_line_chart(price_chart, "date", value_cols, "Price curves by product", ylabel="Price")
         revenue_df = results["revenue"].copy()
         revenue_df["date"] = pd.to_datetime(revenue_df["date"])
         _render_dataframe(revenue_df, "Revenue stack", key="revenue")
+        if not revenue_df.empty:
+            revenue_chart = (
+                revenue_df.groupby(["date", "product"], as_index=False)["revenue"].sum().pivot(
+                    index="date", columns="product", values="revenue"
+                )
+            )
+            revenue_chart = revenue_chart.fillna(0.0).reset_index()
+            value_cols = [col for col in revenue_chart.columns if col != "date"]
+            if value_cols:
+                _render_area_chart(revenue_chart, "date", value_cols, "Revenue mix by product", ylabel="Revenue")
 
         st.markdown("### Break-even analysis")
         be_results = results.get("break_even", {})
@@ -2664,6 +3430,8 @@ def main() -> None:
                 }
             )
             _render_dataframe(summary_df, "Break-even summary by product", key="break_even_summary")
+            _render_break_even_bar_chart(per_product_be)
+            _render_break_even_comparison_chart(per_product_be)
 
         if isinstance(overall_be, dict) and overall_be:
             overall_table = pd.DataFrame(
@@ -2955,6 +3723,7 @@ def main() -> None:
                         st.caption(
                             f"Total probability weight: {decision_result.get('total_probability', 0.0):.2f}"
                         )
+                        _render_decision_tree_chart(paths_df, selected_objective)
 
 
     with scenario_tab:
@@ -3005,6 +3774,7 @@ def main() -> None:
                             drivers,
                         )
                     _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
+                    _render_tornado_chart(tornado_results)
 
         with scenario_sections[1]:
             distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
@@ -3180,6 +3950,7 @@ def main() -> None:
                 )
                 _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
                 _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+                _render_monte_carlo_histograms(monte_results["samples"])
 
         with scenario_sections[2]:
             _render_table_editor(
@@ -3200,9 +3971,23 @@ def main() -> None:
                         lambda c: run_full_model(c),
                         scenario_overrides_active,
                     )
-                base_metrics = pd.DataFrame([metrics]).assign(scenario="Base")
+                base_metrics = pd.DataFrame([metrics]).assign(scenario=BASE_SCENARIO_LABEL)
                 scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
                 _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+                scenario_results_map: Dict[str, Mapping[str, object]] = {}
+                for scenario_name in scenario_df["scenario"].dropna().astype(str).unique():
+                    cfg_payload, res_payload = _ensure_scenario_payload(
+                        scenario_name,
+                        cfg,
+                        results,
+                        scenario_overrides_active,
+                    )
+                    scenario_results_map[scenario_name] = res_payload
+                _render_scenario_metric_chart(scenario_df)
+                if scenario_results_map:
+                    _render_scenario_cashflow_stack(scenario_results_map)
+                    _render_scenario_dscr_chart(scenario_results_map)
+                    _render_scenario_scatter_chart(scenario_results_map)
 
     st.success("Model run complete.")
 
