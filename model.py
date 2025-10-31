@@ -2230,6 +2230,9 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
             "date": monthly_index,
             "Revenue": revenue_total.values,
             "COGS": cogs_total.values,
+            "DirectCosts": direct_costs_total.reindex(monthly_index, fill_value=0.0).values,
+            "OtherOpexCosts": other_opex_total.reindex(monthly_index, fill_value=0.0).values,
+            "StaffCosts": staff_costs_total.reindex(monthly_index, fill_value=0.0).values,
             "GrossProfit": gross_profit.values,
             "Opex": opex_total.values,
             "EBITDA": ebitda.values,
@@ -2402,13 +2405,29 @@ def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, obj
 ###############################################################################
 
 
-def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFrame], production_monthly: pd.DataFrame, revenue_df: pd.DataFrame, valuation: Dict[str, object], out_dir: Optional[Path] = None) -> Dict[str, object]:
+def build_dashboard(
+    cfg: Mapping[str, object],
+    statements: Dict[str, pd.DataFrame],
+    production_monthly: pd.DataFrame,
+    revenue_df: pd.DataFrame,
+    valuation: Dict[str, object],
+    working_capital: Optional[pd.DataFrame] = None,
+    debt_schedule: Optional[pd.DataFrame] = None,
+    staff_detail: Optional[pd.DataFrame] = None,
+    break_even: Optional[Mapping[str, object]] = None,
+    out_dir: Optional[Path] = None,
+) -> Dict[str, object]:
     horizon = cfg["projection_horizon"]
     production_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
     global_inputs = cfg["global_inputs"]
     metrics = valuation["metrics"]
-    monthly_pnl = statements["pnl"]
-    cashflow = statements["cashflow"]
+
+    monthly_pnl = statements.get("pnl", pd.DataFrame()).copy()
+    cashflow = statements.get("cashflow", pd.DataFrame()).copy()
+
+    for frame in (monthly_pnl, cashflow, production_monthly, revenue_df):
+        if isinstance(frame, pd.DataFrame) and not frame.empty and "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
 
     dashboard: Dict[str, object] = {}
     dashboard["assumptions_snapshot"] = pd.DataFrame(
@@ -2454,12 +2473,12 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
         }
     )
 
-    final_row = monthly_pnl.iloc[-1]
-    final_cashflow = cashflow.iloc[-1]
+    final_row = monthly_pnl.iloc[-1] if not monthly_pnl.empty else pd.Series(dtype=float)
+    final_cashflow = cashflow.iloc[-1] if not cashflow.empty else pd.Series(dtype=float)
     dashboard["latest_drivers"] = {
-        "final_month_revenue": final_row["Revenue"],
-        "final_month_ebitda": final_row["EBITDA"],
-        "final_month_equity_cf": final_cashflow["NetCashFlow"],
+        "final_month_revenue": float(final_row.get("Revenue", np.nan)),
+        "final_month_ebitda": float(final_row.get("EBITDA", np.nan)),
+        "final_month_equity_cf": float(final_cashflow.get("NetCashFlow", np.nan)),
         "cumulative_fcf_to_date": metrics.get("Cumulative_FCF"),
         "cumulative_equity_cf": metrics.get("Cumulative_Equity_CF"),
     }
@@ -2478,34 +2497,130 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
         }
     )
 
-    prod_for_annual = production_monthly.copy()
-    prod_for_annual["date"] = pd.to_datetime(prod_for_annual["date"], errors="coerce")
-    prod_for_annual = prod_for_annual.dropna(subset=["date"]) if "date" in prod_for_annual else pd.DataFrame()
-
-    revenue_by_product = revenue_df.copy()
-    revenue_by_product["date"] = pd.to_datetime(revenue_by_product["date"], errors="coerce")
-    revenue_by_product = revenue_by_product.dropna(subset=["date"]) if not revenue_by_product.empty else revenue_by_product
-
-    if prod_for_annual is not None and {"date", "product", "volume"}.issubset(prod_for_annual.columns):
+    prod_for_annual = production_monthly.copy() if isinstance(production_monthly, pd.DataFrame) else pd.DataFrame()
+    if not prod_for_annual.empty and {"date", "product", "volume"}.issubset(prod_for_annual.columns):
+        prod_for_annual = prod_for_annual.dropna(subset=["date"])
+        prod_for_annual["product"] = prod_for_annual["product"].astype(str).str.lower()
         prod_for_annual["year"] = prod_for_annual["date"].dt.year
-        volume_annual = (
-            prod_for_annual.groupby(["year", "product"], as_index=False)["volume"].sum()
-        )
-        if {"product"}.issubset(revenue_by_product.columns):
-            revenue_by_product["year"] = revenue_by_product["date"].dt.year
-            revenue_annual = (
-                revenue_by_product.groupby(["year", "product"], as_index=False)["revenue"].sum()
-            )
-        else:
-            revenue_annual = pd.DataFrame(columns=["year", "product", "revenue"])
-        annual_production = volume_annual.merge(revenue_annual, on=["year", "product"], how="left")
-        annual_production["revenue"].fillna(0.0, inplace=True)
-        annual_production_chart = (
-            annual_production.pivot(index="year", columns="product", values="volume").fillna(0.0)
-        )
+        volume_annual = prod_for_annual.groupby(["year", "product"], as_index=False)["volume"].sum()
     else:
-        annual_production = pd.DataFrame(columns=["year", "product", "volume", "revenue"])
-        annual_production_chart = pd.DataFrame(columns=PRODUCTS)
+        volume_annual = pd.DataFrame(columns=["year", "product", "volume"])
+
+    revenue_by_product = revenue_df.copy() if isinstance(revenue_df, pd.DataFrame) else pd.DataFrame()
+    if not revenue_by_product.empty and {"date", "product", "revenue"}.issubset(revenue_by_product.columns):
+        revenue_by_product = revenue_by_product.dropna(subset=["date"])
+        revenue_by_product["product"] = revenue_by_product["product"].astype(str).str.lower()
+        revenue_by_product["year"] = revenue_by_product["date"].dt.year
+        revenue_annual = revenue_by_product.groupby(["year", "product"], as_index=False)["revenue"].sum()
+    else:
+        revenue_annual = pd.DataFrame(columns=["year", "product", "revenue"])
+
+    annual_production = volume_annual.merge(revenue_annual, on=["year", "product"], how="left")
+    if "revenue" in annual_production:
+        annual_production["revenue"].fillna(0.0, inplace=True)
+    annual_production_chart = (
+        annual_production.pivot(index="year", columns="product", values="volume").fillna(0.0)
+        if not annual_production.empty
+        else pd.DataFrame(columns=PRODUCTS)
+    )
+
+    # Risk-adjusted DSCR and debt summaries
+    dscr_df = pd.DataFrame()
+    debt_summary = pd.DataFrame()
+    if isinstance(debt_schedule, pd.DataFrame) and not debt_schedule.empty:
+        debt_local = debt_schedule.copy()
+        debt_local["date"] = pd.to_datetime(debt_local["date"], errors="coerce")
+        debt_local = debt_local.dropna(subset=["date"])
+        debt_summary = (
+            debt_local.groupby("date")[["interest", "principal", "debt_service", "draw"]]
+            .sum()
+            .reset_index()
+            .sort_values("date")
+        )
+        if not cashflow.empty:
+            dscr_df = cashflow.merge(debt_summary, on="date", how="left")
+            dscr_df[["interest", "principal", "debt_service"]] = dscr_df[["interest", "principal", "debt_service"]].fillna(0.0)
+            dscr_df["CFADS"] = dscr_df["CFO"] + dscr_df["interest"]
+            dscr_df["DSCR"] = np.where(
+                dscr_df["debt_service"].abs() > 1e-9,
+                dscr_df["CFADS"] / dscr_df["debt_service"],
+                np.nan,
+            )
+            dscr_df = dscr_df[["date", "CFADS", "debt_service", "interest", "principal", "DSCR"]]
+    dashboard["dscr_trend"] = dscr_df
+
+    debt_service_annual = pd.DataFrame()
+    if not debt_summary.empty:
+        debt_summary["year"] = debt_summary["date"].dt.year
+        debt_service_annual = (
+            debt_summary.groupby("year")[["interest", "principal", "debt_service", "draw"]].sum().reset_index()
+        )
+    dashboard["debt_service_summary"] = debt_service_annual
+
+    wc_trend = working_capital.copy() if isinstance(working_capital, pd.DataFrame) else pd.DataFrame()
+    if not wc_trend.empty and "date" in wc_trend.columns:
+        wc_trend = wc_trend.copy()
+        wc_trend["date"] = pd.to_datetime(wc_trend["date"], errors="coerce")
+        wc_trend = wc_trend.dropna(subset=["date"])
+    dashboard["working_capital_trend"] = wc_trend
+
+    cost_structure_monthly = pd.DataFrame()
+    if not monthly_pnl.empty:
+        cost_cols = [col for col in ("DirectCosts", "StaffCosts", "OtherOpexCosts") if col in monthly_pnl.columns]
+        if cost_cols:
+            cost_structure_monthly = monthly_pnl[["date", *cost_cols]].copy()
+            cost_structure_monthly[cost_cols] = cost_structure_monthly[cost_cols].fillna(0.0)
+    dashboard["cost_structure_monthly"] = cost_structure_monthly
+    cost_structure_annual = aggregate_annual(cost_structure_monthly) if not cost_structure_monthly.empty else pd.DataFrame()
+    dashboard["cost_structure_annual"] = cost_structure_annual
+
+    labour_summary = pd.DataFrame()
+    if isinstance(staff_detail, pd.DataFrame) and not staff_detail.empty:
+        labour_summary = staff_detail.copy()
+        labour_summary["date"] = pd.to_datetime(labour_summary["date"], errors="coerce")
+        labour_summary = labour_summary.dropna(subset=["date"])
+    dashboard["labour_summary"] = labour_summary
+
+    break_even_products = pd.DataFrame()
+    if isinstance(break_even, Mapping):
+        per_product = break_even.get("per_product")
+        if isinstance(per_product, pd.DataFrame):
+            break_even_products = per_product.copy()
+    dashboard["break_even_per_product"] = break_even_products
+
+    valuation_cashflows = valuation.get("cashflows", {}) if isinstance(valuation, Mapping) else {}
+    cumulative_cf = pd.DataFrame()
+    if isinstance(valuation_cashflows, Mapping):
+        project_cf = valuation_cashflows.get("project")
+        equity_cf = valuation_cashflows.get("equity")
+        if (
+            project_cf is not None
+            and equity_cf is not None
+            and not cashflow.empty
+            and len(project_cf)
+            and len(equity_cf)
+        ):
+            min_len = min(len(project_cf), len(equity_cf), len(cashflow))
+            cf_df = pd.DataFrame(
+                {
+                    "date": cashflow["date"].values[:min_len],
+                    "project_cf": np.asarray(project_cf, dtype=float)[:min_len],
+                    "equity_cf": np.asarray(equity_cf, dtype=float)[:min_len],
+                }
+            )
+            cf_df["project_cumulative"] = cf_df["project_cf"].cumsum()
+            cf_df["equity_cumulative"] = cf_df["equity_cf"].cumsum()
+            cumulative_cf = cf_df
+    dashboard["cumulative_cashflows"] = cumulative_cf
+
+    revenue_vs_production = annual_production.copy()
+    if not revenue_vs_production.empty and "volume" in revenue_vs_production:
+        revenue_vs_production["average_price"] = np.where(
+            revenue_vs_production["volume"].abs() > 1e-9,
+            revenue_vs_production.get("revenue", 0.0) / revenue_vs_production["volume"],
+            np.nan,
+        )
+    dashboard["revenue_vs_production"] = revenue_vs_production
 
     charts: Dict[str, Optional[Path]] = {}
     if plt is not None:
@@ -2521,35 +2636,129 @@ def build_dashboard(cfg: Mapping[str, object], statements: Dict[str, pd.DataFram
             plt.close(fig)
             return path
 
-        fig, ax = plt.subplots(figsize=(8, 4))
-        annual_production_chart.plot(kind="bar", stacked=True, ax=ax)
-        ax.set_title("Annual Production by Product")
-        ax.set_ylabel("Volume")
-        charts["annual_production"] = _save_chart(fig, "annual_production")
+        if not annual_production_chart.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            annual_production_chart.plot(kind="bar", stacked=True, ax=ax)
+            ax.set_title("Annual Production by Product")
+            ax.set_ylabel("Volume")
+            charts["annual_production"] = _save_chart(fig, "annual_production")
 
-        annual_cashflow = aggregate_annual(cashflow)
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(annual_cashflow["year"], annual_cashflow["NetCashFlow"], label="FCF")
-        ax.bar(annual_cashflow["year"], annual_cashflow["CFO"], label="CFO", alpha=0.5)
-        ax.legend()
-        ax.set_title("Annual Cash Flow")
-        charts["cash_flow"] = _save_chart(fig, "cash_flow")
+        annual_cashflow = aggregate_annual(cashflow) if not cashflow.empty else pd.DataFrame()
+        if not annual_cashflow.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(annual_cashflow["year"], annual_cashflow["NetCashFlow"], label="Net CF", color="tab:blue", alpha=0.6)
+            ax.bar(annual_cashflow["year"], annual_cashflow["CFO"], label="CFO", color="tab:green", alpha=0.4)
+            ax.set_title("Annual Cash Flow")
+            ax.legend()
+            charts["cash_flow"] = _save_chart(fig, "cash_flow")
 
-        revenue_mix = revenue_df.copy()
-        revenue_mix["year"] = revenue_mix["date"].dt.year
-        revenue_mix = revenue_mix.groupby(["year", "product"])["revenue"].sum().unstack(fill_value=0.0)
-        fig, ax = plt.subplots(figsize=(8, 4))
-        revenue_mix.plot(kind="bar", stacked=True, ax=ax)
-        ax.set_title("Revenue Mix")
-        charts["revenue_mix"] = _save_chart(fig, "revenue_mix")
+        if not revenue_by_product.empty:
+            revenue_mix = revenue_by_product.groupby(["year", "product"])["revenue"].sum().unstack(fill_value=0.0)
+            fig, ax = plt.subplots(figsize=(8, 4))
+            revenue_mix.plot(kind="bar", stacked=True, ax=ax)
+            ax.set_title("Revenue Mix")
+            charts["revenue_mix"] = _save_chart(fig, "revenue_mix")
+
+        if not dscr_df.empty:
+            fig, ax1 = plt.subplots(figsize=(8, 4))
+            ax1.plot(dscr_df["date"], dscr_df["DSCR"], color="tab:blue", label="DSCR")
+            ax1.axhline(1.0, color="gray", linestyle="--", linewidth=1)
+            ax1.set_ylabel("DSCR")
+            ax2 = ax1.twinx()
+            ax2.plot(dscr_df["date"], dscr_df["CFADS"], color="tab:green", label="CFADS")
+            ax2.plot(dscr_df["date"], dscr_df["debt_service"], color="tab:red", label="Debt service")
+            ax1.set_title("DSCR and Debt Service Trend")
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines + lines2, labels + labels2, loc="upper right")
+            charts["dscr_trend"] = _save_chart(fig, "dscr_trend")
+
+        if not debt_service_annual.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            bottom = np.zeros(len(debt_service_annual))
+            for col, color in (("interest", "tab:red"), ("principal", "tab:purple")):
+                ax.bar(debt_service_annual["year"], debt_service_annual[col], bottom=bottom, label=col.title(), color=color, alpha=0.7)
+                bottom += debt_service_annual[col].values
+            ax.plot(debt_service_annual["year"], debt_service_annual["draw"], color="tab:orange", marker="o", label="Draws")
+            ax.set_title("Debt Service Waterfall")
+            ax.legend()
+            charts["debt_service"] = _save_chart(fig, "debt_service")
+
+        if not wc_trend.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.stackplot(
+                wc_trend["date"],
+                wc_trend["accounts_receivable"],
+                wc_trend["inventory"],
+                wc_trend["accounts_payable"],
+                labels=["Accounts Receivable", "Inventory", "Accounts Payable"],
+            )
+            ax.set_title("Working Capital Components")
+            ax.legend(loc="upper left")
+            charts["working_capital"] = _save_chart(fig, "working_capital")
+
+        if not cost_structure_annual.empty:
+            df = cost_structure_annual.set_index("year")[[col for col in cost_structure_annual.columns if col not in {"year"}]]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            df.plot(kind="bar", stacked=True, ax=ax)
+            ax.set_title("Annual Cost Structure")
+            charts["cost_structure"] = _save_chart(fig, "cost_structure")
+
+        if not labour_summary.empty:
+            labour_plot = labour_summary.groupby(["date", "dept"])["total_cost"].sum().unstack(fill_value=0.0)
+            if not labour_plot.empty:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                labour_plot.plot(kind="area", stacked=True, ax=ax)
+                ax.set_title("Labour Cost by Department")
+                charts["labour_cost"] = _save_chart(fig, "labour_cost")
+
+        if not break_even_products.empty:
+            be_plot = break_even_products[["product", "actual_volume", "break_even_units"]].dropna()
+            if not be_plot.empty:
+                be_plot = be_plot.set_index("product")
+                fig, ax = plt.subplots(figsize=(8, 4))
+                be_plot.plot(kind="bar", ax=ax)
+                ax.set_title("Actual vs Break-even Volume")
+                ax.set_ylabel("Units")
+                charts["break_even"] = _save_chart(fig, "break_even")
+
+        if not cumulative_cf.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(cumulative_cf["date"], cumulative_cf["project_cumulative"], label="Project cumulative")
+            ax.plot(cumulative_cf["date"], cumulative_cf["equity_cumulative"], label="Equity cumulative")
+            ax.set_title("Cumulative Cash Flows")
+            ax.legend()
+            charts["cumulative_cashflows"] = _save_chart(fig, "cumulative_cashflows")
+
+        if not revenue_vs_production.empty:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            for product, grp in revenue_vs_production.groupby("product"):
+                ax.scatter(grp["volume"], grp.get("revenue", 0.0), label=product)
+            ax.set_xlabel("Volume")
+            ax.set_ylabel("Revenue")
+            ax.set_title("Revenue vs Production")
+            ax.legend()
+            charts["revenue_vs_production"] = _save_chart(fig, "revenue_vs_production")
+
     else:
-        charts = {"annual_production": None, "cash_flow": None, "revenue_mix": None}
+        charts = {
+            "annual_production": None,
+            "cash_flow": None,
+            "revenue_mix": None,
+            "dscr_trend": None,
+            "debt_service": None,
+            "working_capital": None,
+            "cost_structure": None,
+            "labour_cost": None,
+            "break_even": None,
+            "cumulative_cashflows": None,
+            "revenue_vs_production": None,
+        }
 
     dashboard["charts"] = charts
-    dashboard["annual_production"] = annual_production_chart.reset_index()
+    dashboard["annual_production"] = annual_production_chart.reset_index() if not annual_production_chart.empty else annual_production_chart
     dashboard["annual_production_detail"] = annual_production
-    annual_cashflow = aggregate_annual(cashflow)
-    dashboard["annual_cashflow"] = annual_cashflow
+    dashboard["annual_cashflow"] = aggregate_annual(cashflow) if not cashflow.empty else pd.DataFrame()
 
     return dashboard
 ###############################################################################
@@ -3965,7 +4174,6 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
     valuation = project_cashflows(statements, cfg, timeline)
-    dashboard = build_dashboard(cfg, statements, production_monthly, revenue_df, valuation, out_dir=export_dir)
     be_inputs_cfg = cfg.get("break_even_inputs") if isinstance(cfg.get("break_even_inputs"), pd.DataFrame) else None
     be = break_even_analysis(
         statements,
@@ -3973,6 +4181,18 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         production_monthly,
         break_even_inputs=be_inputs_cfg,
         price_config=cfg.get("prices"),
+    )
+    dashboard = build_dashboard(
+        cfg,
+        statements,
+        production_monthly,
+        revenue_df,
+        valuation,
+        working_capital=wc_df,
+        debt_schedule=debt_schedule,
+        staff_detail=staff_detail,
+        break_even=be,
+        out_dir=export_dir,
     )
 
     results = {
