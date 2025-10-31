@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import datetime
 import importlib
 import itertools
 import json
@@ -28,10 +29,24 @@ import random
 import re
 import statistics
 import sys
-from collections import defaultdict
+import zipfile
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Literal, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import (
+    BinaryIO,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
+from xml.sax.saxutils import escape as xml_escape
 
 try:
     import matplotlib.pyplot as plt
@@ -82,6 +97,8 @@ RISK_MULTIPLIER_COLUMNS: Dict[str, str] = {
     "revenue_multiplier": "revenue",
     "yield_multiplier": "yield",
 }
+
+SIMPLE_XLSX_ENGINE = "__simple_xlsx__"
 
 DEFAULTS = {
     "horizon": {"start_year": 2025, "end_year": 2035, "start_month": 1, "frequency": "monthly"},
@@ -4248,6 +4265,197 @@ def export_csv(results: Mapping[str, object], out_dir: Path) -> None:
                     subvalue.to_csv(out_dir / f"{key}_{subkey}.csv", index=False)
 
 
+def _sanitize_sheet_name(name: str, existing: Sequence[str]) -> str:
+    base = re.sub(r"[\[\]:\\/?*]", "", str(name)) or "Sheet"
+    base = base[:31]
+    candidate = base
+    counter = 1
+    while candidate in existing:
+        suffix = f"_{counter}"
+        candidate = f"{base[: max(0, 31 - len(suffix))]}{suffix}" or f"Sheet_{counter}"
+        counter += 1
+    return candidate
+
+
+def _column_letter(index: int) -> str:
+    result = ""
+    idx = index
+    while idx >= 0:
+        idx, rem = divmod(idx, 26)
+        result = chr(65 + rem) + result
+        idx -= 1
+    return result
+
+
+def write_simple_xlsx(sheets: Mapping[str, pd.DataFrame], handle: BinaryIO) -> None:
+    """Write a minimal XLSX workbook without third-party engines."""
+
+    shared_strings: Dict[str, int] = {}
+    shared_order: List[str] = []
+
+    def add_shared(text: str) -> int:
+        if text in shared_strings:
+            return shared_strings[text]
+        idx = len(shared_order)
+        shared_strings[text] = idx
+        shared_order.append(text)
+        return idx
+
+    sheet_defs: List[Tuple[str, str]] = []
+    existing_names: List[str] = []
+
+    for sheet_name, df in sheets.items():
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        df_local = df.copy()
+        sanitized = _sanitize_sheet_name(str(sheet_name), existing_names)
+        existing_names.append(sanitized)
+        rows_xml: List[str] = []
+
+        headers = list(df_local.columns)
+        if headers:
+            cells = []
+            for col_idx, heading in enumerate(headers):
+                text = str(heading)
+                ref = f"{_column_letter(col_idx)}1"
+                idx = add_shared(text)
+                cells.append(f'<c r="{ref}" t="s"><v>{idx}</v></c>')
+            rows_xml.append(f"<row r=\"1\">{''.join(cells)}</row>")
+
+        for row_idx, row in enumerate(df_local.itertuples(index=False, name=None), start=2 if headers else 1):
+            cells = []
+            for col_idx, value in enumerate(row):
+                if value is None:
+                    continue
+                if isinstance(value, (float, np.floating)) and math.isnan(value):
+                    continue
+                if pd.isna(value):
+                    continue
+                cell_ref = f"{_column_letter(col_idx)}{row_idx}"
+                formatted = None
+                cell_type = ""
+                if isinstance(value, (int, np.integer)):
+                    formatted = f"<v>{int(value)}</v>"
+                elif isinstance(value, (float, np.floating)) and not math.isnan(value):
+                    formatted = f"<v>{float(value)}</v>"
+                elif isinstance(value, (pd.Timestamp, np.datetime64, datetime.date, datetime.datetime)):
+                    if isinstance(value, np.datetime64):
+                        value = pd.Timestamp(value).to_pydatetime()
+                    if isinstance(value, pd.Timestamp):
+                        value = value.to_pydatetime()
+                    if isinstance(value, datetime.datetime):
+                        value = value.isoformat()
+                    elif isinstance(value, datetime.date):
+                        value = value.isoformat()
+                    else:
+                        value = str(value)
+                    idx = add_shared(str(value))
+                    formatted = f"<v>{idx}</v>"
+                    cell_type = ' t="s"'
+                elif isinstance(value, bool):
+                    idx = add_shared("TRUE" if value else "FALSE")
+                    formatted = f"<v>{idx}</v>"
+                    cell_type = ' t="s"'
+                else:
+                    idx = add_shared(str(value))
+                    formatted = f"<v>{idx}</v>"
+                    cell_type = ' t="s"'
+                if formatted is not None:
+                    cells.append(f'<c r="{cell_ref}"{cell_type}>{formatted}</c>')
+            rows_xml.append(f"<row r=\"{row_idx}\">{''.join(cells)}</row>")
+
+        sheet_content = (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            f"<sheetData>{''.join(rows_xml)}</sheetData>"
+            "</worksheet>"
+        )
+        sheet_defs.append((sanitized, sheet_content))
+
+    if not sheet_defs:
+        sheet_defs.append(
+            (
+                "Summary",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheetData/></worksheet>",
+            )
+        )
+
+    shared_entries = ''.join(
+        f"<si><t>{xml_escape(text)}</t></si>" for text in shared_order
+    )
+    shared_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        f"<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"{len(shared_order)}\" "
+        f"uniqueCount=\"{len(shared_order)}\">{shared_entries}</sst>"
+    )
+
+    sheets_entries = []
+    sheets_rels = []
+    for idx, (name, _) in enumerate(sheet_defs, start=1):
+        sheets_entries.append(
+            f"<sheet name=\"{xml_escape(name)}\" sheetId=\"{idx}\" r:id=\"rId{idx}\"/>"
+        )
+        sheets_rels.append(
+            f"<Relationship Id=\"rId{idx}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" "
+            f"Target=\"worksheets/sheet{idx}.xml\"/>"
+        )
+
+    workbook_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        f"<sheets>{''.join(sheets_entries)}</sheets></workbook>"
+    )
+
+    workbook_rels = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
+        f"{''.join(sheets_rels)}"
+        "<Relationship Id=\"rId_styles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>"
+        "<Relationship Id=\"rId_sharedStrings\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>"
+        "</Relationships>"
+    )
+
+    styles_xml = (
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+        "<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>"
+        "<fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills>"
+        "<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>"
+        "<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>"
+        "<cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellXfs>"
+        "<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>"
+        "</styleSheet>"
+    )
+
+    content_types = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
+        "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>",
+        "<Default Extension=\"xml\" ContentType=\"application/xml\"/>",
+        "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>",
+        "<Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>",
+        "<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+    ]
+    for idx, _ in enumerate(sheet_defs, start=1):
+        content_types.append(
+            f"<Override PartName=\"/xl/worksheets/sheet{idx}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        )
+    content_types.append("</Types>")
+    content_types_xml = ''.join(content_types)
+
+    with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types_xml)
+        zf.writestr("_rels/.rels", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>")
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", styles_xml)
+        zf.writestr("xl/sharedStrings.xml", shared_xml)
+        for idx, (_, content) in enumerate(sheet_defs, start=1):
+            zf.writestr(f"xl/worksheets/sheet{idx}.xml", content)
+
+
 def resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
     """Return the first available Excel writer engine from the preferred list."""
 
@@ -4258,23 +4466,44 @@ def resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) 
             return engine
         except ImportError:
             continue
-    raise RuntimeError(
-        "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
-        "Install one of them to enable workbook downloads."
-    )
+    return SIMPLE_XLSX_ENGINE
 
 
 def build_excel_pack(results: Mapping[str, object], path: Path) -> None:
     engine = resolve_excel_engine()
-    with pd.ExcelWriter(path, engine=engine) as writer:
-        results["dashboard"]["assumptions_snapshot"].to_excel(writer, sheet_name="Summary", index=False)
+    sheets: OrderedDict[str, pd.DataFrame] = OrderedDict()
+    dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
+    if isinstance(dashboard, Mapping):
+        snapshot = dashboard.get("assumptions_snapshot")
+        if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
+            sheets["Summary"] = snapshot
+        overview = dashboard.get("overview_metrics")
+        if isinstance(overview, pd.DataFrame) and not overview.empty:
+            sheets["Metrics"] = overview
+        annual_prod = dashboard.get("annual_production")
+        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
+            sheets["Production"] = annual_prod
+
+    statements = results.get("statements_annual") if isinstance(results, Mapping) else None
+    if isinstance(statements, Mapping):
         for key in ("pnl", "cashflow", "balancesheet"):
-            results["statements_annual"][key].to_excel(writer, sheet_name=f"Annual_{key}", index=False)
-        results["capex"].to_excel(writer, sheet_name="CAPEX", index=False)
-        results["debt_schedule"].to_excel(writer, sheet_name="Debt", index=False)
-        results["working_capital"].to_excel(writer, sheet_name="WorkingCapital", index=False)
-        results["dashboard"]["overview_metrics"].to_excel(writer, sheet_name="Metrics", index=False)
-        results["dashboard"]["annual_production"].to_excel(writer, sheet_name="Production", index=False)
+            df = statements.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sheets[f"Annual_{key}"] = df
+
+    for label, key in (("CAPEX", "capex"), ("Debt", "debt_schedule"), ("WorkingCapital", "working_capital")):
+        df = results.get(key) if isinstance(results, Mapping) else None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            sheets[label] = df
+
+    if engine == SIMPLE_XLSX_ENGINE:
+        with open(path, "wb") as handle:
+            write_simple_xlsx(sheets, handle)
+        return
+
+    with pd.ExcelWriter(path, engine=engine) as writer:
+        for sheet_name, df in sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
 ###############################################################################
 # Section 18: CLI entrypoint
 ###############################################################################

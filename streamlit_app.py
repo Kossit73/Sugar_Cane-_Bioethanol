@@ -15,6 +15,7 @@ import importlib
 import math
 import re
 import sys
+from collections import OrderedDict
 from contextlib import contextmanager
 from io import BytesIO
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -155,15 +156,17 @@ try:  # noqa: SIM105 - streamlit feedback when dependencies missing
         metaheuristic_optimize,
         monte_carlo,
         neural_forecast_production,
-        parse_ramp,
-        run_full_model,
-        run_scenarios,
-        sensitivity_tornado,
-        statistical_forecast,
-        normalize_key,
-        Timeline,
-        resolve_excel_engine,
-    )
+    parse_ramp,
+    run_full_model,
+    run_scenarios,
+    sensitivity_tornado,
+    statistical_forecast,
+    normalize_key,
+    Timeline,
+    resolve_excel_engine,
+    SIMPLE_XLSX_ENGINE,
+    write_simple_xlsx,
+)
 except ModuleNotFoundError as exc:  # pragma: no cover - executed only when deps missing
     MODEL_IMPORT_ERROR = exc
 
@@ -206,6 +209,8 @@ if MODEL_IMPORT_ERROR is not None:
     MONTE_CARLO_VARIABLES = tuple(key for key, _ in MONTE_CARLO_VARIABLE_ITEMS)
     MONTE_CARLO_VARIABLE_LABELS = {key: label for key, label in MONTE_CARLO_VARIABLE_ITEMS}
 
+    SIMPLE_XLSX_ENGINE = "__simple_xlsx__"
+
     def resolve_excel_engine(preferred: Sequence[str] = ("xlsxwriter", "openpyxl")) -> str:
         for engine in preferred:
             module = "openpyxl" if engine == "openpyxl" else engine
@@ -214,6 +219,9 @@ if MODEL_IMPORT_ERROR is not None:
                 return engine
             except ImportError:
                 continue
+        return SIMPLE_XLSX_ENGINE
+
+    def write_simple_xlsx(sheets: Mapping[str, pd.DataFrame], handle) -> None:
         raise RuntimeError(
             "Excel export requires the 'xlsxwriter' or 'openpyxl' package. "
             "Install one of them to enable workbook downloads."
@@ -425,53 +433,53 @@ def _generate_excel_bytes(
 
     buffer = BytesIO()
     engine = resolve_excel_engine()
-    with pd.ExcelWriter(buffer, engine=engine) as writer:
-        dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
-        if isinstance(dashboard, Mapping):
-            snapshot = dashboard.get("assumptions_snapshot")
-            if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
-                snapshot.to_excel(writer, sheet_name="Summary", index=False)
-            overview = dashboard.get("overview_metrics")
-            if isinstance(overview, pd.DataFrame) and not overview.empty:
-                overview.to_excel(writer, sheet_name="Metrics", index=False)
-            annual_prod = dashboard.get("annual_production")
-            if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
-                annual_prod.to_excel(writer, sheet_name="Production", index=False)
+    sheets: OrderedDict[str, pd.DataFrame] = OrderedDict()
 
-        statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
-        if isinstance(statements_annual, Mapping):
-            for key in ("pnl", "cashflow", "balancesheet"):
-                df = statements_annual.get(key)
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    sheet = f"Annual_{key}"
-                    df.to_excel(writer, sheet_name=sheet, index=False)
+    dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
+    if isinstance(dashboard, Mapping):
+        snapshot = dashboard.get("assumptions_snapshot")
+        if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
+            sheets["Summary"] = snapshot
+        overview = dashboard.get("overview_metrics")
+        if isinstance(overview, pd.DataFrame) and not overview.empty:
+            sheets["Metrics"] = overview
+        annual_prod = dashboard.get("annual_production")
+        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
+            sheets["Production"] = annual_prod
 
-        capex_df = results.get("capex") if isinstance(results, Mapping) else None
-        if isinstance(capex_df, pd.DataFrame) and not capex_df.empty:
-            capex_df.to_excel(writer, sheet_name="CAPEX", index=False)
+    statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+    if isinstance(statements_annual, Mapping):
+        for key in ("pnl", "cashflow", "balancesheet"):
+            df = statements_annual.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sheets[f"Annual_{key}"] = df
 
-        debt_df = results.get("debt_schedule") if isinstance(results, Mapping) else None
-        if isinstance(debt_df, pd.DataFrame) and not debt_df.empty:
-            debt_df.to_excel(writer, sheet_name="Debt", index=False)
+    for label, key in (("CAPEX", "capex"), ("Debt", "debt_schedule"), ("WorkingCapital", "working_capital")):
+        df = results.get(key) if isinstance(results, Mapping) else None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            sheets[label] = df
 
-        wc_df = results.get("working_capital") if isinstance(results, Mapping) else None
-        if isinstance(wc_df, pd.DataFrame) and not wc_df.empty:
-            wc_df.to_excel(writer, sheet_name="WorkingCapital", index=False)
+    meta_rows: List[Dict[str, object]] = []
+    global_inputs = cfg.get("global_inputs") if isinstance(cfg, Mapping) else {}
+    if isinstance(global_inputs, Mapping):
+        meta_rows.append(
+            {
+                "Scenario": scenario_name,
+                "Discount rate": global_inputs.get("discount_rate"),
+                "Corporate tax": global_inputs.get("corp_tax_rate"),
+                "Investor share": global_inputs.get("investor_share"),
+                "Owner share": global_inputs.get("owner_share"),
+            }
+        )
+    if meta_rows:
+        sheets["Scenario"] = pd.DataFrame(meta_rows)
 
-        meta_rows: List[Dict[str, object]] = []
-        global_inputs = cfg.get("global_inputs") if isinstance(cfg, Mapping) else {}
-        if isinstance(global_inputs, Mapping):
-            meta_rows.append(
-                {
-                    "Scenario": scenario_name,
-                    "Discount rate": global_inputs.get("discount_rate"),
-                    "Corporate tax": global_inputs.get("corp_tax_rate"),
-                    "Investor share": global_inputs.get("investor_share"),
-                    "Owner share": global_inputs.get("owner_share"),
-                }
-            )
-        if meta_rows:
-            pd.DataFrame(meta_rows).to_excel(writer, sheet_name="Scenario", index=False)
+    if engine == SIMPLE_XLSX_ENGINE:
+        write_simple_xlsx(sheets, buffer)
+    else:
+        with pd.ExcelWriter(buffer, engine=engine) as writer:
+            for sheet_name, df in sheets.items():
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
 
     buffer.seek(0)
     return buffer.read()
