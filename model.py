@@ -777,6 +777,74 @@ def _derive_direct_costs(df: pd.DataFrame) -> pd.DataFrame:
     result.loc[mask, "amount"] = result.loc[mask, "unit_price"] * result.loc[mask, "quantity"]
 
     return result
+
+
+def _derive_staff_costs(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise staff cost entries and recompute totals from per-head inputs."""
+
+    required_columns = [
+        "date",
+        "dept",
+        "headcount",
+        "gross_pay",
+        "benefits",
+        "training",
+        "other",
+        "gross_pay_per_head",
+        "benefits_per_head",
+        "training_per_head",
+        "other_per_head",
+        "currency",
+    ]
+
+    if df is None or df.empty:
+        empty = pd.DataFrame(columns=required_columns)
+        for column in ("headcount", "gross_pay", "benefits", "training", "other", "gross_pay_per_head", "benefits_per_head", "training_per_head", "other_per_head"):
+            empty[column] = empty[column].astype(float)
+        return empty
+
+    result = df.copy()
+    for column in required_columns:
+        if column not in result.columns:
+            result[column] = np.nan
+
+    # Ensure textual columns carry sensible defaults while numeric fields are coerced
+    result["dept"] = result["dept"].astype(str).where(result["dept"].notna(), "Unassigned")
+    result["currency"] = result["currency"].astype(str).where(result["currency"].notna(), DEFAULTS["global"].get("base_currency", "USD"))
+
+    headcount = pd.to_numeric(result["headcount"], errors="coerce")
+    result["headcount"] = headcount.fillna(0.0)
+
+    pairs = (
+        ("gross_pay", "gross_pay_per_head"),
+        ("benefits", "benefits_per_head"),
+        ("training", "training_per_head"),
+        ("other", "other_per_head"),
+    )
+
+    for total_col, per_head_col in pairs:
+        total_series = pd.to_numeric(result[total_col], errors="coerce")
+        per_head_series = pd.to_numeric(result[per_head_col], errors="coerce")
+
+        # Compute totals from per-head values whenever available
+        mask_per_head = per_head_series.notna() & headcount.notna()
+        if mask_per_head.any():
+            total_series.loc[mask_per_head] = (
+                per_head_series.loc[mask_per_head].fillna(0.0)
+                * headcount.loc[mask_per_head].fillna(0.0)
+            ).values
+
+        # Derive per-head figures from totals where missing and headcount is positive
+        mask_total = total_series.notna() & headcount.notna() & (headcount != 0)
+        if mask_total.any():
+            per_head_series.loc[mask_total] = (
+                total_series.loc[mask_total] / headcount.loc[mask_total]
+            ).values
+
+        result[total_col] = total_series.fillna(0.0)
+        result[per_head_col] = per_head_series.fillna(0.0)
+
+    return result[required_columns]
 ###############################################################################
 # Section 3: Input tables and CRUD helpers
 ###############################################################################
@@ -910,6 +978,7 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "currency": "str",
         },
         defaults={"currency": "USD", "gross_pay_per_head": 0.0, "benefits_per_head": 0.0, "training_per_head": 0.0, "other_per_head": 0.0},
+        derived=_derive_staff_costs,
     ),
     "other_opex_monthly": TableSchema(
         columns={"date": "str", "category": "str", "amount": "float", "currency": "str"},
@@ -2031,29 +2100,10 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     if "headcount" not in staff_costs.columns:
         staff_costs["headcount"] = 0.0
 
-    for col in ("gross_pay", "benefits", "training", "other", "headcount"):
-        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce")
+    staff_costs = _derive_staff_costs(staff_costs)
 
     headcount_series = staff_costs["headcount"].fillna(0.0)
     cost_components = ("gross_pay", "benefits", "training", "other")
-    for col in cost_components:
-        per_head_col = f"{col}_per_head"
-        if per_head_col in staff_costs.columns:
-            per_head_values = pd.to_numeric(
-                staff_costs[per_head_col], errors="coerce"
-            )
-        else:
-            per_head_values = pd.Series(np.nan, index=staff_costs.index)
-        staff_costs[per_head_col] = per_head_values
-
-        totals = pd.to_numeric(staff_costs[col], errors="coerce")
-        totals = totals.fillna(0.0)
-        computed_totals = per_head_values.fillna(0.0) * headcount_series
-        use_per_head = per_head_values.notna() & (
-            (per_head_values != 0) | (totals == 0)
-        )
-        staff_costs[col] = np.where(use_per_head, computed_totals, totals)
-        staff_costs[col] = pd.to_numeric(staff_costs[col], errors="coerce").fillna(0.0)
 
     staff_costs_detail = (
         staff_costs.groupby(["date", "dept", "currency"], dropna=False)[
