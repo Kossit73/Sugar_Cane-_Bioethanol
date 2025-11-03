@@ -48,10 +48,23 @@ from typing import (
 )
 from xml.sax.saxutils import escape as xml_escape
 
+from dependencies import ensure_package, get_package_error
+
+MATPLOTLIB_IMPORT_ERROR: Optional[str] = None
 try:
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:  # pragma: no cover - optional dependency in testing env
-    plt = None
+    if ensure_package("matplotlib"):
+        try:
+            import matplotlib.pyplot as plt  # type: ignore  # noqa: F401
+        except Exception as exc:  # pragma: no cover - secondary failure after install
+            MATPLOTLIB_IMPORT_ERROR = str(exc)
+            plt = None
+    else:
+        MATPLOTLIB_IMPORT_ERROR = get_package_error("matplotlib")
+        plt = None
+else:
+    MATPLOTLIB_IMPORT_ERROR = None
 import numpy as np
 import pandas as pd
 

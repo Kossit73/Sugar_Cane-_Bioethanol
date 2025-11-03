@@ -26,12 +26,39 @@ import streamlit as st
 from streamlit.errors import StreamlitAPIException
 from pandas.testing import assert_frame_equal
 
+from dependencies import ensure_package, get_package_error
+
+MATPLOTLIB_INSTALL_ERROR: Optional[str] = None
 try:  # Matplotlib is optional but required for chart rendering
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
-except Exception:  # pragma: no cover - runtime fallback when matplotlib missing
-    plt = None
-    mdates = None
+except ModuleNotFoundError:
+    if ensure_package("matplotlib"):
+        try:
+            import matplotlib.pyplot as plt  # type: ignore  # noqa: F401
+            import matplotlib.dates as mdates  # type: ignore  # noqa: F401
+        except Exception as exc:  # pragma: no cover - secondary failure after install
+            MATPLOTLIB_INSTALL_ERROR = str(exc)
+            plt = None
+            mdates = None
+    else:
+        MATPLOTLIB_INSTALL_ERROR = get_package_error("matplotlib")
+        plt = None
+        mdates = None
+else:
+    MATPLOTLIB_INSTALL_ERROR = None
+
+PLOTLY_INSTALL_ERROR: Optional[str] = None
+try:
+    import plotly  # type: ignore  # noqa: F401
+except ModuleNotFoundError:
+    if ensure_package("plotly"):
+        try:
+            import plotly  # type: ignore  # noqa: F401
+        except Exception as exc:  # pragma: no cover - import failed after install
+            PLOTLY_INSTALL_ERROR = str(exc)
+    else:
+        PLOTLY_INSTALL_ERROR = get_package_error("plotly")
 
 _MATPLOTLIB_WARNING_SHOWN = False
 
@@ -365,14 +392,41 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
 def _ensure_matplotlib() -> bool:
     """Return True when matplotlib is available, showing guidance otherwise."""
 
-    global _MATPLOTLIB_WARNING_SHOWN
+    global _MATPLOTLIB_WARNING_SHOWN, MATPLOTLIB_INSTALL_ERROR, plt, mdates
+
+    if plt is None:
+        try:
+            import matplotlib.pyplot as _plt  # type: ignore
+            import matplotlib.dates as _mdates  # type: ignore
+        except ModuleNotFoundError:
+            if ensure_package("matplotlib"):
+                try:
+                    import matplotlib.pyplot as _plt  # type: ignore
+                    import matplotlib.dates as _mdates  # type: ignore
+                except Exception as exc:  # pragma: no cover - import failed post-install
+                    MATPLOTLIB_INSTALL_ERROR = str(exc)
+                else:
+                    plt = _plt
+                    mdates = _mdates
+                    MATPLOTLIB_INSTALL_ERROR = None
+                    return True
+            else:
+                MATPLOTLIB_INSTALL_ERROR = get_package_error("matplotlib")
+        else:
+            plt = _plt
+            mdates = _mdates
+            MATPLOTLIB_INSTALL_ERROR = None
+            return True
 
     if plt is None:
         if not _MATPLOTLIB_WARNING_SHOWN:
-            st.info(
+            message = (
                 "Matplotlib is required to display charts. Install it with "
                 "`pip install matplotlib` and reload the app."
             )
+            if MATPLOTLIB_INSTALL_ERROR:
+                message += f"\nLast installation attempt: {MATPLOTLIB_INSTALL_ERROR}"
+            st.info(message)
             _MATPLOTLIB_WARNING_SHOWN = True
         return False
     return True
@@ -2512,6 +2566,21 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    if PLOTLY_INSTALL_ERROR:
+        st.warning(
+            "Plotly is optional but enables interactive visuals. "
+            f"Installation attempt failed: {PLOTLY_INSTALL_ERROR}",
+            icon="⚠️",
+        )
+
+    if MATPLOTLIB_INSTALL_ERROR and plt is None:
+        st.info(
+            "Matplotlib charts will use Streamlit fallbacks until the library is "
+            "installed. Last attempt: "
+            f"{MATPLOTLIB_INSTALL_ERROR}",
+            icon="ℹ️",
+        )
 
     if MODEL_IMPORT_ERROR is not None:
         st.error(
