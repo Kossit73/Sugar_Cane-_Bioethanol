@@ -85,6 +85,21 @@ def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     st.session_state.pop(f"editor_{table_name}", None)
 
 
+def _total_capex_from_inputs(tables: "InputTables") -> float:
+    """Return the aggregate CAPEX amount from the current input schedule."""
+
+    try:
+        capex_df = tables.ensure_table("capex_lines").copy()
+    except KeyError:  # pragma: no cover - defensive guard if schema missing
+        return 0.0
+
+    if capex_df.empty:
+        return 0.0
+
+    amounts = pd.to_numeric(capex_df.get("amount"), errors="coerce").fillna(0.0)
+    return float(amounts.sum())
+
+
 def _option_index(options: Sequence[str], value: str, default: int = 0) -> int:
     """Return the index of ``value`` inside ``options`` with a safe fallback."""
 
@@ -2253,6 +2268,42 @@ def _render_table_editor(
     st.session_state.pop(f"editor_{table_name}", None)
 
     display_df = df.copy()
+    effective_column_config: Dict[str, object] = dict(column_config) if column_config else {}
+
+    if table_name == "debt_tranches":
+        total_capex = _total_capex_from_inputs(tables)
+        if "share" in display_df.columns:
+            share_series = pd.to_numeric(display_df["share"], errors="coerce").fillna(0.0)
+        else:
+            share_series = pd.Series(0.0, index=display_df.index)
+        display_df["share_amount"] = share_series * total_capex
+        if "share" in display_df.columns and "share_amount" in display_df.columns:
+            columns_order = list(display_df.columns)
+            share_idx = columns_order.index("share")
+            share_amount_idx = columns_order.index("share_amount")
+            if share_amount_idx != share_idx + 1:
+                columns_order.insert(share_idx + 1, columns_order.pop(share_amount_idx))
+                display_df = display_df[columns_order]
+        share_help = (
+            "Calculated debt amount based on the tranche share multiplied by the "
+            f"current total CAPEX ({total_capex:,.2f})."
+        )
+        effective_column_config.setdefault(
+            "share",
+            st.column_config.NumberColumn(
+                "Share",
+                min_value=0.0,
+                max_value=1.0,
+                format="%.4f",
+            ),
+        )
+        effective_column_config["share_amount"] = st.column_config.NumberColumn(
+            "Debt amount",
+            help=share_help,
+            format="%.2f",
+            disabled=True,
+        )
+
     if table_name == "monte_carlo_settings" and "variable" in display_df.columns:
         display_df["variable"] = display_df["variable"].map(MONTE_CARLO_VARIABLE_LABELS).fillna(
             display_df["variable"].astype(str)
@@ -2263,7 +2314,7 @@ def _render_table_editor(
         num_rows="dynamic",
         use_container_width=True,
         key=state_key,
-        column_config=column_config,
+        column_config=effective_column_config if effective_column_config else column_config,
     )
     if isinstance(editor, pd.DataFrame):
         editor_clean = editor.copy()
