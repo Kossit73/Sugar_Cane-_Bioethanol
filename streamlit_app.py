@@ -2329,6 +2329,14 @@ def _render_table_editor(
                 format="%.4f",
             ),
         )
+        effective_column_config.setdefault(
+            "start_year",
+            st.column_config.NumberColumn(
+                "Start year",
+                step=1,
+                format="%d",
+            ),
+        )
         effective_column_config["share_amount"] = st.column_config.NumberColumn(
             "Debt amount",
             help=share_help,

@@ -156,6 +156,7 @@ DEFAULTS = {
                 "currency": "USD",
                 "fx_curve": None,
                 "share": 0.6,
+                "start_year": 2025,
             }
         ]
     },
@@ -1094,12 +1095,14 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "currency": "str",
             "fx_curve": "str",
             "share": "float",
+            "start_year": "int",
         },
         defaults={
             "type": "term",
             "amortization": "straight",
             "currency": "USD",
             "share": 1.0,
+            "start_year": 2025,
         },
     ),
     "tax_schedule": TableSchema(
@@ -2013,7 +2016,22 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
         name = tranche.get("name", "Tranche")
         share = float(tranche.get("share", 1.0))
         principal_total = total_capex * share
+        start_year_value = _coerce_int(tranche.get("start_year"), monthly_index[0].year)
+        start_year_value = max(monthly_index[0].year, min(monthly_index[-1].year, start_year_value))
+        start_mask = monthly_index.year >= start_year_value
+        if start_mask.any():
+            loan_start_idx = int(np.argmax(start_mask))
+        else:  # pragma: no cover - defensive fallback
+            loan_start_idx = 0
         draw_curve = parse_draw_curve(tranche.get("draw_curve"), monthly_index)
+        if loan_start_idx > 0:
+            draw_curve = draw_curve.copy()
+            draw_curve.iloc[:loan_start_idx] = 0.0
+            total = draw_curve.sum()
+            if total <= 0:
+                draw_curve.iloc[loan_start_idx] = 1.0
+            else:
+                draw_curve = draw_curve / total
         draws = draw_curve * principal_total
         rate = float(tranche.get("interest_rate", cfg["debt"].get("global_rate", 0.1))) + float(tranche.get("base_rate", 0.0)) + float(tranche.get("margin", 0.0))
         tenor_years = max(0, _coerce_int(tranche.get("tenor_years"), 8))
@@ -2033,18 +2051,20 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
             balance += draw
             interest = balance * monthly_rate
             principal_payment = 0.0
-            year_index = i // 12
-            if year_index >= grace_years:
+            months_since_start = max(0, i - loan_start_idx)
+            years_since_start = months_since_start // 12
+            if years_since_start >= grace_years and tenor_years > 0:
                 if amortization == "annuity":
                     if annuity_payment is None:
                         n = tenor_years * 12
                         if monthly_rate == 0:
                             annuity_payment = principal_total / n
                         else:
-                            annuity_payment = principal_total * (monthly_rate * (1 + monthly_rate) ** n) / ((1 + monthly_rate) ** n - 1)
+                            factor = (1 + monthly_rate) ** n
+                            annuity_payment = principal_total * (monthly_rate * factor) / max(1e-9, factor - 1)
                     principal_payment = max(0.0, annuity_payment - interest)
                 else:
-                    principal_payment = principal_total / (tenor_years * 12)
+                    principal_payment = principal_total / max(1, tenor_years * 12)
                 principal_payment = min(principal_payment, balance)
                 balance -= principal_payment
             else:
