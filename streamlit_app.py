@@ -2218,6 +2218,24 @@ def _render_table_editor(
                             key=f"add_row_{table_name}_{col_name}",
                         )
 
+                share_amount_key: Optional[str] = None
+                share_amount_value: Optional[str] = None
+                if table_name == "debt_tranches":
+                    share_amount_key = f"add_row_{table_name}_share_amount"
+                    total_capex = _total_capex_from_inputs(tables)
+                    share_amount_help = (
+                        "Optional: enter the tranche debt amount to derive the share automatically. "
+                        f"Current total CAPEX = {total_capex:,.2f}."
+                        if total_capex > 0
+                        else "Enter the tranche share directly or populate CAPEX to derive it from an amount."
+                    )
+                    share_amount_value = st.text_input(
+                        "Debt amount (optional)",
+                        value="",
+                        help=share_amount_help,
+                        key=share_amount_key,
+                    )
+
                 submit_col, cancel_col = st.columns(2)
                 submitted = submit_col.form_submit_button("Save row", use_container_width=True)
                 cancelled = cancel_col.form_submit_button("Cancel", use_container_width=True, type="secondary")
@@ -2226,6 +2244,8 @@ def _render_table_editor(
                 st.session_state.pop(add_modal_key, None)
                 for col_name, _ in schema_columns:
                     st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
+                if share_amount_key is not None:
+                    st.session_state.pop(share_amount_key, None)
                 _safe_rerun()
             elif submitted:
                 try:
@@ -2233,6 +2253,16 @@ def _render_table_editor(
                     for col_name, dtype in schema_columns:
                         widget_value = form_values[col_name]
                         row_payload[col_name] = _parse_modal_entry(widget_value, dtype)
+                    if table_name == "debt_tranches" and share_amount_key is not None:
+                        share_amount_raw = (share_amount_value or "").strip()
+                        if share_amount_raw:
+                            amount_value = _parse_modal_entry(share_amount_raw, "float")
+                            total_capex = _total_capex_from_inputs(tables)
+                            if total_capex <= 0:
+                                raise ValueError(
+                                    "Populate the CAPEX schedule before deriving a debt amount."
+                                )
+                            row_payload["share"] = float(amount_value) / float(total_capex)
                     tables.add_row(table_name, row_payload)
                 except Exception as exc:
                     st.error(f"Unable to add row: {exc}")
@@ -2244,6 +2274,8 @@ def _render_table_editor(
                     st.session_state.pop(add_modal_key, None)
                     for col_name, _ in schema_columns:
                         st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
+                    if share_amount_key is not None:
+                        st.session_state.pop(share_amount_key, None)
                     _update_editor_state(table_name, tables)
                     _safe_rerun()
 
