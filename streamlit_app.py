@@ -28,37 +28,19 @@ from pandas.testing import assert_frame_equal
 
 from dependencies import ensure_package, get_package_error
 
-MATPLOTLIB_INSTALL_ERROR: Optional[str] = None
-try:  # Matplotlib is optional but required for chart rendering
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-except ModuleNotFoundError:
-    if ensure_package("matplotlib"):
-        try:
-            import matplotlib.pyplot as plt  # type: ignore  # noqa: F401
-            import matplotlib.dates as mdates  # type: ignore  # noqa: F401
-        except Exception as exc:  # pragma: no cover - secondary failure after install
-            MATPLOTLIB_INSTALL_ERROR = str(exc)
-            plt = None
-            mdates = None
-    else:
-        MATPLOTLIB_INSTALL_ERROR = get_package_error("matplotlib")
+MATPLOTLIB_INSTALL_ERROR: Optional[str]
+if ensure_package("matplotlib"):
+    try:  # pragma: no cover - optional dependency
+        import matplotlib.dates as mdates
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - unexpected import failure
+        MATPLOTLIB_INSTALL_ERROR = str(exc)
         plt = None
         mdates = None
 else:
-    MATPLOTLIB_INSTALL_ERROR = None
-
-PLOTLY_INSTALL_ERROR: Optional[str] = None
-try:
-    import plotly  # type: ignore  # noqa: F401
-except ModuleNotFoundError:
-    if ensure_package("plotly"):
-        try:
-            import plotly  # type: ignore  # noqa: F401
-        except Exception as exc:  # pragma: no cover - import failed after install
-            PLOTLY_INSTALL_ERROR = str(exc)
-    else:
-        PLOTLY_INSTALL_ERROR = get_package_error("plotly")
+    MATPLOTLIB_INSTALL_ERROR = get_package_error("matplotlib")
+    plt = None
+    mdates = None
 
 _MATPLOTLIB_WARNING_SHOWN = False
 
@@ -395,30 +377,6 @@ def _ensure_matplotlib() -> bool:
     global _MATPLOTLIB_WARNING_SHOWN, MATPLOTLIB_INSTALL_ERROR, plt, mdates
 
     if plt is None:
-        try:
-            import matplotlib.pyplot as _plt  # type: ignore
-            import matplotlib.dates as _mdates  # type: ignore
-        except ModuleNotFoundError:
-            if ensure_package("matplotlib"):
-                try:
-                    import matplotlib.pyplot as _plt  # type: ignore
-                    import matplotlib.dates as _mdates  # type: ignore
-                except Exception as exc:  # pragma: no cover - import failed post-install
-                    MATPLOTLIB_INSTALL_ERROR = str(exc)
-                else:
-                    plt = _plt
-                    mdates = _mdates
-                    MATPLOTLIB_INSTALL_ERROR = None
-                    return True
-            else:
-                MATPLOTLIB_INSTALL_ERROR = get_package_error("matplotlib")
-        else:
-            plt = _plt
-            mdates = _mdates
-            MATPLOTLIB_INSTALL_ERROR = None
-            return True
-
-    if plt is None:
         if not _MATPLOTLIB_WARNING_SHOWN:
             message = (
                 "Matplotlib is required to display charts. Install it with "
@@ -449,9 +407,6 @@ def _render_horizon_timeline_chart(
     horizon: Mapping[str, object],
     production_horizon: Mapping[str, object],
 ) -> None:
-    if not _ensure_matplotlib():
-        return
-
     try:
         proj_start = pd.Timestamp(
             year=int(horizon.get("start_year", 0) or 0),
@@ -474,6 +429,19 @@ def _render_horizon_timeline_chart(
         ("Projection horizon", proj_start, proj_end, "#1f77b4"),
         ("Production horizon", prod_start, prod_end, "#2ca02c"),
     ]
+
+    summary = pd.DataFrame(
+        {
+            "Horizon": [label for label, *_ in bars],
+            "Start": [start.date() for _, start, _, _ in bars],
+            "End": [end.date() for _, _, end, _ in bars],
+            "Duration (years)": [max((end - start).days / 365.0, 0.0) for _, start, end, _ in bars],
+        }
+    )
+
+    if not _ensure_matplotlib():
+        st.dataframe(summary, hide_index=True, use_container_width=True)
+        return
 
     fig, ax = plt.subplots(figsize=(8, 2.6))
     yticks: List[int] = []
@@ -512,13 +480,18 @@ def _render_stacked_columns(
     title: str,
     ylabel: str = "Value",
 ) -> None:
-    if not _ensure_matplotlib() or df.empty:
-        if df.empty:
-            st.info(f"No data available for {title.lower()}.")
+    if df.empty:
+        st.info(f"No data available for {title.lower()}.")
         return
 
     data = df.copy()
     data = data[[x_col, *value_cols]].fillna(0.0)
+
+    if plt is None or not _ensure_matplotlib():
+        chart_data = data.set_index(x_col)[list(value_cols)]
+        st.bar_chart(chart_data, use_container_width=True)
+        return
+
     x_labels = data[x_col].astype(str).tolist()
     bottom = np.zeros(len(data))
 
@@ -545,17 +518,19 @@ def _render_line_chart(
     ylabel: str = "Value",
     secondary: Optional[str] = None,
 ) -> None:
-    if not _ensure_matplotlib() or df.empty:
-        if df.empty:
-            st.info(f"No data available for {title.lower()}.")
-        return
-
     data = df.copy()
     data[x_col] = pd.to_datetime(data[x_col], errors="coerce")
     data = data.dropna(subset=[x_col])
     data = data.sort_values(x_col)
     if data.empty:
         st.info(f"No valid dates available for {title.lower()}.")
+        return
+
+    if plt is None or not _ensure_matplotlib():
+        chart_df = data.set_index(x_col)[list(value_cols)].astype(float)
+        st.line_chart(chart_df, use_container_width=True)
+        if secondary and secondary in data.columns:
+            st.line_chart(data.set_index(x_col)[[secondary]], use_container_width=True)
         return
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -589,10 +564,10 @@ def _render_area_chart(
     title: str,
     ylabel: str = "Value",
     invert_columns: Optional[Sequence[str]] = None,
+
 ) -> None:
-    if not _ensure_matplotlib() or df.empty:
-        if df.empty:
-            st.info(f"No data available for {title.lower()}.")
+    if df.empty:
+        st.info(f"No data available for {title.lower()}.")
         return
 
     invert_columns = tuple(invert_columns or [])
@@ -602,6 +577,14 @@ def _render_area_chart(
     data = data.sort_values(x_col)
     if data.empty:
         st.info(f"No valid dates available for {title.lower()}.")
+        return
+
+    if plt is None or not _ensure_matplotlib():
+        chart_df = data.set_index(x_col)[list(value_cols)].astype(float)
+        for col in invert_columns:
+            if col in chart_df.columns:
+                chart_df[col] = -chart_df[col]
+        st.area_chart(chart_df, use_container_width=True)
         return
 
     stack_values = []
@@ -632,9 +615,8 @@ def _render_grouped_bar_chart(
     title: str,
     ylabel: str = "Value",
 ) -> None:
-    if not _ensure_matplotlib() or df.empty:
-        if df.empty:
-            st.info(f"No data available for {title.lower()}.")
+    if df.empty:
+        st.info(f"No data available for {title.lower()}.")
         return
 
     categories = df[category_col].astype(str).tolist()
@@ -642,6 +624,11 @@ def _render_grouped_bar_chart(
     values = [df[col].astype(float).fillna(0.0).to_numpy() for col in metrics if col in df.columns]
     if not values:
         st.info(f"The required fields are missing for {title.lower()}.")
+        return
+
+    if plt is None or not _ensure_matplotlib():
+        chart_df = df.set_index(category_col)[metrics].fillna(0.0)
+        st.bar_chart(chart_df, use_container_width=True)
         return
 
     x = np.arange(len(categories))
@@ -671,14 +658,15 @@ def _render_scatter_chart(
     xlabel: str,
     ylabel: str,
 ) -> None:
-    if not _ensure_matplotlib() or df.empty:
-        if df.empty:
-            st.info(f"No data available for {title.lower()}.")
-        return
-
     data = df.dropna(subset=[x_col, y_col]).copy()
     if data.empty:
         st.info(f"Insufficient data to render {title.lower()}.")
+        return
+
+    if plt is None or not _ensure_matplotlib():
+        chart_df = data[[x_col, y_col]].astype(float)
+        chart_df[category_col] = data[category_col].astype(str)
+        st.scatter_chart(chart_df, x=x_col, y=y_col, color=category_col, use_container_width=True)
         return
 
     categories = data[category_col].astype(str).unique()
@@ -857,14 +845,26 @@ def _render_tornado_chart(df: pd.DataFrame) -> None:
 
 
 def _render_monte_carlo_histograms(samples: pd.DataFrame) -> None:
-    if not _ensure_matplotlib() or samples.empty:
-        if samples.empty:
-            st.info("Monte Carlo samples are empty.")
+    if samples.empty:
+        st.info("Monte Carlo samples are empty.")
         return
 
     metrics = [col for col in ("Project_NPV", "Equity_IRR", "Unit_Margin") if col in samples.columns]
     if not metrics:
         st.info("Monte Carlo outputs do not include the expected metrics.")
+        return
+
+    if plt is None or not _ensure_matplotlib():
+        for metric in metrics:
+            values = samples[metric].dropna()
+            if values.empty:
+                continue
+            counts, bins = np.histogram(values, bins=30)
+            hist_df = pd.DataFrame({
+                metric: counts,
+                "bin_start": bins[:-1],
+            }).set_index("bin_start")
+            st.bar_chart(hist_df, use_container_width=True)
         return
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 4))
@@ -890,7 +890,10 @@ def _render_decision_tree_chart(df: pd.DataFrame, objective: str) -> None:
         st.info("Decision tree produced no active paths.")
         return
 
-    if not _ensure_matplotlib():
+    if plt is None or not _ensure_matplotlib():
+        st.dataframe(data.rename(columns={"path_name": "Path"}), hide_index=True, use_container_width=True)
+        chart_df = data.set_index("path_name")["metric"].to_frame()
+        st.bar_chart(chart_df, use_container_width=True)
         return
 
     fig, ax1 = plt.subplots(figsize=(8, 4))
@@ -959,10 +962,14 @@ def _render_scenario_dscr_chart(results_map: Mapping[str, Mapping[str, object]])
         st.info("DSCR trends are unavailable for the selected scenarios.")
         return
     data = pd.concat(frames, ignore_index=True)
-    if not _ensure_matplotlib():
-        return
     data["date"] = pd.to_datetime(data["date"], errors="coerce")
     data = data.dropna(subset=["date"]).sort_values("date")
+
+    if plt is None or not _ensure_matplotlib():
+        chart_df = data.pivot_table(index="date", columns="scenario", values="DSCR")
+        st.line_chart(chart_df, use_container_width=True)
+        return
+
     fig, ax = plt.subplots(figsize=(8, 4))
     for scenario, group in data.groupby("scenario"):
         ax.plot(group["date"], group["DSCR"], label=scenario)
@@ -989,8 +996,11 @@ def _render_scenario_scatter_chart(results_map: Mapping[str, Mapping[str, object
         st.info("Revenue vs production data is unavailable for the selected scenarios.")
         return
     data = pd.concat(frames, ignore_index=True)
-    if not _ensure_matplotlib():
+    if plt is None or not _ensure_matplotlib():
+        chart_df = data.rename(columns={"scenario": "Scenario"})
+        st.scatter_chart(chart_df, x="volume", y="revenue", color="Scenario", use_container_width=True)
         return
+
     fig, ax = plt.subplots(figsize=(8, 4))
     for scenario, group in data.groupby("scenario"):
         ax.scatter(group["volume"], group["revenue"], label=scenario)
@@ -2566,13 +2576,6 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-    if PLOTLY_INSTALL_ERROR:
-        st.warning(
-            "Plotly is optional but enables interactive visuals. "
-            f"Installation attempt failed: {PLOTLY_INSTALL_ERROR}",
-            icon="⚠️",
-        )
 
     if MATPLOTLIB_INSTALL_ERROR and plt is None:
         st.info(

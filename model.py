@@ -10,8 +10,9 @@ comprehensive monthly project finance model for an integrated sugarcane complex 
 sugar, electricity, and animal feed. Outputs include monthly and annual financial statements, dashboard
 metrics, sensitivity and scenario analytics, and optional CSV/Excel exports.
 
-The implementation uses only pandas, numpy, matplotlib, and the Python standard library. No external
-services are required.
+The implementation relies on :mod:`pandas` and :mod:`numpy`, with optional chart
+generation via :mod:`matplotlib` when available. No external services are
+required.
 """
 
 from __future__ import annotations
@@ -50,21 +51,16 @@ from xml.sax.saxutils import escape as xml_escape
 
 from dependencies import ensure_package, get_package_error
 
-MATPLOTLIB_IMPORT_ERROR: Optional[str] = None
-try:
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError:  # pragma: no cover - optional dependency in testing env
-    if ensure_package("matplotlib"):
-        try:
-            import matplotlib.pyplot as plt  # type: ignore  # noqa: F401
-        except Exception as exc:  # pragma: no cover - secondary failure after install
-            MATPLOTLIB_IMPORT_ERROR = str(exc)
-            plt = None
-    else:
-        MATPLOTLIB_IMPORT_ERROR = get_package_error("matplotlib")
+MATPLOTLIB_IMPORT_ERROR: Optional[str]
+if ensure_package("matplotlib"):
+    try:  # pragma: no cover - optional dependency
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # pragma: no cover - matplotlib import failed unexpectedly
         plt = None
+        MATPLOTLIB_IMPORT_ERROR = str(exc)
 else:
-    MATPLOTLIB_IMPORT_ERROR = None
+    plt = None
+    MATPLOTLIB_IMPORT_ERROR = get_package_error("matplotlib")
 import numpy as np
 import pandas as pd
 

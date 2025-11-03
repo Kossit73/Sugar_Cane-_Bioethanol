@@ -1,20 +1,19 @@
-"""Utility helpers for ensuring optional third-party packages are available.
+"""Utility helpers for optional third-party dependencies.
 
-The model prefers to use matplotlib and plotly for chart generation. These
-packages may be absent in the execution environment, so this module provides
-lightweight wrappers that try to import the requested modules and, if that
-fails, attempt a best-effort installation via ``pip``. Results are cached to
-avoid repeatedly invoking the package manager on subsequent imports.
+The application prefers to use :mod:`matplotlib` (and optionally other plotting
+libraries) when available, but the execution environment may not permit network
+access to install them.  These helpers provide a tiny caching layer around
+import attempts so callers can determine whether a dependency is present and, if
+not, surface a clear message instructing the user to install it manually.
 
-The helpers are intentionally defensive: installation failures are captured and
-stored so the caller can surface user-friendly diagnostics without raising
-exceptions during normal execution.
+Unlike a traditional "auto-install" helper, this module intentionally **does not
+attempt to invoke ``pip``**.  Repeated installation attempts can be slow and are
+destined to fail in locked-down sandboxes, so we simply record the first import
+failure and reuse that information for subsequent checks.
 """
 from __future__ import annotations
 
 import importlib
-import subprocess
-import sys
 from typing import Dict, Mapping, Optional
 
 # Cache import/installation attempts so we only try once per interpreter run.
@@ -34,34 +33,16 @@ def _try_import(module_name: str) -> bool:
 
 
 def ensure_package(module_name: str, package_name: Optional[str] = None) -> bool:
-    """Ensure ``module_name`` can be imported, attempting ``pip install`` if
-    necessary.
+    """Return ``True`` if ``module_name`` can be imported.
 
-    Parameters
-    ----------
-    module_name:
-        Fully-qualified module name to import (e.g. ``"matplotlib"`` or
-        ``"matplotlib.pyplot"``).
-    package_name:
-        Optional pip package name to install if the import fails. Defaults to
-        the top-level portion of ``module_name``.
-
-    Returns
-    -------
-    bool
-        ``True`` when the module is available after the call, otherwise
-        ``False``. Installation errors are stored and retrievable via
-        :func:`get_package_error`.
+    When the import fails we remember the error message and instruct callers to
+    install the package manually.  Passing ``package_name`` allows the helper to
+    mention a friendlier distribution name (for example ``"matplotlib"`` instead
+    of ``"matplotlib.pyplot"``).
     """
 
     if module_name in _ATTEMPTS:
-        if _ATTEMPTS[module_name]:
-            return True
-        if _try_import(module_name):  # Allow re-checks after manual installations.
-            _ATTEMPTS[module_name] = True
-            _ERRORS.pop(module_name, None)
-            return True
-        return False
+        return _ATTEMPTS[module_name]
 
     if _try_import(module_name):
         _ATTEMPTS[module_name] = True
@@ -69,22 +50,10 @@ def ensure_package(module_name: str, package_name: Optional[str] = None) -> bool
         return True
 
     package = package_name or module_name.split(".")[0]
-    cmd = [sys.executable, "-m", "pip", "install", package]
-    try:  # pragma: no cover - relies on external tooling
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-    except Exception as exc:  # Capture the failure but do not raise.
-        _ATTEMPTS[module_name] = False
-        _ERRORS[module_name] = f"{cmd!r} failed: {exc}"
-        return False
-
-    if _try_import(module_name):
-        _ATTEMPTS[module_name] = True
-        _ERRORS.pop(module_name, None)
-        return True
-
     _ATTEMPTS[module_name] = False
     _ERRORS[module_name] = (
-        f"Package '{package}' was installed but importing '{module_name}' still failed"
+        f"Optional dependency '{package}' is not installed. Install it via 'pip install {package}' "
+        "and reload the application."
     )
     return False
 
