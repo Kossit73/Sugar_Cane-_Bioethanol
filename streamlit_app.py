@@ -1942,7 +1942,21 @@ def _apply_yearly_increment_monthly(
     if working.empty:
         raise ValueError("No valid dates detected in the current table.")
 
-    base_rows = working[working["__date_ts"].dt.year == int(base_year)].copy()
+    target_year = int(base_year)
+    available_years = (
+        working["__date_ts"].dt.year.dropna().astype(int).sort_values().unique().tolist()
+    )
+    if target_year not in available_years:
+        fallback_year = next((y for y in available_years if y >= target_year), None)
+        if fallback_year is None and available_years:
+            fallback_year = available_years[-1]
+        if fallback_year is None:
+            raise ValueError(
+                "No dated rows available to seed the yearly increment helper."
+            )
+        target_year = int(fallback_year)
+
+    base_rows = working[working["__date_ts"].dt.year == target_year].copy()
     if base_rows.empty:
         raise ValueError("No rows found for the selected base year. Update the table and try again.")
 
@@ -1951,13 +1965,13 @@ def _apply_yearly_increment_monthly(
             base_rows[column] = pd.to_numeric(base_rows[column], errors="coerce").fillna(0.0)
 
     template_sample = base_rows.iloc[0]["date"]
-    years = [year for year in timeline.annual_index() if year >= int(base_year)]
+    years = [year for year in timeline.annual_index() if year >= target_year]
     if not years:
         raise ValueError("Projection horizon does not extend beyond the selected base year.")
 
     generated_rows: List[Dict[str, object]] = []
     for year in years:
-        offset = year - int(base_year)
+        offset = year - target_year
         for _, row in base_rows.iterrows():
             new_row = row.copy()
             new_date = row["__date_ts"].replace(year=int(year))
