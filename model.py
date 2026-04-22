@@ -331,6 +331,7 @@ DEFAULTS = {
                 "scenario_name": "FARM_ONLY",
                 "feedstock_scenario": "FARM_ONLY",
                 "farm_share": 1.0,
+                "increment_profile": "base",
                 "notes": "All feedstock grown internally",
             },
             {
@@ -338,6 +339,7 @@ DEFAULTS = {
                 "scenario_name": "BUY_ONLY",
                 "feedstock_scenario": "BUY_ONLY",
                 "farm_share": 0.0,
+                "increment_profile": "base",
                 "notes": "All feedstock purchased from market",
             },
             {
@@ -345,6 +347,7 @@ DEFAULTS = {
                 "scenario_name": "HYBRID",
                 "feedstock_scenario": "HYBRID",
                 "farm_share": 0.5,
+                "increment_profile": "base",
                 "notes": "Blend of internal farming and market purchases",
             },
         ]
@@ -519,6 +522,7 @@ DEFAULTS = {
             {
                 "enabled": True,
                 "case_name": "Base case (P50)",
+                "increment_profile": "base",
                 "production_multiplier": 1.0,
                 "price_multiplier": 1.0,
                 "opex_multiplier": 1.0,
@@ -529,6 +533,7 @@ DEFAULTS = {
             {
                 "enabled": True,
                 "case_name": "Downside case (P90-like)",
+                "increment_profile": "downside",
                 "production_multiplier": 0.9,
                 "price_multiplier": 0.9,
                 "opex_multiplier": 1.1,
@@ -539,6 +544,7 @@ DEFAULTS = {
             {
                 "enabled": True,
                 "case_name": "Break case",
+                "increment_profile": "break",
                 "production_multiplier": 0.8,
                 "price_multiplier": 0.82,
                 "opex_multiplier": 1.2,
@@ -550,9 +556,11 @@ DEFAULTS = {
     ),
     "yearly_increments": pd.DataFrame(
         [
-            {"year": 2025, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
-            {"year": 2026, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
-            {"year": 2027, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"profile": "base", "year": 2025, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"profile": "base", "year": 2026, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"profile": "base", "year": 2027, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"profile": "downside", "year": 2025, "global_increment_pct": 0.0, "price_increment_pct": -0.01, "opex_increment_pct": 0.01, "debt_increment_pct": 0.005, "capex_increment_pct": 0.01, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"profile": "break", "year": 2025, "global_increment_pct": 0.0, "price_increment_pct": -0.02, "opex_increment_pct": 0.02, "debt_increment_pct": 0.01, "capex_increment_pct": 0.02, "wc_increment_pct": 0.01, "tax_increment_pct": 0.0},
         ]
     ),
 }
@@ -1278,12 +1286,14 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "scenario_name": "str",
             "feedstock_scenario": "str",
             "farm_share": "float",
+            "increment_profile": "str",
             "notes": "str",
         },
         defaults={
             "enabled": True,
             "feedstock_scenario": "HYBRID",
             "farm_share": 0.5,
+            "increment_profile": "base",
             "notes": "",
         },
     ),
@@ -1434,6 +1444,7 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         columns={
             "enabled": "bool",
             "case_name": "str",
+            "increment_profile": "str",
             "production_multiplier": "float",
             "price_multiplier": "float",
             "opex_multiplier": "float",
@@ -1441,10 +1452,11 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "delay_months": "int",
             "debt_rate_shift": "float",
         },
-        defaults={"enabled": True, "production_multiplier": 1.0, "price_multiplier": 1.0, "opex_multiplier": 1.0, "capex_multiplier": 1.0, "delay_months": 0, "debt_rate_shift": 0.0},
+        defaults={"enabled": True, "increment_profile": "base", "production_multiplier": 1.0, "price_multiplier": 1.0, "opex_multiplier": 1.0, "capex_multiplier": 1.0, "delay_months": 0, "debt_rate_shift": 0.0},
     ),
     "yearly_increments": TableSchema(
         columns={
+            "profile": "str",
             "year": "int",
             "global_increment_pct": "float",
             "price_increment_pct": "float",
@@ -1455,6 +1467,7 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "tax_increment_pct": "float",
         },
         defaults={
+            "profile": "base",
             "global_increment_pct": 0.0,
             "price_increment_pct": 0.0,
             "opex_increment_pct": 0.0,
@@ -1594,6 +1607,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
     cfg = {
         "projection_horizon": dict(DEFAULTS["horizon"]),
         "production_horizon": dict(DEFAULTS["production_horizon"]),
+        "increment_profile": "base",
         "global_inputs": dict(DEFAULTS["global"]),
         "prices": {k: dict(v) for k, v in DEFAULTS["prices"].items()},
         "production": dict(DEFAULTS["production"]),
@@ -1648,6 +1662,8 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             cfg["debt"]["target_ratio"] = _coerce_float(value, 0.6)
         elif key in {"debt_rate", "interest_rate"}:
             cfg["debt"].setdefault("global_rate", _coerce_float(value, 0.1))
+        elif key in {"increment_profile", "yearly_increment_profile"}:
+            cfg["increment_profile"] = str(value)
 
     tables.ensure_table("projection_horizon")
     if not tables.tables["projection_horizon"].empty:
@@ -1802,6 +1818,13 @@ def build_yearly_increment_factors(cfg: Mapping[str, object], timeline: Timeline
         return pd.DataFrame({"date": monthly_index, **{col: 1.0 for col in columns}})
 
     inc = increments_df.copy()
+    profile_name = str(cfg.get("increment_profile", "base")).strip().lower()
+    if "profile" in inc.columns:
+        inc["profile"] = inc["profile"].astype(str).str.strip().str.lower()
+        selected = inc[inc["profile"] == profile_name]
+        if selected.empty:
+            selected = inc[inc["profile"] == "base"]
+        inc = selected if not selected.empty else inc
     if "year" not in inc.columns:
         return pd.DataFrame({"date": monthly_index, **{col: 1.0 for col in columns}})
     inc["year"] = pd.to_numeric(inc["year"], errors="coerce").fillna(0).astype(int)
@@ -1828,7 +1851,7 @@ def build_yearly_increment_factors(cfg: Mapping[str, object], timeline: Timeline
     monthly["year"] = monthly["date"].dt.year
     monthly = monthly.merge(inc[["year", *columns]], on="year", how="left").drop(columns=["year"])
     for col in columns:
-        monthly[col] = pd.to_numeric(monthly[col], errors="coerce").fillna(method="ffill").fillna(1.0)
+        monthly[col] = pd.to_numeric(monthly[col], errors="coerce").ffill().fillna(1.0)
     return monthly
 
 
@@ -1871,6 +1894,8 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
     production_factor = max(float(risk_profile.get("production", 1.0)), 0.0)
     yield_factor = max(float(risk_profile.get("yield", 1.0)), 0.0)
     scaling_factor = production_factor * yield_factor
+    risk_curve = get_increment_series(cfg, timeline, "global_factor")
+    yearly_risk_curve = risk_curve.groupby(risk_curve.index.year).mean()
 
     def _default_production_table() -> pd.DataFrame:
         base = DEFAULTS["production"]
@@ -2013,7 +2038,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     {
                         "year": year,
                         "product": row["product"],
-                        "volume": float(row["annual_volume"]) * float(ramp[idx]),
+                        "volume": float(row["annual_volume"]) * float(ramp[idx]) * float(yearly_risk_curve.get(year, 1.0)),
                         "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
                         "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
                     }
@@ -2059,7 +2084,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
                     {
                         "year": year,
                         "product": row["product"],
-                        "volume": float(row["annual_volume"]) * float(ramp[idx]),
+                        "volume": float(row["annual_volume"]) * float(ramp[idx]) * float(yearly_risk_curve.get(year, 1.0)),
                         "availability": row.get("availability", DEFAULTS["production"]["plant_availability"]),
                         "loss_factor": row.get("loss_factor", DEFAULTS["production"]["loss_factor"]),
                     }
@@ -2136,6 +2161,14 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
 
 
 def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFrame, price_curves: pd.DataFrame) -> pd.DataFrame:
+    timeline = Timeline(
+        start_year=int(cfg["projection_horizon"]["start_year"]),
+        end_year=int(cfg["projection_horizon"]["end_year"]),
+        start_month=int(cfg["projection_horizon"].get("start_month", 1)),
+    )
+    price_factor = get_increment_series(cfg, timeline, "price_factor")
+    opex_factor = get_increment_series(cfg, timeline, "opex_factor")
+    global_factor = get_increment_series(cfg, timeline, "global_factor")
     df = production_monthly.merge(price_curves, on=["date", "product"], how="left")
     df["price"].fillna(0.0, inplace=True)
     df["contracted_share"] = 0.0
@@ -2161,6 +2194,11 @@ def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFr
                 df[col] = df[term_col].where(df[term_col].notna(), df[col])
                 df.drop(columns=[term_col], inplace=True)
     contracted_price = df["price"].clip(lower=df["floor_price"].fillna(-np.inf), upper=df["collar_price"].fillna(np.inf))
+    date_values = pd.to_datetime(df["date"], errors="coerce")
+    price_scale = date_values.map(lambda d: float(price_factor.get(d, 1.0)) if pd.notna(d) else 1.0)
+    opex_scale = date_values.map(lambda d: float(opex_factor.get(d, 1.0)) if pd.notna(d) else 1.0)
+    global_scale = date_values.map(lambda d: float(global_factor.get(d, 1.0)) if pd.notna(d) else 1.0)
+    contracted_price = contracted_price * price_scale.values
     effective_price = (
         contracted_price * df["contracted_share"].fillna(0.0)
         + df["price"] * df["merchant_share"].fillna(1.0)
@@ -2168,7 +2206,8 @@ def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFr
     df["effective_price"] = effective_price
     df["contracted_volume"] = df["volume"] * df["contracted_share"].fillna(0.0)
     df["merchant_volume"] = df["volume"] * df["merchant_share"].fillna(1.0)
-    df["revenue"] = df["volume"] * df["effective_price"] * (1.0 - df["counterparty_haircut"].fillna(0.0).clip(lower=0.0))
+    haircut = (df["counterparty_haircut"].fillna(0.0) * global_scale.values).clip(lower=0.0, upper=0.95)
+    df["revenue"] = df["volume"] * df["effective_price"] * (1.0 - haircut)
     dispatch_df = cfg.get("dispatch_constraints")
     if isinstance(dispatch_df, pd.DataFrame) and not dispatch_df.empty:
         dispatch = dispatch_df.copy()
@@ -2178,7 +2217,8 @@ def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFr
         allowed_volume = df["volume"] * df["max_dispatch_share"].fillna(1.0)
         curtailed = np.where(constrained, np.maximum(df["volume"] - allowed_volume, 0.0), 0.0)
         df["curtailed_volume"] = curtailed
-        df["curtailment_penalty"] = df["curtailed_volume"] * df["curtailment_penalty_per_unit"].fillna(0.0)
+        penalty_rate = df["curtailment_penalty_per_unit"].fillna(0.0) * opex_scale.values
+        df["curtailment_penalty"] = df["curtailed_volume"] * penalty_rate
         df["revenue"] = np.where(constrained, allowed_volume * df["effective_price"] - df["curtailment_penalty"], df["revenue"])
     df["currency"] = cfg["global_inputs"].get("base_currency", "USD")
     risk_profile = cfg.get("risk_profile", {})
@@ -2431,6 +2471,7 @@ def build_debt_schedule(
         balances = []
         interests = []
         principals = []
+        fees = []
         services = []
         balance = 0.0
         annuity_payment = None
@@ -2443,6 +2484,7 @@ def build_debt_schedule(
             balance += draw
             interest = balance * monthly_rate_i
             principal_payment = 0.0
+            fee_payment = 0.0
             months_since_start = max(0, i - loan_start_idx)
             years_since_start = months_since_start // 12
             if years_since_start >= grace_years and tenor_years > 0:
@@ -2469,10 +2511,17 @@ def build_debt_schedule(
                     interest = 0.0
                 else:
                     balance += 0.0
+            if i == loan_start_idx:
+                upfront_raw = float(tranche.get("fees_upfront", 0.0) or 0.0)
+                fee_payment += principal_total * upfront_raw if abs(upfront_raw) <= 1.0 else upfront_raw
+            annual_fee_rate = float(tranche.get("fees_annual", 0.0) or 0.0)
+            if annual_fee_rate > 0:
+                fee_payment += balance * annual_fee_rate / 12.0
             balances.append(balance)
             interests.append(interest)
             principals.append(principal_payment)
-            services.append(interest + principal_payment)
+            fees.append(fee_payment)
+            services.append(interest + principal_payment + fee_payment)
         schedule_frames.append(
             pd.DataFrame(
                 {
@@ -2481,6 +2530,7 @@ def build_debt_schedule(
                     "draw": draws.values,
                     "interest": interests,
                     "principal": principals,
+                    "fees": fees,
                     "debt_service": services,
                     "balance": balances,
                 }
@@ -2489,7 +2539,7 @@ def build_debt_schedule(
     if schedule_frames:
         schedule = pd.concat(schedule_frames, ignore_index=True)
     else:
-        schedule = pd.DataFrame({"date": monthly_index, "tranche": [], "draw": [], "interest": [], "principal": [], "debt_service": [], "balance": []})
+        schedule = pd.DataFrame({"date": monthly_index, "tranche": [], "draw": [], "interest": [], "principal": [], "fees": [], "debt_service": [], "balance": []})
     return schedule
 ###############################################################################
 # Section 10: Working capital and tax
@@ -2857,9 +2907,11 @@ def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, obj
     cashflow = statements["cashflow"].copy()
     pnl = statements["pnl"].copy()
     monthly_index = timeline.monthly_index()
-    discount_rate = cfg["global_inputs"].get("discount_rate", DEFAULTS["global"]["discount_rate"])
-    monthly_rate = (1 + discount_rate) ** (1 / 12) - 1
-    discount_factors = (1 + monthly_rate) ** np.arange(len(monthly_index))
+    base_discount_rate = float(cfg["global_inputs"].get("discount_rate", DEFAULTS["global"]["discount_rate"]))
+    wacc_factor = get_increment_series(cfg, timeline, "global_factor")
+    annual_discount_curve = np.maximum(base_discount_rate * wacc_factor.reindex(monthly_index, fill_value=1.0).values, 0.0)
+    monthly_rate_curve = np.power(1 + annual_discount_curve, 1 / 12) - 1
+    discount_factors = np.cumprod(1 + monthly_rate_curve)
     fcf = cashflow["NetCashFlow"].values
     project_npv = np.sum(fcf / discount_factors)
 
@@ -2915,6 +2967,9 @@ def evaluate_credit_and_waterfall(
     case_name: str = "base",
 ) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
+    global_factor = get_increment_series(cfg, timeline, "global_factor")
+    wc_factor = get_increment_series(cfg, timeline, "wc_factor")
+    debt_factor = get_increment_series(cfg, timeline, "debt_factor")
     cashflow = statements.get("cashflow", pd.DataFrame()).copy()
     if cashflow.empty or "date" not in cashflow.columns:
         empty = pd.DataFrame()
@@ -2972,6 +3027,8 @@ def evaluate_credit_and_waterfall(
                 if pd.notna(row.get(key)):
                     threshold_frame.loc[mask, key] = float(row.get(key))
     dscr_df = dscr_df.merge(threshold_frame, on="date", how="left")
+    for col in ("adsc_min", "dscr_lockup", "dscr_default", "llcr_min"):
+        dscr_df[col] = pd.to_numeric(dscr_df[col], errors="coerce").fillna(0.0) * global_factor.reindex(monthly_index, fill_value=1.0).values
     dscr_df["lockup_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_lockup"]
     dscr_df["default_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_default"]
     dscr_df["llcr_breach"] = dscr_df["LLCR"] < dscr_df["llcr_min"]
@@ -2980,22 +3037,28 @@ def evaluate_credit_and_waterfall(
     reserve_row = reserve_cfg.iloc[0] if isinstance(reserve_cfg, pd.DataFrame) and not reserve_cfg.empty else {}
     sweep_pct = float(reserve_row.get("sweep_pct", 0.0) or 0.0)
     sweep_trigger = float(reserve_row.get("sweep_dscr_trigger", 1.25) or 1.25)
-    dsra_months = float(reserve_row.get("dsra_months", 6.0) or 0.0)
-    mmra_monthly = float(reserve_row.get("mmra_monthly", 0.0) or 0.0)
-    restricted_cash_min = float(reserve_row.get("restricted_cash_min", 0.0) or 0.0)
-    wc_limit = float(reserve_row.get("wc_facility_limit", 0.0) or 0.0)
-    wc_rate = float(reserve_row.get("wc_facility_rate", 0.0) or 0.0)
+    dsra_months_base = float(reserve_row.get("dsra_months", 6.0) or 0.0)
+    mmra_monthly_base = float(reserve_row.get("mmra_monthly", 0.0) or 0.0)
+    restricted_cash_min_base = float(reserve_row.get("restricted_cash_min", 0.0) or 0.0)
+    wc_limit_base = float(reserve_row.get("wc_facility_limit", 0.0) or 0.0)
+    wc_rate_base = float(reserve_row.get("wc_facility_rate", 0.0) or 0.0)
+    dsra_months_series = dsra_months_base * wc_factor
+    mmra_monthly_series = mmra_monthly_base * wc_factor
+    restricted_cash_min_series = restricted_cash_min_base * wc_factor
+    wc_limit_series = wc_limit_base * wc_factor
+    wc_rate_series = wc_rate_base * debt_factor
+    sweep_trigger_series = sweep_trigger * global_factor
     rolling_ds = debt_monthly["debt_service"].rolling(12, min_periods=1).mean()
-    dsra_target = rolling_ds * dsra_months
-    sweep_amount = np.where(dscr_df["DSCR"].fillna(0.0) >= sweep_trigger, np.maximum(cfads.values - debt_monthly["debt_service"].values, 0.0) * sweep_pct, 0.0)
-    mmra_balance = np.cumsum(np.full(len(monthly_index), mmra_monthly))
+    dsra_target = rolling_ds * dsra_months_series.values
+    sweep_amount = np.where(dscr_df["DSCR"].fillna(0.0) >= sweep_trigger_series.values, np.maximum(cfads.values - debt_monthly["debt_service"].values, 0.0) * sweep_pct, 0.0)
+    mmra_balance = np.cumsum(mmra_monthly_series.values)
     dsra_funding = np.maximum(dsra_target.values - np.concatenate([[0.0], dsra_target.values[:-1]]), 0.0)
-    restricted_cash = np.maximum(dsra_target.values + mmra_balance, restricted_cash_min)
-    wc_draw = np.minimum(np.maximum(-project_cf.values, 0.0), wc_limit)
-    wc_interest = wc_draw * wc_rate / 12.0
-    distributable = np.maximum(cfads.values - debt_monthly["debt_service"].values - dsra_funding - mmra_monthly - sweep_amount - wc_interest, 0.0)
+    restricted_cash = np.maximum(dsra_target.values + mmra_balance, restricted_cash_min_series.values)
+    wc_draw = np.minimum(np.maximum(-project_cf.values, 0.0), wc_limit_series.values)
+    wc_interest = wc_draw * wc_rate_series.values / 12.0
+    distributable = np.maximum(cfads.values - debt_monthly["debt_service"].values - dsra_funding - mmra_monthly_series.values - sweep_amount - wc_interest, 0.0)
     distributable = np.where(dscr_df["lockup_triggered"], 0.0, distributable)
-    cash_waterfall = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "dsra_target": dsra_target.values, "dsra_funding": dsra_funding, "mmra_contribution": mmra_monthly, "cash_sweep": sweep_amount, "wc_facility_draw": wc_draw, "wc_facility_interest": wc_interest, "restricted_cash": restricted_cash, "distributable_cash": distributable})
+    cash_waterfall = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "dsra_target": dsra_target.values, "dsra_funding": dsra_funding, "mmra_contribution": mmra_monthly_series.values, "cash_sweep": sweep_amount, "wc_facility_draw": wc_draw, "wc_facility_interest": wc_interest, "restricted_cash": restricted_cash, "distributable_cash": distributable})
 
     completion_table = cfg.get("completion_tests")
     completion_rows: List[Dict[str, object]] = []
@@ -3149,14 +3212,15 @@ def build_dashboard(
         debt_local["date"] = pd.to_datetime(debt_local["date"], errors="coerce")
         debt_local = debt_local.dropna(subset=["date"])
         debt_summary = (
-            debt_local.groupby("date")[["interest", "principal", "debt_service", "draw"]]
+            debt_local.groupby("date")[[col for col in ["interest", "principal", "fees", "debt_service", "draw"] if col in debt_local.columns]]
             .sum()
             .reset_index()
             .sort_values("date")
         )
         if not cashflow.empty:
             dscr_df = cashflow.merge(debt_summary, on="date", how="left")
-            dscr_df[["interest", "principal", "debt_service"]] = dscr_df[["interest", "principal", "debt_service"]].fillna(0.0)
+            fill_cols = [col for col in ["interest", "principal", "fees", "debt_service"] if col in dscr_df.columns]
+            dscr_df[fill_cols] = dscr_df[fill_cols].fillna(0.0)
             dscr_df["CFADS"] = dscr_df["CFO"] + dscr_df["interest"]
             dscr_df["DSCR"] = np.where(
                 dscr_df["debt_service"].abs() > 1e-9,
@@ -3169,9 +3233,8 @@ def build_dashboard(
     debt_service_annual = pd.DataFrame()
     if not debt_summary.empty:
         debt_summary["year"] = debt_summary["date"].dt.year
-        debt_service_annual = (
-            debt_summary.groupby("year")[["interest", "principal", "debt_service", "draw"]].sum().reset_index()
-        )
+        annual_cols = [col for col in ["interest", "principal", "fees", "debt_service", "draw"] if col in debt_summary.columns]
+        debt_service_annual = debt_summary.groupby("year")[annual_cols].sum().reset_index()
     dashboard["debt_service_summary"] = debt_service_annual
 
     wc_trend = working_capital.copy() if isinstance(working_capital, pd.DataFrame) else pd.DataFrame()
@@ -4539,6 +4602,7 @@ def _apply_lender_case(base_cfg: Mapping[str, object], case_row: Mapping[str, ob
     capex_mult = float(case_row.get("capex_multiplier", 1.0) or 1.0)
     delay_months = max(0, _coerce_int(case_row.get("delay_months"), 0))
     debt_shift = float(case_row.get("debt_rate_shift", 0.0) or 0.0)
+    increment_profile = str(case_row.get("increment_profile", "") or "").strip()
 
     production_monthly = cfg_case.get("production_monthly")
     if isinstance(production_monthly, pd.DataFrame) and "volume" in production_monthly.columns:
@@ -4579,6 +4643,8 @@ def _apply_lender_case(base_cfg: Mapping[str, object], case_row: Mapping[str, ob
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0) + debt_shift
         cfg_case["debt_tranches"] = df
+    if increment_profile:
+        cfg_case["increment_profile"] = increment_profile
     cfg_case["_disable_lender_case_eval"] = True
     return cfg_case
 ###############################################################################
@@ -4592,6 +4658,7 @@ def break_even_analysis(
     production_df: pd.DataFrame,
     break_even_inputs: Optional[pd.DataFrame] = None,
     price_config: Optional[Mapping[str, Mapping[str, object]]] = None,
+    cfg: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     pnl = statements.get("pnl", pd.DataFrame()).copy()
     if pnl.empty or "COGS" not in pnl:
@@ -4688,6 +4755,24 @@ def break_even_analysis(
         sanitized_records.append(record)
 
     inputs_used = pd.DataFrame(sanitized_records)
+    monthly_dates = pd.to_datetime(production_local.get("date"), errors="coerce") if "date" in production_local.columns else pd.Series(dtype="datetime64[ns]")
+    if monthly_dates.empty:
+        avg_price_factor = 1.0
+        avg_opex_factor = 1.0
+    else:
+        tmp_timeline = Timeline(
+            start_year=int(monthly_dates.dropna().min().year) if not monthly_dates.dropna().empty else DEFAULTS["horizon"]["start_year"],
+            end_year=int(monthly_dates.dropna().max().year) if not monthly_dates.dropna().empty else DEFAULTS["horizon"]["end_year"],
+            start_month=1,
+        )
+        avg_price_factor = float(get_increment_series(cfg, tmp_timeline, "price_factor").mean()) if isinstance(cfg, Mapping) else 1.0
+        avg_opex_factor = float(get_increment_series(cfg, tmp_timeline, "opex_factor").mean()) if isinstance(cfg, Mapping) else 1.0
+    if "unit_price" in inputs_used.columns:
+        inputs_used["unit_price"] = pd.to_numeric(inputs_used["unit_price"], errors="coerce") * avg_price_factor
+    if "variable_cost_per_unit" in inputs_used.columns:
+        inputs_used["variable_cost_per_unit"] = pd.to_numeric(inputs_used["variable_cost_per_unit"], errors="coerce") * avg_opex_factor
+    if "fixed_cost" in inputs_used.columns:
+        inputs_used["fixed_cost"] = pd.to_numeric(inputs_used["fixed_cost"], errors="coerce") * avg_opex_factor
     for col in ["unit_price", "variable_cost_per_unit", "fixed_cost", "reference_volume"]:
         inputs_used[col] = pd.to_numeric(inputs_used[col], errors="coerce")
 
@@ -4809,6 +4894,7 @@ def break_even_analysis(
 
 def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None) -> Dict[str, object]:
     cfg = copy.deepcopy(dict(cfg))
+    cfg.setdefault("increment_profile", "base")
     risk_params = cfg.get("risk_params")
     if not isinstance(risk_params, pd.DataFrame) or risk_params.empty:
         risk_params = DEFAULTS["risk_params"].copy()
@@ -4870,6 +4956,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         production_monthly,
         break_even_inputs=be_inputs_cfg,
         price_config=cfg.get("prices"),
+        cfg=cfg,
     )
     dashboard = build_dashboard(
         cfg,

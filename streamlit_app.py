@@ -1038,6 +1038,9 @@ def _scenario_overrides_from_table(scenario_df: pd.DataFrame) -> Dict[str, Dict[
                 pass
         if production_override:
             override["production"] = production_override
+        increment_profile = str(row.get("increment_profile", "")).strip()
+        if increment_profile:
+            override["increment_profile"] = increment_profile
         if override:
             overrides[name] = override
 
