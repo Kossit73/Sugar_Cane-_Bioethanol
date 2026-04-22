@@ -3616,6 +3616,9 @@ def main() -> None:
                 "Neural forecasts",
                 "Statistical forecasts",
                 "Decision tree",
+                "Sensitivity tornado",
+                "Monte Carlo simulation",
+                "Scenario comparison",
             ]
         )
 
@@ -3867,16 +3870,7 @@ def main() -> None:
                         )
                         _render_decision_tree_chart(paths_df, selected_objective)
 
-
-    with sensitivity_tab:
-        st.markdown("### Scenario analytics workspace")
-        scenario_sections = st.tabs([
-            "Sensitivity tornado",
-            "Monte Carlo simulation",
-            "Scenario comparison",
-        ])
-
-        with scenario_sections[0]:
+        with sensitivity_sections[4]:
             _render_table_editor(
                 tables,
                 "tornado_drivers",
@@ -3918,7 +3912,7 @@ def main() -> None:
                     _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
                     _render_tornado_chart(tornado_results)
 
-        with scenario_sections[1]:
+        with sensitivity_sections[5]:
             distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
             variable_label_map = dict(MONTE_CARLO_VARIABLE_LABELS)
             variable_options = list(variable_label_map.values())
@@ -4094,7 +4088,7 @@ def main() -> None:
                 _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
                 _render_monte_carlo_histograms(monte_results["samples"])
 
-        with scenario_sections[2]:
+        with sensitivity_sections[6]:
             _render_table_editor(
                 tables,
                 "scenario_comparison",
