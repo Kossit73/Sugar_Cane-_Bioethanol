@@ -11,10 +11,14 @@ Run with:
 from __future__ import annotations
 
 import copy
+import json
 import importlib
 import math
 import re
 import sys
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
 from collections import OrderedDict
 from contextlib import contextmanager
 from io import BytesIO
@@ -43,6 +47,31 @@ else:
     mdates = None
 
 _MATPLOTLIB_WARNING_SHOWN = False
+
+
+CHAT_PROVIDER_DEFAULTS: Dict[str, Dict[str, object]] = {
+    "OpenAI": {"base_url": "https://api.openai.com/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Anthropic": {"base_url": "https://api.anthropic.com/v1/messages", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "Google Gemini": {"base_url": "", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Mistral": {"base_url": "https://api.mistral.ai/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "Cohere": {"base_url": "https://api.cohere.com/v2/chat", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "DeepSeek": {"base_url": "https://api.deepseek.com/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "xAI": {"base_url": "https://api.x.ai/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Llama-compatible": {"base_url": "http://localhost:8000/v1/chat/completions", "supports_reasoning": False, "supports_tools": False, "supports_web_search": False},
+}
+
+
+@dataclass
+class ChatProviderSettings:
+    provider_name: str
+    model_name: str
+    api_key: str
+    base_url: str
+    temperature: float
+    max_tokens: int
+    reasoning_mode: str
+    use_tools: bool
+    use_web_search: bool
 
 
 def _streamlit_runtime_exists() -> bool:
@@ -130,6 +159,215 @@ def _float_option_values(start: float, stop: float, step: float, digits: int = 6
     if values and values[-1] < round(stop, digits):
         values.append(round(stop, digits))
     return values
+
+
+def _chat_supports(provider_name: str, capability: str) -> bool:
+    defaults = CHAT_PROVIDER_DEFAULTS.get(provider_name, {})
+    return bool(defaults.get(capability, False))
+
+
+def _run_sandbox(code: str) -> Dict[str, object]:
+    """Execute controlled Python snippets in a restricted sandbox namespace."""
+
+    safe_builtins = {
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "sum": sum,
+        "len": len,
+        "range": range,
+        "round": round,
+        "sorted": sorted,
+    }
+    restricted_globals = {"__builtins__": safe_builtins, "math": math, "np": np, "pd": pd}
+    restricted_locals: Dict[str, object] = {}
+    try:
+        exec(code, restricted_globals, restricted_locals)
+        output = restricted_locals.get("result")
+        return {"used": True, "ok": True, "result": output, "locals": list(restricted_locals.keys())}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _web_comparison_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
+    """Perform lightweight web lookup for comparative references."""
+
+    if not query.strip():
+        return []
+    encoded = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+    url = f"https://api.duckduckgo.com/?{encoded}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    results: List[Dict[str, str]] = []
+    for item in payload.get("RelatedTopics", []):
+        if isinstance(item, dict) and item.get("Text") and item.get("FirstURL"):
+            results.append({"title": str(item.get("Text")), "url": str(item.get("FirstURL"))})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str, str]]) -> str:
+    """Send chat request using a provider-agnostic OpenAI-compatible schema."""
+
+    if not settings.api_key.strip():
+        return "No API key configured. Add a provider API key in Chatbot settings to enable LLM responses."
+    if not settings.base_url.strip():
+        return "No base URL configured for the selected provider."
+
+    payload = {
+        "model": settings.model_name,
+        "messages": messages,
+        "temperature": float(settings.temperature),
+        "max_tokens": int(settings.max_tokens),
+    }
+    if settings.reasoning_mode:
+        payload["reasoning"] = {"effort": settings.reasoning_mode}
+
+    request = urllib.request.Request(
+        settings.base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return f"Provider call failed: {exc}"
+
+    if isinstance(data, dict):
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+        output = data.get("output_text")
+        if isinstance(output, str) and output.strip():
+            return output
+    return "Provider response parsed, but no assistant text was returned."
+
+
+def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
+    st.subheader("Intelligent Analytical Chatbot")
+    st.caption(
+        "Reasoning-first assistant with conversation memory, optional sandbox execution, "
+        "selective web comparison, and multi-provider LLM settings."
+    )
+
+    history = st.session_state.setdefault("chat_history", [])
+    provider_options = list(CHAT_PROVIDER_DEFAULTS.keys())
+    selected_provider = st.selectbox("Provider", provider_options, key="chat_provider")
+    defaults = CHAT_PROVIDER_DEFAULTS[selected_provider]
+
+    col1, col2, col3 = st.columns(3)
+    model_name = col1.text_input("Model name", value=st.session_state.get("chat_model_name", "gpt-4.1-mini"), key="chat_model_name")
+    api_key = col2.text_input("API key", value=st.session_state.get("chat_api_key", ""), type="password", key="chat_api_key")
+    base_url = col3.text_input("Base URL", value=st.session_state.get("chat_base_url", str(defaults.get("base_url", ""))), key="chat_base_url")
+    col4, col5, col6 = st.columns(3)
+    temperature = col4.number_input("Temperature", min_value=0.0, max_value=2.0, value=float(st.session_state.get("chat_temperature", 0.2)), step=0.1, key="chat_temperature")
+    max_tokens = int(col5.number_input("Max tokens", min_value=64, max_value=8192, value=int(st.session_state.get("chat_max_tokens", 1200)), step=64, key="chat_max_tokens"))
+    reasoning_mode = col6.selectbox("Reasoning mode", ["", "low", "medium", "high"], index=2, key="chat_reasoning_mode")
+
+    st.write(
+        f"Capabilities: reasoning={_chat_supports(selected_provider, 'supports_reasoning')}, "
+        f"tools={_chat_supports(selected_provider, 'supports_tools')}, "
+        f"web={_chat_supports(selected_provider, 'supports_web_search')}"
+    )
+
+    with st.expander("Conversation history", expanded=False):
+        if history:
+            for item in history:
+                st.markdown(f"**{item.get('role', 'assistant').title()}:** {item.get('content', '')}")
+        else:
+            st.info("No messages yet.")
+        if st.button("Clear history", key="clear_chat_history"):
+            st.session_state["chat_history"] = []
+            _safe_rerun()
+
+    use_sandbox = st.checkbox("Use sandbox execution for intermediate calculations", value=True, key="chat_use_sandbox")
+    use_web = st.checkbox("Use web search for comparative analysis", value=True, key="chat_use_web")
+    sandbox_code = st.text_area(
+        "Sandbox code (optional, Python). Set `result = ...` to expose output.",
+        value=st.session_state.get("chat_sandbox_code", ""),
+        height=120,
+        key="chat_sandbox_code",
+    )
+    user_prompt = st.text_area("Ask the assistant", height=140, key="chat_prompt")
+
+    if st.button("Send", key="chat_send"):
+        if not user_prompt.strip():
+            st.warning("Enter a prompt to continue.")
+            return
+
+        settings = ChatProviderSettings(
+            provider_name=selected_provider,
+            model_name=model_name.strip() or "gpt-4.1-mini",
+            api_key=api_key,
+            base_url=base_url.strip(),
+            temperature=float(temperature),
+            max_tokens=max_tokens,
+            reasoning_mode=reasoning_mode,
+            use_tools=bool(use_sandbox),
+            use_web_search=bool(use_web),
+        )
+
+        sandbox_output: Dict[str, object] = {"used": False}
+        if settings.use_tools and sandbox_code.strip():
+            sandbox_output = _run_sandbox(sandbox_code)
+
+        web_sources: List[Dict[str, str]] = []
+        if settings.use_web_search and _chat_supports(selected_provider, "supports_web_search"):
+            web_sources = _web_comparison_search(user_prompt, limit=5)
+
+        compact_metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
+        system_prompt = (
+            "You are an intelligent analytical assistant. Respond with sections: "
+            "Direct answer, Internal reasoning summary, Sandbox output usage, External comparison, "
+            "Interpretation, Recommendation, Sources. Keep answers concise and actionable."
+        )
+        context_blob = {
+            "project_metrics": compact_metrics,
+            "sandbox_output": sandbox_output,
+            "web_sources": web_sources,
+        }
+        llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        llm_messages.extend([{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in history[-8:]])
+        llm_messages.append(
+            {
+                "role": "user",
+                "content": f"User prompt:\n{user_prompt}\n\nContext:\n{json.dumps(context_blob, default=str)}",
+            }
+        )
+        assistant_text = _call_chat_provider(settings, llm_messages)
+
+        history.append({"role": "user", "content": user_prompt})
+        history.append({"role": "assistant", "content": assistant_text})
+        st.session_state["chat_history"] = history
+
+        st.markdown("### Direct answer")
+        st.write(assistant_text)
+        st.markdown("### Internal reasoning")
+        st.info("Reasoning summary is embedded in the assistant response.")
+        st.markdown("### Sandbox output")
+        st.json(sandbox_output)
+        st.markdown("### External comparison via web search")
+        if web_sources:
+            st.dataframe(pd.DataFrame(web_sources), use_container_width=True)
+        else:
+            st.caption("No web comparison data was collected.")
+        st.markdown("### Interpretation")
+        st.caption("Use the response to validate assumptions against model metrics and external references.")
+        st.markdown("### Recommendation")
+        st.caption("Iterate with tighter prompts, explicit assumptions, and optional sandbox scripts for reproducible steps.")
+        st.markdown("### Sources")
+        for src in web_sources:
+            st.markdown(f"- [{src['title']}]({src['url']})")
 
 
 @contextmanager
@@ -2635,6 +2873,7 @@ def main() -> None:
         financial_tab,
         production_tab,
         sensitivity_tab,
+        chatbot_tab,
     ) = page_tabs_container.tabs(
         [
             "Model Controls",
@@ -2643,6 +2882,7 @@ def main() -> None:
             "Financial Statements",
             "Production & Pricing",
             "Sensitivities",
+            "AI Chatbot",
         ]
     )
 
@@ -4146,6 +4386,9 @@ def main() -> None:
                     _render_scenario_cashflow_stack(scenario_results_map)
                     _render_scenario_dscr_chart(scenario_results_map)
                     _render_scenario_scatter_chart(scenario_results_map)
+
+    with chatbot_tab:
+        _render_chatbot_tab(results)
 
     st.success("Model run complete.")
 
