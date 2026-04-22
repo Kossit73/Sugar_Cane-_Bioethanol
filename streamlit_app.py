@@ -2617,7 +2617,6 @@ def main() -> None:
         financial_tab,
         production_tab,
         sensitivity_tab,
-        scenario_tab,
     ) = page_tabs_container.tabs(
         [
             "Model Controls",
@@ -2626,7 +2625,6 @@ def main() -> None:
             "Financial Statements",
             "Production & Pricing",
             "Sensitivities",
-            "Scenarios",
         ]
     )
 
@@ -3870,7 +3868,7 @@ def main() -> None:
                         _render_decision_tree_chart(paths_df, selected_objective)
 
 
-    with scenario_tab:
+    with sensitivity_tab:
         st.markdown("### Scenario analytics workspace")
         scenario_sections = st.tabs([
             "Sensitivity tornado",
