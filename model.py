@@ -427,6 +427,127 @@ DEFAULTS = {
             },
         ]
     ),
+    "offtake_terms": pd.DataFrame(
+        [
+            {
+                "product": "ethanol",
+                "contracted_share": 0.7,
+                "merchant_share": 0.3,
+                "floor_price": 0.65,
+                "collar_price": 0.85,
+                "indexation_rule": "cpi",
+                "counterparty_haircut": 0.02,
+            },
+            {
+                "product": "electricity",
+                "contracted_share": 0.8,
+                "merchant_share": 0.2,
+                "floor_price": 70.0,
+                "collar_price": 95.0,
+                "indexation_rule": "cpi",
+                "counterparty_haircut": 0.01,
+            },
+        ]
+    ),
+    "dispatch_constraints": pd.DataFrame(
+        [
+            {
+                "product": "electricity",
+                "max_dispatch_share": 0.95,
+                "curtailment_penalty_per_unit": 2.0,
+                "availability_floor": 0.88,
+            }
+        ]
+    ),
+    "construction_schedule": pd.DataFrame(
+        [
+            {
+                "epc_package": "Plant EPC",
+                "start_date": "2025-01",
+                "end_date": "2025-12",
+                "amount": 30_000_000.0,
+                "draw_curve": "",
+                "contingency_rank": 1,
+                "contingency_amount": 2_000_000.0,
+                "delay_months": 0,
+            }
+        ]
+    ),
+    "completion_tests": pd.DataFrame(
+        [
+            {"enabled": True, "metric": "plant_availability", "threshold": 0.85, "test_date": "2026-01-01"},
+            {"enabled": True, "metric": "dscr_min", "threshold": 1.1, "test_date": "2026-12-01"},
+        ]
+    ),
+    "reserve_accounts": pd.DataFrame(
+        [
+            {
+                "dsra_months": 6.0,
+                "mmra_monthly": 75_000.0,
+                "wc_facility_limit": 2_000_000.0,
+                "wc_facility_rate": 0.08,
+                "restricted_cash_min": 250_000.0,
+                "sweep_pct": 0.5,
+                "sweep_dscr_trigger": 1.25,
+            }
+        ]
+    ),
+    "covenant_thresholds": pd.DataFrame(
+        [
+            {
+                "start_date": "2025-01-01",
+                "end_date": "2035-12-01",
+                "case": "base",
+                "adsc_min": 1.2,
+                "dscr_lockup": 1.1,
+                "dscr_default": 1.0,
+                "llcr_min": 1.25,
+            },
+            {
+                "start_date": "2025-01-01",
+                "end_date": "2035-12-01",
+                "case": "downside",
+                "adsc_min": 1.1,
+                "dscr_lockup": 1.05,
+                "dscr_default": 0.95,
+                "llcr_min": 1.15,
+            },
+        ]
+    ),
+    "lender_cases": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "case_name": "Base case (P50)",
+                "production_multiplier": 1.0,
+                "price_multiplier": 1.0,
+                "opex_multiplier": 1.0,
+                "capex_multiplier": 1.0,
+                "delay_months": 0,
+                "debt_rate_shift": 0.0,
+            },
+            {
+                "enabled": True,
+                "case_name": "Downside case (P90-like)",
+                "production_multiplier": 0.9,
+                "price_multiplier": 0.9,
+                "opex_multiplier": 1.1,
+                "capex_multiplier": 1.08,
+                "delay_months": 6,
+                "debt_rate_shift": 0.01,
+            },
+            {
+                "enabled": True,
+                "case_name": "Break case",
+                "production_multiplier": 0.8,
+                "price_multiplier": 0.82,
+                "opex_multiplier": 1.2,
+                "capex_multiplier": 1.15,
+                "delay_months": 12,
+                "debt_rate_shift": 0.02,
+            },
+        ]
+    ),
 }
 
 
@@ -1105,6 +1226,8 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "fx_curve": "str",
             "share": "float",
             "start_year": "int",
+            "target_dscr": "float",
+            "sculpting_enabled": "bool",
         },
         defaults={
             "type": "term",
@@ -1112,6 +1235,8 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "currency": "USD",
             "share": 1.0,
             "start_year": 2025,
+            "target_dscr": 1.3,
+            "sculpting_enabled": False,
         },
     ),
     "tax_schedule": TableSchema(
@@ -1258,6 +1383,68 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "yield_multiplier": 1.0,
         },
     ),
+    "offtake_terms": TableSchema(
+        columns={
+            "product": "str",
+            "contracted_share": "float",
+            "merchant_share": "float",
+            "floor_price": "float",
+            "collar_price": "float",
+            "indexation_rule": "str",
+            "counterparty_haircut": "float",
+        },
+        defaults={"contracted_share": 0.0, "merchant_share": 1.0, "indexation_rule": "cpi", "counterparty_haircut": 0.0},
+    ),
+    "dispatch_constraints": TableSchema(
+        columns={"product": "str", "max_dispatch_share": "float", "curtailment_penalty_per_unit": "float", "availability_floor": "float"},
+        defaults={"max_dispatch_share": 1.0, "curtailment_penalty_per_unit": 0.0, "availability_floor": 0.0},
+    ),
+    "construction_schedule": TableSchema(
+        columns={
+            "epc_package": "str",
+            "start_date": "str",
+            "end_date": "str",
+            "amount": "float",
+            "draw_curve": "str",
+            "contingency_rank": "int",
+            "contingency_amount": "float",
+            "delay_months": "int",
+        },
+        defaults={"contingency_rank": 1, "contingency_amount": 0.0, "delay_months": 0},
+    ),
+    "completion_tests": TableSchema(
+        columns={"enabled": "bool", "metric": "str", "threshold": "float", "test_date": "str"},
+        defaults={"enabled": True, "threshold": 0.0},
+    ),
+    "reserve_accounts": TableSchema(
+        columns={
+            "dsra_months": "float",
+            "mmra_monthly": "float",
+            "wc_facility_limit": "float",
+            "wc_facility_rate": "float",
+            "restricted_cash_min": "float",
+            "sweep_pct": "float",
+            "sweep_dscr_trigger": "float",
+        },
+        defaults={"dsra_months": 6.0, "mmra_monthly": 0.0, "wc_facility_limit": 0.0, "wc_facility_rate": 0.0, "restricted_cash_min": 0.0, "sweep_pct": 0.0, "sweep_dscr_trigger": 1.25},
+    ),
+    "covenant_thresholds": TableSchema(
+        columns={"start_date": "str", "end_date": "str", "case": "str", "adsc_min": "float", "dscr_lockup": "float", "dscr_default": "float", "llcr_min": "float"},
+        defaults={"case": "base", "adsc_min": 1.2, "dscr_lockup": 1.1, "dscr_default": 1.0, "llcr_min": 1.25},
+    ),
+    "lender_cases": TableSchema(
+        columns={
+            "enabled": "bool",
+            "case_name": "str",
+            "production_multiplier": "float",
+            "price_multiplier": "float",
+            "opex_multiplier": "float",
+            "capex_multiplier": "float",
+            "delay_months": "int",
+            "debt_rate_shift": "float",
+        },
+        defaults={"enabled": True, "production_multiplier": 1.0, "price_multiplier": 1.0, "opex_multiplier": 1.0, "capex_multiplier": 1.0, "delay_months": 0, "debt_rate_shift": 0.0},
+    ),
 }
 
 
@@ -1398,6 +1585,13 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "risk_params": DEFAULTS["risk_params"].copy(),
         "inflation_index": DEFAULTS["inflation_index"].copy(),
         "break_even_inputs": DEFAULTS["break_even_inputs"].copy(),
+        "offtake_terms": DEFAULTS["offtake_terms"].copy(),
+        "dispatch_constraints": DEFAULTS["dispatch_constraints"].copy(),
+        "construction_schedule": DEFAULTS["construction_schedule"].copy(),
+        "completion_tests": DEFAULTS["completion_tests"].copy(),
+        "reserve_accounts": DEFAULTS["reserve_accounts"].copy(),
+        "covenant_thresholds": DEFAULTS["covenant_thresholds"].copy(),
+        "lender_cases": DEFAULTS["lender_cases"].copy(),
     }
 
     for key, value in assumptions.items():
@@ -1498,6 +1692,13 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "tornado_drivers",
         "monte_carlo_settings",
         "scenario_comparison",
+        "offtake_terms",
+        "dispatch_constraints",
+        "construction_schedule",
+        "completion_tests",
+        "reserve_accounts",
+        "covenant_thresholds",
+        "lender_cases",
     ):
         df = tables.ensure_table(table_name)
         if not df.empty:
@@ -1539,6 +1740,17 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         cfg["monte_carlo_settings"] = DEFAULTS["monte_carlo_settings"].copy()
     if not isinstance(cfg.get("scenario_comparison"), pd.DataFrame) or cfg["scenario_comparison"].empty:
         cfg["scenario_comparison"] = DEFAULTS["scenario_comparison"].copy()
+    for table_name in (
+        "offtake_terms",
+        "dispatch_constraints",
+        "construction_schedule",
+        "completion_tests",
+        "reserve_accounts",
+        "covenant_thresholds",
+        "lender_cases",
+    ):
+        if not isinstance(cfg.get(table_name), pd.DataFrame) or cfg[table_name].empty:
+            cfg[table_name] = DEFAULTS[table_name].copy()
 
     return align_with_projection_horizon(cfg)
 ###############################################################################
@@ -1855,7 +2067,48 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
 def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFrame, price_curves: pd.DataFrame) -> pd.DataFrame:
     df = production_monthly.merge(price_curves, on=["date", "product"], how="left")
     df["price"].fillna(0.0, inplace=True)
-    df["revenue"] = df["volume"] * df["price"]
+    df["contracted_share"] = 0.0
+    df["merchant_share"] = 1.0
+    df["floor_price"] = np.nan
+    df["collar_price"] = np.nan
+    df["counterparty_haircut"] = 0.0
+    offtake_df = cfg.get("offtake_terms")
+    if isinstance(offtake_df, pd.DataFrame) and not offtake_df.empty:
+        terms = offtake_df.copy()
+        terms["product"] = terms["product"].astype(str).str.lower()
+        df = df.merge(
+            terms[
+                ["product", "contracted_share", "merchant_share", "floor_price", "collar_price", "counterparty_haircut"]
+            ],
+            on="product",
+            how="left",
+            suffixes=("", "_term"),
+        )
+        for col in ("contracted_share", "merchant_share", "floor_price", "collar_price", "counterparty_haircut"):
+            term_col = f"{col}_term"
+            if term_col in df.columns:
+                df[col] = df[term_col].where(df[term_col].notna(), df[col])
+                df.drop(columns=[term_col], inplace=True)
+    contracted_price = df["price"].clip(lower=df["floor_price"].fillna(-np.inf), upper=df["collar_price"].fillna(np.inf))
+    effective_price = (
+        contracted_price * df["contracted_share"].fillna(0.0)
+        + df["price"] * df["merchant_share"].fillna(1.0)
+    )
+    df["effective_price"] = effective_price
+    df["contracted_volume"] = df["volume"] * df["contracted_share"].fillna(0.0)
+    df["merchant_volume"] = df["volume"] * df["merchant_share"].fillna(1.0)
+    df["revenue"] = df["volume"] * df["effective_price"] * (1.0 - df["counterparty_haircut"].fillna(0.0).clip(lower=0.0))
+    dispatch_df = cfg.get("dispatch_constraints")
+    if isinstance(dispatch_df, pd.DataFrame) and not dispatch_df.empty:
+        dispatch = dispatch_df.copy()
+        dispatch["product"] = dispatch["product"].astype(str).str.lower()
+        df = df.merge(dispatch[["product", "max_dispatch_share", "curtailment_penalty_per_unit"]], on="product", how="left")
+        constrained = df["max_dispatch_share"].notna()
+        allowed_volume = df["volume"] * df["max_dispatch_share"].fillna(1.0)
+        curtailed = np.where(constrained, np.maximum(df["volume"] - allowed_volume, 0.0), 0.0)
+        df["curtailed_volume"] = curtailed
+        df["curtailment_penalty"] = df["curtailed_volume"] * df["curtailment_penalty_per_unit"].fillna(0.0)
+        df["revenue"] = np.where(constrained, allowed_volume * df["effective_price"] - df["curtailment_penalty"], df["revenue"])
     df["currency"] = cfg["global_inputs"].get("base_currency", "USD")
     risk_profile = cfg.get("risk_profile", {})
     revenue_multiplier = float(risk_profile.get("revenue", 1.0))
@@ -1969,6 +2222,46 @@ def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> D
     depr_df["accum_depr"] = depr_df["depr"].cumsum()
 
     return {"capex": capex_df, "depreciation": depr_df}
+
+
+def apply_construction_risk(cfg: Mapping[str, object], timeline: Timeline, capex_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply construction draw S-curves, delays, and contingency hierarchy."""
+    monthly_index = timeline.monthly_index()
+    construction = cfg.get("construction_schedule")
+    if not isinstance(construction, pd.DataFrame) or construction.empty:
+        empty = pd.DataFrame(columns=["epc_package", "base_amount", "adjusted_amount", "delay_months", "contingency_amount", "rank"])
+        return capex_df, empty
+    records: List[Dict[str, object]] = []
+    capex_series = pd.Series(0.0, index=monthly_index)
+    for _, row in construction.iterrows():
+        amount = float(row.get("amount", 0.0) or 0.0)
+        contingency = float(row.get("contingency_amount", 0.0) or 0.0)
+        delay_months = max(0, _coerce_int(row.get("delay_months"), 0))
+        start = parse_date_str(row.get("start_date"), monthly_index[0]) + pd.DateOffset(months=delay_months)
+        end = parse_date_str(row.get("end_date"), monthly_index[0]) + pd.DateOffset(months=delay_months)
+        local_index = pd.date_range(start=start, end=end, freq="MS")
+        if local_index.empty:
+            local_index = pd.DatetimeIndex([start])
+        curve = parse_draw_curve(row.get("draw_curve"), local_index)
+        package_total = amount + contingency
+        for dt, val in curve.items():
+            if dt in capex_series.index:
+                capex_series.loc[dt] += float(val) * package_total
+        records.append(
+            {
+                "epc_package": row.get("epc_package", "EPC"),
+                "base_amount": amount,
+                "adjusted_amount": package_total,
+                "delay_months": delay_months,
+                "contingency_amount": contingency,
+                "rank": _coerce_int(row.get("contingency_rank"), 1),
+            }
+        )
+    adjusted = capex_df.copy()
+    adjusted = adjusted.set_index("date").reindex(monthly_index, fill_value=0.0).reset_index()
+    adjusted["amount"] = capex_series.values
+    adjusted["cumulative_capex"] = adjusted["amount"].cumsum()
+    return adjusted, pd.DataFrame(records)
 ###############################################################################
 # Section 9: Debt modeling
 ###############################################################################
@@ -2013,7 +2306,12 @@ def parse_draw_curve(draw_curve: object, monthly_index: pd.DatetimeIndex) -> pd.
     return series
 
 
-def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df: pd.DataFrame) -> pd.DataFrame:
+def build_debt_schedule(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    capex_df: pd.DataFrame,
+    cfads_series: Optional[pd.Series] = None,
+) -> pd.DataFrame:
     monthly_index = timeline.monthly_index()
     tranches = cfg.get("debt_tranches") if "debt_tranches" in cfg else cfg["debt"].get("tranches", [])
     if isinstance(tranches, pd.DataFrame):
@@ -2047,6 +2345,8 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
         grace_years = max(0, _coerce_int(tranche.get("grace_years"), 1))
         capitalize_idc = bool(tranche.get("capitalize_idc", True))
         amortization = str(tranche.get("amortization", "straight")).lower()
+        target_dscr = float(tranche.get("target_dscr", 1.3) or 1.3)
+        sculpting_enabled = bool(tranche.get("sculpting_enabled", False)) or amortization == "sculpted"
 
         balances = []
         interests = []
@@ -2071,7 +2371,11 @@ def build_debt_schedule(cfg: Mapping[str, object], timeline: Timeline, capex_df:
                         else:
                             factor = (1 + monthly_rate) ** n
                             annuity_payment = principal_total * (monthly_rate * factor) / max(1e-9, factor - 1)
-                    principal_payment = max(0.0, annuity_payment - interest)
+                        principal_payment = max(0.0, annuity_payment - interest)
+                elif sculpting_enabled and cfads_series is not None:
+                    cfads_value = float(cfads_series.reindex(monthly_index, fill_value=0.0).iloc[i])
+                    allowed_debt_service = max(0.0, cfads_value / max(target_dscr, 1e-6))
+                    principal_payment = max(0.0, allowed_debt_service - interest)
                 else:
                     principal_payment = principal_total / max(1, tenor_years * 12)
                 principal_payment = min(principal_payment, balance)
@@ -2447,6 +2751,126 @@ def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, obj
         "DSCR_avg": float(np.nanmean(dscr_series)) if dscr_series else np.nan,
     }
     return {"metrics": metrics, "cashflows": {"project": fcf, "equity": equity_cf.values, "discount_factors": discount_factors}}
+
+
+def _annual_credit_distributions(dscr_df: pd.DataFrame) -> pd.DataFrame:
+    if dscr_df.empty:
+        return pd.DataFrame(columns=["year", "ADSCR_p10", "ADSCR_p50", "ADSCR_p90", "ADSCR_avg"])
+    rows: List[Dict[str, float]] = []
+    work = dscr_df.copy()
+    work["year"] = work["date"].dt.year
+    for year, group in work.groupby("year"):
+        adsc = pd.to_numeric(group["DSCR"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        rows.append(
+            {
+                "year": int(year),
+                "ADSCR_p10": float(np.nanpercentile(adsc, 10)) if not adsc.empty else np.nan,
+                "ADSCR_p50": float(np.nanpercentile(adsc, 50)) if not adsc.empty else np.nan,
+                "ADSCR_p90": float(np.nanpercentile(adsc, 90)) if not adsc.empty else np.nan,
+                "ADSCR_avg": float(np.nanmean(adsc)) if not adsc.empty else np.nan,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def evaluate_credit_and_waterfall(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    statements: Dict[str, pd.DataFrame],
+    debt_schedule: pd.DataFrame,
+    case_name: str = "base",
+) -> Dict[str, pd.DataFrame]:
+    monthly_index = timeline.monthly_index()
+    cashflow = statements.get("cashflow", pd.DataFrame()).copy()
+    if cashflow.empty:
+        empty = pd.DataFrame()
+        return {"credit_metrics_yearly": empty, "covenant_monitor": empty, "cash_waterfall": empty, "completion_tests": empty}
+    debt_monthly = debt_schedule.groupby("date")[["debt_service", "balance"]].sum().reindex(monthly_index, fill_value=0.0)
+    cfads = cashflow.set_index("date")["CFO"].reindex(monthly_index, fill_value=0.0)
+    dscr = np.where(debt_monthly["debt_service"].values > 1e-9, cfads.values / debt_monthly["debt_service"].values, np.nan)
+    dscr_df = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "DSCR": dscr, "balance": debt_monthly["balance"].values})
+    annual_dist = _annual_credit_distributions(dscr_df)
+
+    discount_rate = float(cfg.get("global_inputs", {}).get("discount_rate", DEFAULTS["global"]["discount_rate"]))
+    monthly_discount = (1 + discount_rate) ** (1 / 12) - 1
+    project_cf = cashflow.set_index("date")["NetCashFlow"].reindex(monthly_index, fill_value=0.0)
+    llcr_vals: List[float] = []
+    plcr_vals: List[float] = []
+    for i, bal in enumerate(dscr_df["balance"].values):
+        rem = np.arange(len(monthly_index) - i)
+        pv_cfads = float(np.sum(cfads.values[i:] / ((1 + monthly_discount) ** rem)))
+        pv_project = float(np.sum(project_cf.values[i:] / ((1 + monthly_discount) ** rem)))
+        if abs(bal) <= 1e-9:
+            llcr_vals.append(np.nan)
+            plcr_vals.append(np.nan)
+        else:
+            llcr_vals.append(pv_cfads / bal)
+            plcr_vals.append(pv_project / bal)
+    dscr_df["LLCR"] = llcr_vals
+    dscr_df["PLCR"] = plcr_vals
+    ratio_yearly = dscr_df.assign(year=dscr_df["date"].dt.year).groupby("year")[["LLCR", "PLCR"]].agg(["min", "median", "max"]).reset_index()
+    ratio_yearly.columns = ["year", "LLCR_min", "LLCR_p50", "LLCR_max", "PLCR_min", "PLCR_p50", "PLCR_max"]
+    credit_metrics = annual_dist.merge(ratio_yearly, on="year", how="outer").sort_values("year")
+
+    cov_table = cfg.get("covenant_thresholds")
+    threshold_defaults = {"adsc_min": 1.2, "dscr_lockup": 1.1, "dscr_default": 1.0, "llcr_min": 1.25}
+    threshold_frame = pd.DataFrame({"date": monthly_index, **threshold_defaults})
+    if isinstance(cov_table, pd.DataFrame) and not cov_table.empty:
+        cov = cov_table.copy()
+        cov["case"] = cov["case"].astype(str).str.lower()
+        case_rows = cov[cov["case"] == str(case_name).lower()]
+        if case_rows.empty:
+            case_rows = cov[cov["case"] == "base"]
+        for _, row in case_rows.iterrows():
+            start = parse_date_str(row.get("start_date"), monthly_index[0])
+            end = parse_date_str(row.get("end_date"), monthly_index[-1])
+            mask = (threshold_frame["date"] >= start) & (threshold_frame["date"] <= end)
+            for key in threshold_defaults:
+                if pd.notna(row.get(key)):
+                    threshold_frame.loc[mask, key] = float(row.get(key))
+    dscr_df = dscr_df.merge(threshold_frame, on="date", how="left")
+    dscr_df["lockup_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_lockup"]
+    dscr_df["default_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_default"]
+    dscr_df["llcr_breach"] = dscr_df["LLCR"] < dscr_df["llcr_min"]
+
+    reserve_cfg = cfg.get("reserve_accounts")
+    reserve_row = reserve_cfg.iloc[0] if isinstance(reserve_cfg, pd.DataFrame) and not reserve_cfg.empty else {}
+    sweep_pct = float(reserve_row.get("sweep_pct", 0.0) or 0.0)
+    sweep_trigger = float(reserve_row.get("sweep_dscr_trigger", 1.25) or 1.25)
+    dsra_months = float(reserve_row.get("dsra_months", 6.0) or 0.0)
+    mmra_monthly = float(reserve_row.get("mmra_monthly", 0.0) or 0.0)
+    restricted_cash_min = float(reserve_row.get("restricted_cash_min", 0.0) or 0.0)
+    wc_limit = float(reserve_row.get("wc_facility_limit", 0.0) or 0.0)
+    wc_rate = float(reserve_row.get("wc_facility_rate", 0.0) or 0.0)
+    rolling_ds = debt_monthly["debt_service"].rolling(12, min_periods=1).mean()
+    dsra_target = rolling_ds * dsra_months
+    sweep_amount = np.where(dscr_df["DSCR"].fillna(0.0) >= sweep_trigger, np.maximum(cfads.values - debt_monthly["debt_service"].values, 0.0) * sweep_pct, 0.0)
+    mmra_balance = np.cumsum(np.full(len(monthly_index), mmra_monthly))
+    dsra_funding = np.maximum(dsra_target.values - np.concatenate([[0.0], dsra_target.values[:-1]]), 0.0)
+    restricted_cash = np.maximum(dsra_target.values + mmra_balance, restricted_cash_min)
+    wc_draw = np.minimum(np.maximum(-project_cf.values, 0.0), wc_limit)
+    wc_interest = wc_draw * wc_rate / 12.0
+    distributable = np.maximum(cfads.values - debt_monthly["debt_service"].values - dsra_funding - mmra_monthly - sweep_amount - wc_interest, 0.0)
+    distributable = np.where(dscr_df["lockup_triggered"], 0.0, distributable)
+    cash_waterfall = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "dsra_target": dsra_target.values, "dsra_funding": dsra_funding, "mmra_contribution": mmra_monthly, "cash_sweep": sweep_amount, "wc_facility_draw": wc_draw, "wc_facility_interest": wc_interest, "restricted_cash": restricted_cash, "distributable_cash": distributable})
+
+    completion_table = cfg.get("completion_tests")
+    completion_rows: List[Dict[str, object]] = []
+    if isinstance(completion_table, pd.DataFrame) and not completion_table.empty:
+        for _, row in completion_table.iterrows():
+            if not bool(row.get("enabled", True)):
+                continue
+            metric_name = str(row.get("metric", "")).strip().lower()
+            threshold_value = float(row.get("threshold", 0.0) or 0.0)
+            if metric_name == "plant_availability":
+                measure = float(pd.to_numeric(statements.get("production", pd.DataFrame()).get("availability", pd.Series([0.0])), errors="coerce").mean())
+            elif metric_name == "dscr_min":
+                measure = float(np.nanmin(dscr_df["DSCR"].values)) if not dscr_df["DSCR"].dropna().empty else np.nan
+            else:
+                measure = np.nan
+            completion_rows.append({"metric": metric_name, "threshold": threshold_value, "measured": measure, "passed": bool(pd.notna(measure) and measure >= threshold_value), "test_date": row.get("test_date")})
+    completion_df = pd.DataFrame(completion_rows)
+    return {"credit_metrics_yearly": credit_metrics, "covenant_monitor": dscr_df, "cash_waterfall": cash_waterfall, "completion_tests": completion_df}
 ###############################################################################
 # Section 13: Dashboard and charts
 ###############################################################################
@@ -3959,6 +4383,58 @@ def run_scenarios(cfg: Mapping[str, object], run_model_fn: Callable[[Mapping[str
         metrics["scenario"] = name
         results.append(metrics)
     return pd.DataFrame(results)
+
+
+def _apply_lender_case(base_cfg: Mapping[str, object], case_row: Mapping[str, object]) -> Dict[str, object]:
+    cfg_case = copy.deepcopy(dict(base_cfg))
+    prod_mult = float(case_row.get("production_multiplier", 1.0) or 1.0)
+    price_mult = float(case_row.get("price_multiplier", 1.0) or 1.0)
+    opex_mult = float(case_row.get("opex_multiplier", 1.0) or 1.0)
+    capex_mult = float(case_row.get("capex_multiplier", 1.0) or 1.0)
+    delay_months = max(0, _coerce_int(case_row.get("delay_months"), 0))
+    debt_shift = float(case_row.get("debt_rate_shift", 0.0) or 0.0)
+
+    production_monthly = cfg_case.get("production_monthly")
+    if isinstance(production_monthly, pd.DataFrame) and "volume" in production_monthly.columns:
+        df = production_monthly.copy()
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0) * prod_mult
+        cfg_case["production_monthly"] = df
+    production_annual = cfg_case.get("production_annual")
+    if isinstance(production_annual, pd.DataFrame) and "annual_volume" in production_annual.columns:
+        df = production_annual.copy()
+        df["annual_volume"] = pd.to_numeric(df["annual_volume"], errors="coerce").fillna(0.0) * prod_mult
+        cfg_case["production_annual"] = df
+    prices = cfg_case.get("prices", {})
+    if isinstance(prices, dict):
+        for product in PRODUCTS:
+            if product in prices and isinstance(prices[product], dict):
+                prices[product]["base_price"] = float(prices[product].get("base_price", 0.0)) * price_mult
+    opex_cfg = cfg_case.get("opex", {})
+    if isinstance(opex_cfg, dict):
+        if "fixed_opex_per_month" in opex_cfg:
+            opex_cfg["fixed_opex_per_month"] = float(opex_cfg["fixed_opex_per_month"]) * opex_mult
+        if isinstance(opex_cfg.get("other_variable_cost_per_unit"), dict):
+            for key in list(opex_cfg["other_variable_cost_per_unit"].keys()):
+                opex_cfg["other_variable_cost_per_unit"][key] = float(opex_cfg["other_variable_cost_per_unit"][key]) * opex_mult
+    capex_lines = cfg_case.get("capex_lines")
+    if isinstance(capex_lines, pd.DataFrame) and "amount" in capex_lines.columns:
+        df = capex_lines.copy()
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0) * capex_mult
+        if delay_months > 0:
+            for col in ("start_date", "end_date"):
+                if col in df.columns:
+                    parsed = pd.to_datetime(df[col], errors="coerce")
+                    df[col] = (parsed + pd.DateOffset(months=delay_months)).dt.strftime("%Y-%m-%d")
+        cfg_case["capex_lines"] = df
+    debt_df = cfg_case.get("debt_tranches")
+    if isinstance(debt_df, pd.DataFrame):
+        df = debt_df.copy()
+        for col in ("interest_rate", "base_rate", "margin"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0) + debt_shift
+        cfg_case["debt_tranches"] = df
+    cfg_case["_disable_lender_case_eval"] = True
+    return cfg_case
 ###############################################################################
 # Section 15: Break-even analysis
 ###############################################################################
@@ -4202,6 +4678,8 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     price_curves = build_price_curves(cfg, timeline)
     revenue_df = build_revenue_stack(cfg, production_monthly, price_curves)
     capex_info = build_capex_depr_monthly(cfg, timeline)
+    capex_adjusted, construction_report = apply_construction_risk(cfg, timeline, capex_info["capex"])
+    capex_info["capex"] = capex_adjusted
     debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"])
 
     cost_df = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
@@ -4219,8 +4697,18 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
 
     statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+    tranches_df = cfg.get("debt_tranches")
+    has_sculpted = isinstance(tranches_df, pd.DataFrame) and (
+        ("sculpting_enabled" in tranches_df.columns and tranches_df["sculpting_enabled"].fillna(False).astype(bool).any())
+        or ("amortization" in tranches_df.columns and tranches_df["amortization"].astype(str).str.lower().eq("sculpted").any())
+    )
+    if has_sculpted:
+        cfads_series = statements.get("cashflow", pd.DataFrame()).set_index("date")["CFO"] if "cashflow" in statements else None
+        debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"], cfads_series=cfads_series)
+        statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
     valuation = project_cashflows(statements, cfg, timeline)
+    credit_outputs = evaluate_credit_and_waterfall(cfg, timeline, statements, debt_schedule, case_name="base")
     be_inputs_cfg = cfg.get("break_even_inputs") if isinstance(cfg.get("break_even_inputs"), pd.DataFrame) else None
     be = break_even_analysis(
         statements,
@@ -4264,6 +4752,11 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
             else be_inputs_cfg,
         ),
         "risk_profile": cfg.get("risk_profile", {}),
+        "construction_report": construction_report,
+        "credit_metrics_yearly": credit_outputs.get("credit_metrics_yearly", pd.DataFrame()),
+        "covenant_monitor": credit_outputs.get("covenant_monitor", pd.DataFrame()),
+        "cash_waterfall": credit_outputs.get("cash_waterfall", pd.DataFrame()),
+        "completion_tests_result": credit_outputs.get("completion_tests", pd.DataFrame()),
         "tornado_drivers": cfg.get("tornado_drivers").copy()
         if isinstance(cfg.get("tornado_drivers"), pd.DataFrame)
         else cfg.get("tornado_drivers"),
@@ -4273,7 +4766,29 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "scenario_comparison": cfg.get("scenario_comparison").copy()
         if isinstance(cfg.get("scenario_comparison"), pd.DataFrame)
         else cfg.get("scenario_comparison"),
+        "offtake_terms": cfg.get("offtake_terms").copy() if isinstance(cfg.get("offtake_terms"), pd.DataFrame) else cfg.get("offtake_terms"),
+        "dispatch_constraints": cfg.get("dispatch_constraints").copy() if isinstance(cfg.get("dispatch_constraints"), pd.DataFrame) else cfg.get("dispatch_constraints"),
+        "construction_schedule": cfg.get("construction_schedule").copy() if isinstance(cfg.get("construction_schedule"), pd.DataFrame) else cfg.get("construction_schedule"),
+        "reserve_accounts": cfg.get("reserve_accounts").copy() if isinstance(cfg.get("reserve_accounts"), pd.DataFrame) else cfg.get("reserve_accounts"),
+        "covenant_thresholds": cfg.get("covenant_thresholds").copy() if isinstance(cfg.get("covenant_thresholds"), pd.DataFrame) else cfg.get("covenant_thresholds"),
+        "lender_cases": cfg.get("lender_cases").copy() if isinstance(cfg.get("lender_cases"), pd.DataFrame) else cfg.get("lender_cases"),
     }
+    if not bool(cfg.get("_disable_lender_case_eval", False)):
+        lender_case_rows = cfg.get("lender_cases")
+        case_outputs: List[Dict[str, object]] = []
+        if isinstance(lender_case_rows, pd.DataFrame) and not lender_case_rows.empty:
+            for _, row in lender_case_rows.iterrows():
+                if not bool(row.get("enabled", True)):
+                    continue
+                case_name = str(row.get("case_name", "Case")).strip() or "Case"
+                case_cfg = _apply_lender_case(cfg, row.to_dict())
+                case_result = run_full_model(case_cfg, export_dir=None)
+                case_metrics = dict(case_result.get("metrics", {}))
+                case_metrics["case_name"] = case_name
+                case_metrics["assumption_version"] = f"{normalize_key(case_name)}-{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+                case_metrics["run_timestamp_utc"] = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                case_outputs.append(case_metrics)
+        results["lender_case_results"] = pd.DataFrame(case_outputs)
     if isinstance(staff_detail, pd.DataFrame):
         results["staff_costs_detail"] = staff_detail
         results["staff_costs_detail_annual"] = aggregate_annual(staff_detail)
