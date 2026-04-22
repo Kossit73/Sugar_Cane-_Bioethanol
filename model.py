@@ -2036,7 +2036,7 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
     price_by_product = {}
     if isinstance(risk_profile, dict):
         price_by_product = risk_profile.get("price_by_product", {}) or {}
-    if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty:
+    if isinstance(inflation_index, pd.DataFrame) and not inflation_index.empty and "date" in inflation_index.columns:
         idx = inflation_index.copy()
         idx["date"] = pd.to_datetime(idx["date"], errors="coerce")
         idx = idx.set_index("date").reindex(monthly_index).ffill().bfill()
@@ -2258,6 +2258,10 @@ def apply_construction_risk(cfg: Mapping[str, object], timeline: Timeline, capex
             }
         )
     adjusted = capex_df.copy()
+    if "date" not in adjusted.columns:
+        adjusted["date"] = monthly_index[: len(adjusted)] if len(adjusted) else pd.NaT
+    adjusted["date"] = pd.to_datetime(adjusted["date"], errors="coerce")
+    adjusted = adjusted.dropna(subset=["date"])
     adjusted = adjusted.set_index("date").reindex(monthly_index, fill_value=0.0).reset_index()
     adjusted["amount"] = capex_series.values
     adjusted["cumulative_capex"] = adjusted["amount"].cumsum()
@@ -2472,8 +2476,23 @@ def tax_block(pnl_df: pd.DataFrame, cfg: Mapping[str, object]) -> pd.DataFrame:
 
 def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df: pd.DataFrame, production_df: pd.DataFrame, capex_info: Dict[str, pd.DataFrame], debt_schedule: pd.DataFrame, wc_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
-    depreciation = capex_info["depreciation"].set_index("date").reindex(monthly_index, fill_value=0.0)["depr"].values
-    capex = capex_info["capex"].set_index("date").reindex(monthly_index, fill_value=0.0)["amount"].values
+    depreciation_df = capex_info.get("depreciation", pd.DataFrame()).copy()
+    if "date" not in depreciation_df.columns:
+        depreciation_df = pd.DataFrame({"date": monthly_index, "depr": 0.0})
+    depreciation_df["date"] = pd.to_datetime(depreciation_df["date"], errors="coerce")
+    depreciation_df = depreciation_df.dropna(subset=["date"])
+    if "depr" not in depreciation_df.columns:
+        depreciation_df["depr"] = 0.0
+    depreciation = depreciation_df.set_index("date").reindex(monthly_index, fill_value=0.0)["depr"].values
+
+    capex_df = capex_info.get("capex", pd.DataFrame()).copy()
+    if "date" not in capex_df.columns:
+        capex_df = pd.DataFrame({"date": monthly_index, "amount": 0.0})
+    capex_df["date"] = pd.to_datetime(capex_df["date"], errors="coerce")
+    capex_df = capex_df.dropna(subset=["date"])
+    if "amount" not in capex_df.columns:
+        capex_df["amount"] = 0.0
+    capex = capex_df.set_index("date").reindex(monthly_index, fill_value=0.0)["amount"].values
 
     direct_costs = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame()
     if isinstance(direct_costs, pd.DataFrame) and not direct_costs.empty:
@@ -2596,7 +2615,14 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     pnl_df = pnl_df.merge(tax_df[["date", "tax"]], on="date", how="left")
     pnl_df["NetIncome"] = pnl_df["EBIT"] - pnl_df["tax"]
 
-    delta_wc = wc_df.set_index("date")["delta_working_capital"].reindex(monthly_index, fill_value=0.0)
+    wc_work = wc_df.copy() if isinstance(wc_df, pd.DataFrame) else pd.DataFrame()
+    if "date" not in wc_work.columns:
+        wc_work = pd.DataFrame({"date": monthly_index, "delta_working_capital": 0.0})
+    wc_work["date"] = pd.to_datetime(wc_work["date"], errors="coerce")
+    wc_work = wc_work.dropna(subset=["date"])
+    if "delta_working_capital" not in wc_work.columns:
+        wc_work["delta_working_capital"] = 0.0
+    delta_wc = wc_work.set_index("date")["delta_working_capital"].reindex(monthly_index, fill_value=0.0)
     cash_from_ops = pnl_df["EBITDA"] - pnl_df["tax"] - delta_wc.values
     capex_outflow = capex
     debt_service = debt_schedule.groupby("date")["debt_service"].sum().reindex(monthly_index, fill_value=0.0)
