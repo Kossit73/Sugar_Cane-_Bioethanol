@@ -2782,10 +2782,19 @@ def evaluate_credit_and_waterfall(
 ) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
     cashflow = statements.get("cashflow", pd.DataFrame()).copy()
+    if cashflow.empty or "date" not in cashflow.columns:
+        empty = pd.DataFrame()
+        return {"credit_metrics_yearly": empty, "covenant_monitor": empty, "cash_waterfall": empty, "completion_tests": empty}
+    cashflow["date"] = pd.to_datetime(cashflow["date"], errors="coerce")
+    cashflow = cashflow.dropna(subset=["date"])
     if cashflow.empty:
         empty = pd.DataFrame()
         return {"credit_metrics_yearly": empty, "covenant_monitor": empty, "cash_waterfall": empty, "completion_tests": empty}
     debt_monthly = debt_schedule.groupby("date")[["debt_service", "balance"]].sum().reindex(monthly_index, fill_value=0.0)
+    if "CFO" not in cashflow.columns:
+        cashflow["CFO"] = 0.0
+    if "NetCashFlow" not in cashflow.columns:
+        cashflow["NetCashFlow"] = 0.0
     cfads = cashflow.set_index("date")["CFO"].reindex(monthly_index, fill_value=0.0)
     dscr = np.where(debt_monthly["debt_service"].values > 1e-9, cfads.values / debt_monthly["debt_service"].values, np.nan)
     dscr_df = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "DSCR": dscr, "balance": debt_monthly["balance"].values})
@@ -4703,7 +4712,14 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         or ("amortization" in tranches_df.columns and tranches_df["amortization"].astype(str).str.lower().eq("sculpted").any())
     )
     if has_sculpted:
-        cfads_series = statements.get("cashflow", pd.DataFrame()).set_index("date")["CFO"] if "cashflow" in statements else None
+        cfads_series = None
+        cashflow_for_sculpt = statements.get("cashflow", pd.DataFrame()) if "cashflow" in statements else pd.DataFrame()
+        if isinstance(cashflow_for_sculpt, pd.DataFrame) and not cashflow_for_sculpt.empty and "date" in cashflow_for_sculpt.columns:
+            cfads_source = cashflow_for_sculpt.copy()
+            cfads_source["date"] = pd.to_datetime(cfads_source["date"], errors="coerce")
+            cfads_source = cfads_source.dropna(subset=["date"])
+            if "CFO" in cfads_source.columns:
+                cfads_series = cfads_source.set_index("date")["CFO"]
         debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"], cfads_series=cfads_series)
         statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
