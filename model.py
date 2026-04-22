@@ -834,17 +834,8 @@ def align_with_projection_horizon(cfg: Dict[str, object]) -> Dict[str, object]:
 
     start_ts, end_ts = _projection_horizon_bounds(cfg.get("projection_horizon", DEFAULTS["horizon"]))
 
-    production_horizon = cfg.setdefault("production_horizon", dict(DEFAULTS["production_horizon"]))
-    production_horizon["start_year"] = max(
-        _coerce_int(production_horizon.get("start_year"), start_ts.year),
-        start_ts.year,
-    )
-    production_horizon["end_year"] = min(
-        _coerce_int(production_horizon.get("end_year"), end_ts.year),
-        end_ts.year,
-    )
-    if production_horizon["end_year"] < production_horizon["start_year"]:
-        production_horizon["end_year"] = production_horizon["start_year"]
+    # Production horizon is fused with the projection horizon for a simpler UX.
+    cfg["production_horizon"] = {"start_year": int(start_ts.year), "end_year": int(end_ts.year)}
 
     capex_df = cfg.get("capex_lines")
     if isinstance(capex_df, pd.DataFrame) and not capex_df.empty:
@@ -1599,10 +1590,6 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             cfg["projection_horizon"][key] = _coerce_int(value, cfg["projection_horizon"][key])
         elif key == "frequency":
             cfg["projection_horizon"]["frequency"] = str(value).lower()
-        elif key in {"production_start_year", "operations_start_year"}:
-            cfg["production_horizon"]["start_year"] = _coerce_int(value, cfg["production_horizon"]["start_year"])
-        elif key in {"production_end_year", "operations_end_year"}:
-            cfg["production_horizon"]["end_year"] = _coerce_int(value, cfg["production_horizon"]["end_year"])
         elif key in cfg["global_inputs"]:
             if isinstance(cfg["global_inputs"][key], str):
                 cfg["global_inputs"][key] = _coerce_str(value, cfg["global_inputs"][key])
@@ -1643,18 +1630,10 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
             "frequency": horizon_row.get("frequency", cfg["projection_horizon"]["frequency"]),
         })
 
-    tables.ensure_table("production_horizon")
-    if not tables.tables["production_horizon"].empty:
-        prod_row = tables.tables["production_horizon"].iloc[0]
-        cfg["production_horizon"].update({
-            "start_year": _coerce_int(prod_row.get("start_year"), cfg["production_horizon"]["start_year"]),
-            "end_year": _coerce_int(prod_row.get("end_year"), cfg["production_horizon"]["end_year"]),
-        })
-
-    if cfg["production_horizon"]["start_year"] < cfg["projection_horizon"]["start_year"]:
-        cfg["production_horizon"]["start_year"] = cfg["projection_horizon"]["start_year"]
-    if cfg["production_horizon"]["end_year"] > cfg["projection_horizon"]["end_year"]:
-        cfg["production_horizon"]["end_year"] = cfg["projection_horizon"]["end_year"]
+    cfg["production_horizon"] = {
+        "start_year": int(cfg["projection_horizon"]["start_year"]),
+        "end_year": int(cfg["projection_horizon"]["end_year"]),
+    }
 
     if not tables.ensure_table("global_inputs").empty:
         global_row = tables.tables["global_inputs"].iloc[0]
@@ -2924,7 +2903,10 @@ def build_dashboard(
     out_dir: Optional[Path] = None,
 ) -> Dict[str, object]:
     horizon = cfg["projection_horizon"]
-    production_horizon = cfg.get("production_horizon", DEFAULTS["production_horizon"])
+    production_horizon = {
+        "start_year": horizon["start_year"],
+        "end_year": horizon["end_year"],
+    }
     global_inputs = cfg["global_inputs"]
     metrics = valuation["metrics"]
 

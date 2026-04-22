@@ -405,7 +405,6 @@ def _friendly_label(label: str) -> str:
 
 def _render_horizon_timeline_chart(
     horizon: Mapping[str, object],
-    production_horizon: Mapping[str, object],
 ) -> None:
     try:
         proj_start = pd.Timestamp(
@@ -418,12 +417,8 @@ def _render_horizon_timeline_chart(
         st.info("Projection horizon is incomplete; add start and end years to view the timeline.")
         return
 
-    try:
-        prod_start = pd.Timestamp(year=int(production_horizon.get("start_year", proj_start.year)), month=1, day=1)
-        prod_end = pd.Timestamp(year=int(production_horizon.get("end_year", proj_end.year)), month=12, day=31)
-    except Exception:
-        prod_start = proj_start
-        prod_end = proj_end
+    prod_start = proj_start
+    prod_end = proj_end
 
     bars = [
         ("Projection horizon", proj_start, proj_end, "#1f77b4"),
@@ -1761,7 +1756,6 @@ def _sync_tables_from_state(tables: InputTables) -> Dict[str, str]:
 
 LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
     ("Projection Horizon", "projection_horizon", "Define the calendar start and end of the modeling period."),
-    ("Production Horizon", "production_horizon", "Limit operating volumes to the active production window."),
     ("Global Inputs", "global_inputs", "Corporate tax, discount rate, and ownership split."),
     (
         "Working Capital Assumptions",
@@ -2643,10 +2637,7 @@ def main() -> None:
     st.session_state.pop("scenario_payload_cache", None)
 
     horizon = cfg["projection_horizon"]
-    production_horizon = cfg.get(
-        "production_horizon",
-        {"start_year": horizon["start_year"], "end_year": horizon["end_year"]},
-    )
+    production_horizon = {"start_year": horizon["start_year"], "end_year": horizon["end_year"]}
 
     with model_controls_tab:
         st.subheader("Model Controls")
@@ -2682,33 +2673,9 @@ def main() -> None:
                     "start_month": int(start_month),
                 }
             )
-            st.markdown("### Production horizon")
-            prod_start_default = int(production_horizon.get("start_year", start_year))
-            prod_start_default = max(prod_start_default, int(start_year))
-            prod_start_default = min(prod_start_default, int(end_year))
-            prod_start_year = st.number_input(
-                "Production start year",
-                value=prod_start_default,
-                min_value=int(start_year),
-                max_value=int(end_year),
-                step=1,
-            )
-            prod_end_default = int(production_horizon.get("end_year", end_year))
-            prod_end_default = max(prod_end_default, int(prod_start_year))
-            prod_end_default = min(prod_end_default, int(end_year))
-            prod_end_year = st.number_input(
-                "Production end year",
-                value=prod_end_default,
-                min_value=int(prod_start_year),
-                max_value=int(end_year),
-                step=1,
-            )
-            if prod_end_year < prod_start_year:
-                st.warning("Production end year adjusted to be no earlier than the start year.")
-                prod_end_year = prod_start_year
-            production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
+            production_horizon.update({"start_year": int(start_year), "end_year": int(end_year)})
             cfg["production_horizon"] = production_horizon
-            st.caption("Production volumes are set to zero outside the defined production horizon.")
+            st.caption("Production horizon is automatically aligned to the projection horizon.")
             try:
                 tables.set_table("projection_horizon", pd.DataFrame([horizon]))
                 _update_editor_state("projection_horizon", tables)
@@ -3038,7 +3005,7 @@ def main() -> None:
                     st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
 
         st.markdown("### Horizon overview")
-        _render_horizon_timeline_chart(horizon, production_horizon)
+        _render_horizon_timeline_chart(horizon)
 
         st.markdown("### Assumption-driven visuals")
         st.caption("Charts below reflect the current input schedules and help validate annualised assumptions.")
