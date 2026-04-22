@@ -1768,6 +1768,7 @@ LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
         "Detailed plant and farm investment lines with depreciation lives and VAT timing.",
     ),
     ("Product Pricing Inputs", "revenue_params", "Product pricing, escalation, and indexation."),
+    ("Yearly Increment Factors", "yearly_increments", "Apply annual increment percentages and propagate them across price, opex, debt, capex, working capital, and tax."),
     (
         "Production Volumes (Annual)",
         "production_annual",

@@ -548,6 +548,13 @@ DEFAULTS = {
             },
         ]
     ),
+    "yearly_increments": pd.DataFrame(
+        [
+            {"year": 2025, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"year": 2026, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+            {"year": 2027, "global_increment_pct": 0.0, "price_increment_pct": 0.0, "opex_increment_pct": 0.0, "debt_increment_pct": 0.0, "capex_increment_pct": 0.0, "wc_increment_pct": 0.0, "tax_increment_pct": 0.0},
+        ]
+    ),
 }
 
 
@@ -1436,6 +1443,27 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         },
         defaults={"enabled": True, "production_multiplier": 1.0, "price_multiplier": 1.0, "opex_multiplier": 1.0, "capex_multiplier": 1.0, "delay_months": 0, "debt_rate_shift": 0.0},
     ),
+    "yearly_increments": TableSchema(
+        columns={
+            "year": "int",
+            "global_increment_pct": "float",
+            "price_increment_pct": "float",
+            "opex_increment_pct": "float",
+            "debt_increment_pct": "float",
+            "capex_increment_pct": "float",
+            "wc_increment_pct": "float",
+            "tax_increment_pct": "float",
+        },
+        defaults={
+            "global_increment_pct": 0.0,
+            "price_increment_pct": 0.0,
+            "opex_increment_pct": 0.0,
+            "debt_increment_pct": 0.0,
+            "capex_increment_pct": 0.0,
+            "wc_increment_pct": 0.0,
+            "tax_increment_pct": 0.0,
+        },
+    ),
 }
 
 
@@ -1583,6 +1611,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "reserve_accounts": DEFAULTS["reserve_accounts"].copy(),
         "covenant_thresholds": DEFAULTS["covenant_thresholds"].copy(),
         "lender_cases": DEFAULTS["lender_cases"].copy(),
+        "yearly_increments": DEFAULTS["yearly_increments"].copy(),
     }
 
     for key, value in assumptions.items():
@@ -1678,6 +1707,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "reserve_accounts",
         "covenant_thresholds",
         "lender_cases",
+        "yearly_increments",
     ):
         df = tables.ensure_table(table_name)
         if not df.empty:
@@ -1727,6 +1757,7 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "reserve_accounts",
         "covenant_thresholds",
         "lender_cases",
+        "yearly_increments",
     ):
         if not isinstance(cfg.get(table_name), pd.DataFrame) or cfg[table_name].empty:
             cfg[table_name] = DEFAULTS[table_name].copy()
@@ -1751,6 +1782,65 @@ class Timeline:
 
     def annual_index(self) -> List[int]:
         return list(range(self.start_year, self.end_year + 1))
+
+
+def build_yearly_increment_factors(cfg: Mapping[str, object], timeline: Timeline) -> pd.DataFrame:
+    """Return monthly cumulative factors for global/price/opex/debt/capex/wc/tax."""
+
+    monthly_index = timeline.monthly_index()
+    columns = [
+        "global_factor",
+        "price_factor",
+        "opex_factor",
+        "debt_factor",
+        "capex_factor",
+        "wc_factor",
+        "tax_factor",
+    ]
+    increments_df = cfg.get("yearly_increments")
+    if not isinstance(increments_df, pd.DataFrame) or increments_df.empty:
+        return pd.DataFrame({"date": monthly_index, **{col: 1.0 for col in columns}})
+
+    inc = increments_df.copy()
+    if "year" not in inc.columns:
+        return pd.DataFrame({"date": monthly_index, **{col: 1.0 for col in columns}})
+    inc["year"] = pd.to_numeric(inc["year"], errors="coerce").fillna(0).astype(int)
+    inc = inc.sort_values("year")
+    year_rows = pd.DataFrame({"year": sorted(set(monthly_index.year))})
+    inc = year_rows.merge(inc, on="year", how="left").fillna(0.0)
+
+    pct_map = {
+        "global_factor": "global_increment_pct",
+        "price_factor": "price_increment_pct",
+        "opex_factor": "opex_increment_pct",
+        "debt_factor": "debt_increment_pct",
+        "capex_factor": "capex_increment_pct",
+        "wc_factor": "wc_increment_pct",
+        "tax_factor": "tax_increment_pct",
+    }
+    for factor_col, pct_col in pct_map.items():
+        pct = pd.to_numeric(inc.get(pct_col, 0.0), errors="coerce").fillna(0.0)
+        global_pct = pd.to_numeric(inc.get("global_increment_pct", 0.0), errors="coerce").fillna(0.0)
+        combined = (1.0 + global_pct) * (1.0 + pct) - 1.0
+        inc[factor_col] = (1.0 + combined).cumprod()
+
+    monthly = pd.DataFrame({"date": monthly_index})
+    monthly["year"] = monthly["date"].dt.year
+    monthly = monthly.merge(inc[["year", *columns]], on="year", how="left").drop(columns=["year"])
+    for col in columns:
+        monthly[col] = pd.to_numeric(monthly[col], errors="coerce").fillna(method="ffill").fillna(1.0)
+    return monthly
+
+
+def get_increment_series(cfg: Mapping[str, object], timeline: Timeline, factor_col: str) -> pd.Series:
+    factors = cfg.get("_increment_factors")
+    monthly_index = timeline.monthly_index()
+    if isinstance(factors, pd.DataFrame) and not factors.empty and {"date", factor_col}.issubset(factors.columns):
+        work = factors.copy()
+        work["date"] = pd.to_datetime(work["date"], errors="coerce")
+        work = work.dropna(subset=["date"]).set_index("date")
+        return pd.to_numeric(work[factor_col], errors="coerce").reindex(monthly_index, fill_value=1.0).fillna(1.0)
+    return pd.Series(1.0, index=monthly_index)
 ###############################################################################
 # Section 6: Production modeling
 ###############################################################################
@@ -2008,6 +2098,7 @@ def build_production_tables(cfg: Mapping[str, object], timeline: Timeline) -> Tu
 
 def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.DataFrame:
     monthly_index = timeline.monthly_index()
+    price_increment = get_increment_series(cfg, timeline, "price_factor")
     inflation_rate = cfg["global_inputs"].get("inflation_rate", DEFAULTS["global"]["inflation_rate"])
     inflation_index = cfg.get("inflation_index")
     risk_profile = cfg.get("risk_profile", {})
@@ -2038,6 +2129,7 @@ def build_price_curves(cfg: Mapping[str, object], timeline: Timeline) -> pd.Data
             price = base_price * ((1 + monthly_escalation) ** i)
             if params.get("price_indexation", "cpi").lower() == "cpi" and "cpi" in idx:
                 price *= idx.loc[date, "cpi"]
+            price *= float(price_increment.loc[date]) if date in price_increment.index else 1.0
             price *= price_multiplier * product_multiplier
             records.append({"date": date, "product": product, "price": price, "uom": params.get("uom", "")})
     return pd.DataFrame(records)
@@ -2119,6 +2211,7 @@ def parse_date_str(value: object, default: pd.Timestamp) -> pd.Timestamp:
 
 def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
+    capex_increment = get_increment_series(cfg, timeline, "capex_factor")
     capex_lines = cfg.get("capex_lines")
     if not isinstance(capex_lines, pd.DataFrame) or capex_lines.empty:
         capex_lines = pd.DataFrame(
@@ -2156,14 +2249,15 @@ def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> D
         for date in dates:
             if date not in monthly_index:
                 continue
+            escalated_amount = monthly_amount * float(capex_increment.loc[date]) if date in capex_increment.index else monthly_amount
             capex_records.append(
                 {
                     "date": date,
                     "item_name": row.get("item_name"),
                     "category": row.get("category"),
-                    "amount": monthly_amount,
+                    "amount": escalated_amount,
                     "currency": row.get("currency", "USD"),
-                    "vat_outflow": monthly_amount * float(row.get("vat_rate", 0.0)),
+                    "vat_outflow": escalated_amount * float(row.get("vat_rate", 0.0)),
                     "is_farm_capex": bool(row.get("is_farm_capex", False)),
                 }
             )
@@ -2182,7 +2276,7 @@ def build_capex_depr_monthly(cfg: Mapping[str, object], timeline: Timeline) -> D
                 {
                     "date": monthly_index[idx],
                     "item_name": row.get("item_name"),
-                    "depr": amount / life_months,
+                    "depr": (amount / life_months) * float(capex_increment.loc[monthly_index[idx]]),
                 }
             )
 
@@ -2212,6 +2306,7 @@ def apply_construction_risk(cfg: Mapping[str, object], timeline: Timeline, capex
         return capex_df, empty
     records: List[Dict[str, object]] = []
     capex_series = pd.Series(0.0, index=monthly_index)
+    capex_increment = get_increment_series(cfg, timeline, "capex_factor")
     for _, row in construction.iterrows():
         amount = float(row.get("amount", 0.0) or 0.0)
         contingency = float(row.get("contingency_amount", 0.0) or 0.0)
@@ -2222,7 +2317,8 @@ def apply_construction_risk(cfg: Mapping[str, object], timeline: Timeline, capex
         if local_index.empty:
             local_index = pd.DatetimeIndex([start])
         curve = parse_draw_curve(row.get("draw_curve"), local_index)
-        package_total = amount + contingency
+        start_factor = float(capex_increment.loc[start]) if start in capex_increment.index else 1.0
+        package_total = (amount + contingency) * start_factor
         for dt, val in curve.items():
             if dt in capex_series.index:
                 capex_series.loc[dt] += float(val) * package_total
@@ -2296,6 +2392,7 @@ def build_debt_schedule(
     cfads_series: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     monthly_index = timeline.monthly_index()
+    debt_increment = get_increment_series(cfg, timeline, "debt_factor")
     tranches = cfg.get("debt_tranches") if "debt_tranches" in cfg else cfg["debt"].get("tranches", [])
     if isinstance(tranches, pd.DataFrame):
         tranches = tranches.to_dict("records")
@@ -2323,7 +2420,7 @@ def build_debt_schedule(
             else:
                 draw_curve = draw_curve / total
         draws = draw_curve * principal_total
-        rate = float(tranche.get("interest_rate", cfg["debt"].get("global_rate", 0.1))) + float(tranche.get("base_rate", 0.0)) + float(tranche.get("margin", 0.0))
+        base_rate_total = float(tranche.get("interest_rate", cfg["debt"].get("global_rate", 0.1))) + float(tranche.get("base_rate", 0.0)) + float(tranche.get("margin", 0.0))
         tenor_years = max(0, _coerce_int(tranche.get("tenor_years"), 8))
         grace_years = max(0, _coerce_int(tranche.get("grace_years"), 1))
         capitalize_idc = bool(tranche.get("capitalize_idc", True))
@@ -2337,11 +2434,14 @@ def build_debt_schedule(
         services = []
         balance = 0.0
         annuity_payment = None
-        monthly_rate = rate / 12
+        first_factor = float(debt_increment.iloc[loan_start_idx]) if len(debt_increment) > loan_start_idx else 1.0
+        monthly_rate = (base_rate_total * first_factor) / 12
         for i, date in enumerate(monthly_index):
+            effective_rate = base_rate_total * float(debt_increment.loc[date]) if date in debt_increment.index else base_rate_total
+            monthly_rate_i = effective_rate / 12.0
             draw = draws.iloc[i]
             balance += draw
-            interest = balance * monthly_rate
+            interest = balance * monthly_rate_i
             principal_payment = 0.0
             months_since_start = max(0, i - loan_start_idx)
             years_since_start = months_since_start // 12
@@ -2349,11 +2449,11 @@ def build_debt_schedule(
                 if amortization == "annuity":
                     if annuity_payment is None:
                         n = tenor_years * 12
-                        if monthly_rate == 0:
+                        if monthly_rate_i == 0:
                             annuity_payment = principal_total / n
                         else:
-                            factor = (1 + monthly_rate) ** n
-                            annuity_payment = principal_total * (monthly_rate * factor) / max(1e-9, factor - 1)
+                            factor = (1 + monthly_rate_i) ** n
+                            annuity_payment = principal_total * (monthly_rate_i * factor) / max(1e-9, factor - 1)
                         principal_payment = max(0.0, annuity_payment - interest)
                 elif sculpting_enabled and cfads_series is not None:
                     cfads_value = float(cfads_series.reindex(monthly_index, fill_value=0.0).iloc[i])
@@ -2405,10 +2505,14 @@ def working_capital_block(revenue_df: pd.DataFrame, cost_df: pd.DataFrame, cfg: 
     dso = wc_days.get("dso_days", DEFAULTS["working_capital"]["dso_days"])
     dio = wc_days.get("dio_days", DEFAULTS["working_capital"]["dio_days"])
     dpo = wc_days.get("dpo_days", DEFAULTS["working_capital"]["dpo_days"])
+    wc_factor = get_increment_series(cfg, timeline, "wc_factor")
+    dso_series = float(dso) * wc_factor
+    dio_series = float(dio) * wc_factor
+    dpo_series = float(dpo) * wc_factor
 
-    ar = revenue * dso / 365.0
-    inv = cost * dio / 365.0
-    ap = cost * dpo / 365.0
+    ar = revenue * dso_series / 365.0
+    inv = cost * dio_series / 365.0
+    ap = cost * dpo_series / 365.0
     net_wc = ar + inv - ap
     delta_wc = net_wc.diff().fillna(net_wc)
 
@@ -2431,14 +2535,28 @@ def tax_block(pnl_df: pd.DataFrame, cfg: Mapping[str, object]) -> pd.DataFrame:
 
     nol_queue: List[Tuple[int, float]] = []
     rows: List[Dict[str, object]] = []
+    tax_factor_by_year: Dict[int, float] = {}
+    increments_df = cfg.get("yearly_increments")
+    if isinstance(increments_df, pd.DataFrame) and not increments_df.empty and "year" in increments_df.columns:
+        inc = increments_df.copy()
+        inc["year"] = pd.to_numeric(inc["year"], errors="coerce").fillna(0).astype(int)
+        global_pct = pd.to_numeric(inc.get("global_increment_pct", 0.0), errors="coerce").fillna(0.0)
+        tax_pct = pd.to_numeric(inc.get("tax_increment_pct", 0.0), errors="coerce").fillna(0.0)
+        combined = (1.0 + global_pct) * (1.0 + tax_pct) - 1.0
+        inc["tax_factor"] = (1.0 + combined).cumprod()
+        tax_factor_by_year = dict(zip(inc["year"], inc["tax_factor"]))
     for idx, row in pnl_df.iterrows():
         date = row["date"]
+        year = pd.Timestamp(date).year if not pd.isna(date) else 0
+        tax_factor = float(tax_factor_by_year.get(year, 1.0))
+        effective_base_rate = max(float(base_rate) * tax_factor, 0.0)
+        effective_min_tax = max(float(min_tax) * tax_factor, 0.0)
         taxable_income = row["EBIT"]
         available_loss = sum(val for _, val in nol_queue)
         taxable_after_loss = taxable_income - available_loss
         tax = 0.0
         if taxable_after_loss > 0:
-            tax = max(taxable_after_loss * base_rate, taxable_after_loss * min_tax)
+            tax = max(taxable_after_loss * effective_base_rate, taxable_after_loss * effective_min_tax)
             nol_queue.clear()
         else:
             nol_queue.append((idx, -taxable_after_loss))
@@ -2455,6 +2573,7 @@ def tax_block(pnl_df: pd.DataFrame, cfg: Mapping[str, object]) -> pd.DataFrame:
 
 def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df: pd.DataFrame, production_df: pd.DataFrame, capex_info: Dict[str, pd.DataFrame], debt_schedule: pd.DataFrame, wc_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
+    opex_factor = get_increment_series(cfg, timeline, "opex_factor")
     depreciation_df = capex_info.get("depreciation", pd.DataFrame()).copy()
     if "date" not in depreciation_df.columns:
         depreciation_df = pd.DataFrame({"date": monthly_index, "depr": 0.0})
@@ -2486,6 +2605,7 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         })
     direct_costs = _derive_direct_costs(direct_costs)
     direct_costs_total = direct_costs.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=0.0)
+    direct_costs_total = direct_costs_total * opex_factor
 
     staff_costs = cfg.get("staff_costs_monthly") if "staff_costs_monthly" in cfg else pd.DataFrame()
     default_currency = cfg.get("global_inputs", {}).get(
@@ -2537,6 +2657,14 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     if not math.isclose(labour_multiplier, 1.0):
         for col in ("gross_pay", "benefits", "training", "other"):
             staff_costs_detail[col] *= labour_multiplier
+    staff_costs_detail = staff_costs_detail.merge(
+        opex_factor.rename("opex_factor").rename_axis("date").reset_index(),
+        on="date",
+        how="left",
+    )
+    for col in ("gross_pay", "benefits", "training", "other", "total_cost"):
+        if col in staff_costs_detail.columns:
+            staff_costs_detail[col] = pd.to_numeric(staff_costs_detail[col], errors="coerce").fillna(0.0) * staff_costs_detail["opex_factor"].fillna(1.0)
     for col in ("gross_pay", "benefits", "training", "other"):
         staff_costs_detail[f"{col}_per_head"] = np.where(
             staff_costs_detail["headcount"] > 0,
@@ -2566,6 +2694,7 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
     else:
         other_opex = pd.DataFrame({"date": monthly_index, "amount": DEFAULTS["opex"]["fixed_opex_per_month"]})
     other_opex_total = other_opex.groupby("date")["amount"].sum().reindex(monthly_index, fill_value=DEFAULTS["opex"]["fixed_opex_per_month"])
+    other_opex_total = other_opex_total * opex_factor
 
     revenue_total = revenue_df.groupby("date")["revenue"].sum().reindex(monthly_index, fill_value=0.0)
     cogs_total = direct_costs_total + other_opex_total
@@ -4691,6 +4820,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         end_year=int(cfg["projection_horizon"]["end_year"]),
         start_month=int(cfg["projection_horizon"].get("start_month", 1)),
     )
+    cfg["_increment_factors"] = build_yearly_increment_factors(cfg, timeline)
     production_monthly, production_annual = build_production_tables(cfg, timeline)
     price_curves = build_price_curves(cfg, timeline)
     revenue_df = build_revenue_stack(cfg, production_monthly, price_curves)
@@ -4796,6 +4926,8 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "reserve_accounts": cfg.get("reserve_accounts").copy() if isinstance(cfg.get("reserve_accounts"), pd.DataFrame) else cfg.get("reserve_accounts"),
         "covenant_thresholds": cfg.get("covenant_thresholds").copy() if isinstance(cfg.get("covenant_thresholds"), pd.DataFrame) else cfg.get("covenant_thresholds"),
         "lender_cases": cfg.get("lender_cases").copy() if isinstance(cfg.get("lender_cases"), pd.DataFrame) else cfg.get("lender_cases"),
+        "yearly_increments": cfg.get("yearly_increments").copy() if isinstance(cfg.get("yearly_increments"), pd.DataFrame) else cfg.get("yearly_increments"),
+        "increment_factors": cfg.get("_increment_factors").copy() if isinstance(cfg.get("_increment_factors"), pd.DataFrame) else cfg.get("_increment_factors"),
     }
     if not bool(cfg.get("_disable_lender_case_eval", False)):
         lender_case_rows = cfg.get("lender_cases")
