@@ -118,6 +118,20 @@ def _option_index(options: Sequence[str], value: str, default: int = 0) -> int:
         return default if 0 <= default < len(options) else 0
 
 
+def _float_option_values(start: float, stop: float, step: float, digits: int = 6) -> List[float]:
+    """Return an inclusive list of float options suitable for dropdown widgets."""
+
+    if step <= 0:
+        return [round(start, digits)]
+    count = int(round((stop - start) / step))
+    if count < 0:
+        return [round(start, digits)]
+    values = [round(start + idx * step, digits) for idx in range(count + 1)]
+    if values and values[-1] < round(stop, digits):
+        values.append(round(stop, digits))
+    return values
+
+
 @contextmanager
 def _modal_container(title: str):
     """Yield a modal-like container, falling back when `st.modal` is unavailable."""
@@ -2708,12 +2722,13 @@ def main() -> None:
                 step=0.01,
                 format="%.4f",
             )
-            investor_share = st.slider(
+            investor_options = _float_option_values(0.0, 1.0, 0.05, digits=2)
+            investor_share_default = float(global_inputs.get("investor_share", 0.6))
+            investor_share = st.selectbox(
                 "Investor equity share",
-                min_value=0.0,
-                max_value=1.0,
-                value=float(global_inputs.get("investor_share", 0.6)),
-                step=0.05,
+                investor_options,
+                index=min(range(len(investor_options)), key=lambda idx: abs(investor_options[idx] - investor_share_default)),
+                format_func=lambda value: f"{value:.0%}",
             )
             global_inputs.update(
                 {
@@ -2742,19 +2757,21 @@ def main() -> None:
                 step=10_000.0,
                 format="%.0f",
             )
-            availability = st.slider(
+            availability_options = _float_option_values(0.5, 1.0, 0.01, digits=2)
+            availability_default = float(production_cfg.get("plant_availability", 0.9))
+            availability = st.selectbox(
                 "Plant availability",
-                min_value=0.5,
-                max_value=1.0,
-                value=float(production_cfg.get("plant_availability", 0.9)),
-                step=0.01,
+                availability_options,
+                index=min(range(len(availability_options)), key=lambda idx: abs(availability_options[idx] - availability_default)),
+                format_func=lambda value: f"{value:.0%}",
             )
-            loss_factor = st.slider(
+            loss_factor_options = _float_option_values(0.0, 0.2, 0.005, digits=3)
+            loss_factor_default = float(production_cfg.get("loss_factor", 0.02))
+            loss_factor = st.selectbox(
                 "Process loss factor",
-                min_value=0.0,
-                max_value=0.2,
-                value=float(production_cfg.get("loss_factor", 0.02)),
-                step=0.005,
+                loss_factor_options,
+                index=min(range(len(loss_factor_options)), key=lambda idx: abs(loss_factor_options[idx] - loss_factor_default)),
+                format_func=lambda value: f"{value:.1%}",
             )
             production_cfg.update(
                 {
@@ -2770,12 +2787,13 @@ def main() -> None:
             )
             production_cfg["feedstock_scenario"] = scenario
             if scenario == "HYBRID":
-                farm_share = st.slider(
+                farm_share_options = _float_option_values(0.0, 1.0, 0.05, digits=2)
+                farm_share_default = float(production_cfg.get("farm_share", 0.5))
+                farm_share = st.selectbox(
                     "Hybrid farm share",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(production_cfg.get("farm_share", 0.5)),
-                    step=0.05,
+                    farm_share_options,
+                    index=min(range(len(farm_share_options)), key=lambda idx: abs(farm_share_options[idx] - farm_share_default)),
+                    format_func=lambda value: f"{value:.0%}",
                 )
                 production_cfg["farm_share"] = float(farm_share)
 
