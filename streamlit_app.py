@@ -304,6 +304,65 @@ def _build_chatbot_fallback_reply(
     ).strip()
 
 
+def _build_lightweight_plan(
+    user_prompt: str,
+    prior_plans: Sequence[Mapping[str, object]],
+    sandbox_enabled: bool,
+    web_enabled: bool,
+) -> Dict[str, object]:
+    """Generate a lightweight per-turn plan that can be reused by follow-up turns."""
+
+    prompt = user_prompt.strip()
+    prompt_lower = prompt.lower()
+    prior_objective = ""
+    for item in reversed(prior_plans):
+        prior_objective = str(item.get("objective", "")).strip()
+        if prior_objective:
+            break
+
+    objective = prompt
+    if not objective and prior_objective:
+        objective = prior_objective
+    if not objective:
+        objective = "Provide a reasoned analytical response to the user's request."
+
+    sandbox_needed = sandbox_enabled and any(
+        token in prompt_lower
+        for token in (
+            "calculate",
+            "calc",
+            "simulate",
+            "simulation",
+            "python",
+            "code",
+            "table",
+            "dataframe",
+            "model this",
+        )
+    )
+    web_needed = web_enabled and any(
+        token in prompt_lower
+        for token in (
+            "benchmark",
+            "compare",
+            "market",
+            "industry",
+            "latest",
+            "current",
+            "reference",
+            "best practice",
+        )
+    )
+
+    return {
+        "objective": objective,
+        "clarification": "Objective set from current prompt; falls back to prior turn objective when needed.",
+        "sandbox_needed": sandbox_needed,
+        "web_needed": web_needed,
+        "execution": "Run selected tools, then synthesize a concise prose answer with interpretation and recommendation.",
+    }
+
+
 def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
     st.subheader("Intelligent Analytical Chatbot")
     st.caption(
@@ -312,6 +371,7 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
     )
 
     history = st.session_state.setdefault("chat_history", [])
+    plans = st.session_state.setdefault("chat_plans", [])
     provider_options = list(CHAT_PROVIDER_DEFAULTS.keys())
     selected_provider = st.selectbox("Provider", provider_options, key="chat_provider")
     defaults = CHAT_PROVIDER_DEFAULTS[selected_provider]
@@ -339,7 +399,20 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             st.info("No messages yet.")
         if st.button("Clear history", key="clear_chat_history"):
             st.session_state["chat_history"] = []
+            st.session_state["chat_plans"] = []
             _safe_rerun()
+
+    with st.expander("Planner memory", expanded=False):
+        if plans:
+            for idx, plan in enumerate(plans[-5:], start=max(1, len(plans) - 4)):
+                st.markdown(
+                    f"**Turn {idx} objective:** {plan.get('objective', '')}\n\n"
+                    f"- Sandbox needed: {plan.get('sandbox_needed')}\n"
+                    f"- Web needed: {plan.get('web_needed')}\n"
+                    f"- Execution: {plan.get('execution', '')}"
+                )
+        else:
+            st.caption("No saved plans yet.")
 
     use_sandbox = st.checkbox("Use sandbox execution for intermediate calculations", value=True, key="chat_use_sandbox")
     use_web = st.checkbox("Use web search for comparative analysis", value=True, key="chat_use_web")
@@ -367,13 +440,21 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             use_tools=bool(use_sandbox),
             use_web_search=bool(use_web),
         )
+        plan = _build_lightweight_plan(
+            user_prompt=user_prompt,
+            prior_plans=plans,
+            sandbox_enabled=settings.use_tools,
+            web_enabled=settings.use_web_search and _chat_supports(selected_provider, "supports_web_search"),
+        )
+        plans.append(plan)
+        st.session_state["chat_plans"] = plans
 
         sandbox_output: Dict[str, object] = {"used": False}
-        if settings.use_tools and sandbox_code.strip():
+        if bool(plan.get("sandbox_needed")) and sandbox_code.strip():
             sandbox_output = _run_sandbox(sandbox_code)
 
         web_sources: List[Dict[str, str]] = []
-        if settings.use_web_search and _chat_supports(selected_provider, "supports_web_search"):
+        if bool(plan.get("web_needed")):
             web_sources = _web_comparison_search(user_prompt, limit=5)
 
         compact_metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
@@ -420,6 +501,13 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
 
         st.markdown("### Direct answer")
         st.write(assistant_text)
+        st.markdown("### Planner step")
+        st.write(
+            f"Objective: {plan.get('objective')}\n\n"
+            f"Clarification: {plan.get('clarification')}\n\n"
+            f"Sandbox needed: {plan.get('sandbox_needed')} | Web needed: {plan.get('web_needed')}\n\n"
+            f"Execution plan: {plan.get('execution')}"
+        )
         st.markdown("### Internal reasoning")
         st.info("Reasoning summary is embedded in the assistant response.")
         st.markdown("### Sandbox output")
