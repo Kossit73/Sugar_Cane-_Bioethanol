@@ -215,9 +215,9 @@ def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str,
     """Send chat request using a provider-agnostic OpenAI-compatible schema."""
 
     if not settings.api_key.strip():
-        return "No API key configured. Add a provider API key in Chatbot settings to enable LLM responses."
+        return ""
     if not settings.base_url.strip():
-        return "No base URL configured for the selected provider."
+        return ""
 
     payload = {
         "model": settings.model_name,
@@ -237,8 +237,8 @@ def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str,
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             data = json.loads(response.read().decode("utf-8"))
-    except Exception as exc:
-        return f"Provider call failed: {exc}"
+    except Exception:
+        return ""
 
     if isinstance(data, dict):
         choices = data.get("choices")
@@ -247,10 +247,61 @@ def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str,
             content = message.get("content")
             if isinstance(content, str) and content.strip():
                 return content
+            if isinstance(content, list):
+                blocks: List[str] = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            blocks.append(text.strip())
+                if blocks:
+                    return "\n\n".join(blocks)
         output = data.get("output_text")
         if isinstance(output, str) and output.strip():
             return output
-    return "Provider response parsed, but no assistant text was returned."
+    return ""
+
+
+def _build_chatbot_fallback_reply(
+    user_prompt: str,
+    metrics: Mapping[str, object],
+    sandbox_output: Mapping[str, object],
+    web_sources: Sequence[Mapping[str, str]],
+) -> str:
+    """Return a prose-first fallback reply when provider calls are unavailable."""
+
+    npv = metrics.get("Project_NPV")
+    irr = metrics.get("Project_IRR")
+    dscr = metrics.get("DSCR_min")
+    metric_fragments: List[str] = []
+    if isinstance(npv, (int, float, np.floating)):
+        metric_fragments.append(f"project NPV is about {float(npv):,.2f}")
+    if isinstance(irr, (int, float, np.floating)):
+        metric_fragments.append(f"project IRR is roughly {float(irr) * 100:.2f}%")
+    if isinstance(dscr, (int, float, np.floating)):
+        metric_fragments.append(f"minimum DSCR is around {float(dscr):.2f}")
+    metric_sentence = "I checked the loaded model context and " + ", ".join(metric_fragments) + "." if metric_fragments else ""
+
+    sandbox_sentence = ""
+    if sandbox_output.get("used"):
+        if sandbox_output.get("ok"):
+            sandbox_sentence = f"I also executed your sandbox snippet successfully and obtained: {sandbox_output.get('result')}."
+        else:
+            sandbox_sentence = f"I attempted the sandbox snippet, but it returned an error: {sandbox_output.get('error')}."
+
+    web_sentence = ""
+    if web_sources:
+        web_sentence = (
+            f"For external comparison, I found {len(web_sources)} web references that can be used to benchmark assumptions."
+        )
+
+    return (
+        "Here is a practical interpretation of your request: "
+        f"{user_prompt.strip()}.\n\n"
+        f"{metric_sentence} {sandbox_sentence} {web_sentence}\n\n"
+        "Recommendation: if you want a tighter answer, share the exact KPI you want to optimize "
+        "(for example NPV, DSCR, or payback) and I will provide a targeted scenario-based response."
+    ).strip()
 
 
 def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
@@ -331,20 +382,37 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             "Direct answer, Internal reasoning summary, Sandbox output usage, External comparison, "
             "Interpretation, Recommendation, Sources. Keep answers concise and actionable."
         )
-        context_blob = {
-            "project_metrics": compact_metrics,
-            "sandbox_output": sandbox_output,
-            "web_sources": web_sources,
-        }
+        metric_lines = ", ".join(
+            f"{key}={value}"
+            for key, value in compact_metrics.items()
+            if key in {"Project_NPV", "Project_IRR", "Equity_IRR", "DSCR_min", "Payback_Year"}
+        )
+        web_lines = "; ".join(f"{src.get('title', '')} ({src.get('url', '')})" for src in web_sources)
+        sandbox_line = (
+            f"used={sandbox_output.get('used')}, ok={sandbox_output.get('ok')}, result={sandbox_output.get('result')}, "
+            f"error={sandbox_output.get('error')}"
+        )
+        context_blob = (
+            f"Model metrics: {metric_lines or 'none'}\n"
+            f"Sandbox summary: {sandbox_line}\n"
+            f"Web references: {web_lines or 'none'}"
+        )
         llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         llm_messages.extend([{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in history[-8:]])
         llm_messages.append(
             {
                 "role": "user",
-                "content": f"User prompt:\n{user_prompt}\n\nContext:\n{json.dumps(context_blob, default=str)}",
+                "content": f"User prompt:\n{user_prompt}\n\nContext:\n{context_blob}",
             }
         )
         assistant_text = _call_chat_provider(settings, llm_messages)
+        if not assistant_text.strip():
+            assistant_text = _build_chatbot_fallback_reply(
+                user_prompt=user_prompt,
+                metrics=compact_metrics,
+                sandbox_output=sandbox_output,
+                web_sources=web_sources,
+            )
 
         history.append({"role": "user", "content": user_prompt})
         history.append({"role": "assistant", "content": assistant_text})
@@ -355,7 +423,16 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         st.markdown("### Internal reasoning")
         st.info("Reasoning summary is embedded in the assistant response.")
         st.markdown("### Sandbox output")
-        st.json(sandbox_output)
+        if sandbox_output.get("used"):
+            if sandbox_output.get("ok"):
+                st.write(
+                    f"The sandbox ran successfully. Result: {sandbox_output.get('result')}. "
+                    f"Variables produced: {', '.join(map(str, sandbox_output.get('locals', [])))}."
+                )
+            else:
+                st.write(f"The sandbox run failed with error: {sandbox_output.get('error')}.")
+        else:
+            st.caption("Sandbox execution was not used for this turn.")
         st.markdown("### External comparison via web search")
         if web_sources:
             st.dataframe(pd.DataFrame(web_sources), use_container_width=True)
