@@ -16,6 +16,8 @@ import importlib
 import math
 import re
 import sys
+import concurrent.futures
+import ast
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -169,6 +171,30 @@ def _chat_supports(provider_name: str, capability: str) -> bool:
 def _run_sandbox(code: str) -> Dict[str, object]:
     """Execute controlled Python snippets in a restricted sandbox namespace."""
 
+    risky_tokens = [
+        "__",
+        "import ",
+        "open(",
+        "exec(",
+        "eval(",
+        "os.",
+        "sys.",
+        "subprocess",
+        "socket",
+        "shutil",
+        "pathlib",
+        "requests",
+        "urllib",
+        "globals(",
+        "locals(",
+    ]
+    lowered = code.lower()
+    denied = [token for token in risky_tokens if token in lowered]
+    if denied:
+        return {"used": True, "ok": False, "error": f"Blocked by sandbox denial list: {', '.join(denied)}"}
+    if len(code) > 4000:
+        return {"used": True, "ok": False, "error": "Code exceeds sandbox size limit (4000 chars)."}
+
     safe_builtins = {
         "abs": abs,
         "min": min,
@@ -180,11 +206,108 @@ def _run_sandbox(code: str) -> Dict[str, object]:
         "sorted": sorted,
     }
     restricted_globals = {"__builtins__": safe_builtins, "math": math, "np": np, "pd": pd}
-    restricted_locals: Dict[str, object] = {}
-    try:
+
+    def _execute() -> Dict[str, object]:
+        restricted_locals: Dict[str, object] = {}
         exec(code, restricted_globals, restricted_locals)
         output = restricted_locals.get("result")
-        return {"used": True, "ok": True, "result": output, "locals": list(restricted_locals.keys())}
+        output_text = str(output)
+        if len(output_text) > 1200:
+            output_text = output_text[:1200] + "... [truncated]"
+        return {"used": True, "ok": True, "result": output_text, "locals": list(restricted_locals.keys())}
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(_execute).result(timeout=2.0)
+    except concurrent.futures.TimeoutError:
+        return {"used": True, "ok": False, "error": "Sandbox execution timed out (2s)."}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_calc(expression: str) -> Dict[str, object]:
+    """Safely evaluate arithmetic-style expressions."""
+
+    expr = expression.strip()
+    if not expr:
+        return {"used": True, "ok": False, "error": "No expression provided."}
+    if len(expr) > 500:
+        return {"used": True, "ok": False, "error": "Expression too long."}
+    blocked_tokens = ["__", "import", "open(", "exec(", "eval(", "lambda", "os.", "sys.", "subprocess"]
+    if any(token in expr.lower() for token in blocked_tokens):
+        return {"used": True, "ok": False, "error": "Expression blocked by security policy."}
+    try:
+        node = ast.parse(expr, mode="eval")
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Constant,
+            ast.Num,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Pow,
+            ast.Mod,
+            ast.FloorDiv,
+            ast.USub,
+            ast.UAdd,
+            ast.Load,
+            ast.Call,
+            ast.Name,
+        )
+        allowed_names = {"abs": abs, "round": round, "min": min, "max": max}
+        for child in ast.walk(node):
+            if not isinstance(child, allowed_nodes):
+                return {"used": True, "ok": False, "error": f"Unsupported expression element: {type(child).__name__}"}
+            if isinstance(child, ast.Name) and child.id not in allowed_names:
+                return {"used": True, "ok": False, "error": f"Unknown identifier: {child.id}"}
+        result = eval(compile(node, "<tool_calc>", "eval"), {"__builtins__": {}}, allowed_names)
+        return {"used": True, "ok": True, "result": str(result)}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_dataframe_aggregate(model_results: Mapping[str, object], table_name: str, group_by: str, metric: str, agg: str) -> Dict[str, object]:
+    """Aggregate a model output DataFrame with basic guardrails."""
+
+    table = model_results.get(table_name)
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return {"used": True, "ok": False, "error": f"Table '{table_name}' is unavailable or empty."}
+    if group_by and group_by not in table.columns:
+        return {"used": True, "ok": False, "error": f"Group-by column '{group_by}' not found."}
+    if metric not in table.columns:
+        return {"used": True, "ok": False, "error": f"Metric column '{metric}' not found."}
+    agg_funcs = {"sum": "sum", "mean": "mean", "min": "min", "max": "max", "median": "median"}
+    agg_func = agg_funcs.get(agg, "sum")
+    try:
+        if group_by:
+            out = table.groupby(group_by, dropna=False)[metric].agg(agg_func).reset_index()
+        else:
+            out = pd.DataFrame([{metric: getattr(pd.to_numeric(table[metric], errors="coerce"), agg_func)()}])
+        preview = out.head(20).to_dict(orient="records")
+        return {"used": True, "ok": True, "result": preview}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_scenario_compare(model_results: Mapping[str, object], metric_name: str, top_n: int = 10) -> Dict[str, object]:
+    """Compare base metrics with lender-case metrics when available."""
+
+    base_metrics = model_results.get("metrics", {})
+    lender_df = model_results.get("lender_case_results")
+    if not isinstance(lender_df, pd.DataFrame) or lender_df.empty:
+        return {"used": True, "ok": False, "error": "No lender_case_results found for scenario comparison."}
+    if metric_name not in lender_df.columns:
+        return {"used": True, "ok": False, "error": f"Metric '{metric_name}' not found in lender_case_results."}
+    try:
+        comp = lender_df[["case_name", metric_name]].copy()
+        base_value = base_metrics.get(metric_name) if isinstance(base_metrics, Mapping) else None
+        comp["base_value"] = base_value
+        comp["delta_vs_base"] = pd.to_numeric(comp[metric_name], errors="coerce") - (float(base_value) if isinstance(base_value, (int, float, np.floating)) else 0.0)
+        comp = comp.head(max(1, min(int(top_n), 50)))
+        return {"used": True, "ok": True, "result": comp.to_dict(orient="records")}
     except Exception as exc:
         return {"used": True, "ok": False, "error": str(exc)}
 
@@ -487,12 +610,37 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
 
     use_sandbox = st.checkbox("Use sandbox execution for intermediate calculations", value=True, key="chat_use_sandbox")
     use_web = st.checkbox("Use web search for comparative analysis", value=True, key="chat_use_web")
-    sandbox_code = st.text_area(
-        "Sandbox code (optional, Python). Set `result = ...` to expose output.",
-        value=st.session_state.get("chat_sandbox_code", ""),
-        height=120,
-        key="chat_sandbox_code",
+    st.markdown("#### Structured tools")
+    tool_choice = st.selectbox(
+        "Select tool",
+        ["none", "tool_calc(expression)", "tool_dataframe_aggregate(...)", "tool_scenario_compare(...)"],
+        key="chat_tool_choice",
     )
+    calc_expression = st.text_input(
+        "tool_calc expression",
+        value=st.session_state.get("chat_calc_expression", ""),
+        key="chat_calc_expression",
+    )
+    aggregate_table = st.selectbox(
+        "tool_dataframe_aggregate table",
+        ["revenue", "production_monthly", "price_curves", "cash_waterfall", "credit_metrics_yearly", "lender_case_results"],
+        key="chat_aggregate_table",
+    )
+    aggregate_group = st.text_input("Group by column (optional)", value=st.session_state.get("chat_aggregate_group", ""), key="chat_aggregate_group")
+    aggregate_metric = st.text_input("Metric column", value=st.session_state.get("chat_aggregate_metric", "revenue"), key="chat_aggregate_metric")
+    aggregate_fn = st.selectbox("Aggregation", ["sum", "mean", "min", "max", "median"], key="chat_aggregate_fn")
+    scenario_metric = st.text_input("tool_scenario_compare metric", value=st.session_state.get("chat_scenario_metric", "Project_NPV"), key="chat_scenario_metric")
+    scenario_top_n = int(st.number_input("Top N scenario rows", min_value=1, max_value=50, value=10, step=1, key="chat_scenario_top_n"))
+
+    advanced_mode = st.checkbox("Advanced mode: run raw Python sandbox code", value=False, key="chat_advanced_mode")
+    sandbox_code = ""
+    if advanced_mode:
+        sandbox_code = st.text_area(
+            "Sandbox code (advanced). Set `result = ...` to expose output.",
+            value=st.session_state.get("chat_sandbox_code", ""),
+            height=120,
+            key="chat_sandbox_code",
+        )
     user_prompt = st.text_area("Ask the assistant", height=140, key="chat_prompt")
 
     if st.button("Send", key="chat_send"):
@@ -517,12 +665,31 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             sandbox_enabled=settings.use_tools,
             web_enabled=settings.use_web_search and _chat_supports(selected_provider, "supports_web_search"),
         )
+        if tool_choice != "none":
+            plan["sandbox_needed"] = True
         plans.append(plan)
         st.session_state["chat_plans"] = plans
 
         sandbox_output: Dict[str, object] = {"used": False}
-        if bool(plan.get("sandbox_needed")) and sandbox_code.strip():
-            sandbox_output = _run_sandbox(sandbox_code)
+        if bool(plan.get("sandbox_needed")):
+            if tool_choice == "tool_calc(expression)":
+                sandbox_output = _tool_calc(calc_expression)
+            elif tool_choice == "tool_dataframe_aggregate(...)":
+                sandbox_output = _tool_dataframe_aggregate(
+                    model_results=model_results,
+                    table_name=aggregate_table,
+                    group_by=aggregate_group.strip(),
+                    metric=aggregate_metric.strip(),
+                    agg=aggregate_fn,
+                )
+            elif tool_choice == "tool_scenario_compare(...)":
+                sandbox_output = _tool_scenario_compare(
+                    model_results=model_results,
+                    metric_name=scenario_metric.strip(),
+                    top_n=scenario_top_n,
+                )
+            elif advanced_mode and sandbox_code.strip():
+                sandbox_output = _run_sandbox(sandbox_code)
 
         web_sources: List[Dict[str, str]] = []
         if bool(plan.get("web_needed")):
