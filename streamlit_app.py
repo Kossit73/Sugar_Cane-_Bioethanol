@@ -363,6 +363,63 @@ def _build_lightweight_plan(
     }
 
 
+def _update_conversation_summary(history: Sequence[Mapping[str, object]], existing_summary: str) -> str:
+    """Maintain a rolling summary every five user turns."""
+
+    user_turns = [item for item in history if str(item.get("role", "")).lower() == "user"]
+    if not user_turns:
+        return existing_summary
+    if len(user_turns) % 5 != 0 and existing_summary.strip():
+        return existing_summary
+
+    recent = history[-10:]
+    summary_lines: List[str] = []
+    for item in recent:
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip().replace("\n", " ")
+        if not content:
+            continue
+        clipped = content[:180] + ("..." if len(content) > 180 else "")
+        summary_lines.append(f"{role}: {clipped}")
+    return " | ".join(summary_lines)
+
+
+def _update_fact_memory(
+    user_prompt: str,
+    assistant_text: str,
+    metrics: Mapping[str, object],
+    existing_facts: Mapping[str, object],
+) -> Dict[str, object]:
+    """Update persistent fact memory with assumptions, KPIs, constraints, and decisions."""
+
+    facts = dict(existing_facts)
+    text_blob = f"{user_prompt}\n{assistant_text}".lower()
+    constraints = set(str(x) for x in facts.get("constraints", []))
+    assumptions = set(str(x) for x in facts.get("assumptions", []))
+    decisions = list(facts.get("decisions", [])) if isinstance(facts.get("decisions"), list) else []
+
+    if "assume" in text_blob or "assumption" in text_blob:
+        assumptions.add(user_prompt.strip()[:200])
+    for keyword in ("must", "limit", "cannot", "constraint", "target", "threshold"):
+        if keyword in text_blob:
+            constraints.add(keyword)
+    for keyword in ("recommend", "should", "decision", "choose", "select"):
+        if keyword in text_blob:
+            decision_note = assistant_text.strip()[:220]
+            if decision_note:
+                decisions.append(decision_note)
+            break
+
+    kpi_keys = ["Project_NPV", "Project_IRR", "Equity_IRR", "DSCR_min", "Payback_Year"]
+    kpis = {k: metrics.get(k) for k in kpi_keys if k in metrics}
+
+    facts["assumptions"] = sorted(x for x in assumptions if x)
+    facts["constraints"] = sorted(x for x in constraints if x)
+    facts["decisions"] = decisions[-10:]
+    facts["kpis"] = kpis
+    return facts
+
+
 def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
     st.subheader("Intelligent Analytical Chatbot")
     st.caption(
@@ -372,6 +429,11 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
 
     history = st.session_state.setdefault("chat_history", [])
     plans = st.session_state.setdefault("chat_plans", [])
+    conversation_summary = st.session_state.setdefault("chat_summary", "")
+    fact_memory = st.session_state.setdefault(
+        "chat_fact_memory",
+        {"assumptions": [], "constraints": [], "decisions": [], "kpis": {}},
+    )
     provider_options = list(CHAT_PROVIDER_DEFAULTS.keys())
     selected_provider = st.selectbox("Provider", provider_options, key="chat_provider")
     defaults = CHAT_PROVIDER_DEFAULTS[selected_provider]
@@ -400,6 +462,8 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         if st.button("Clear history", key="clear_chat_history"):
             st.session_state["chat_history"] = []
             st.session_state["chat_plans"] = []
+            st.session_state["chat_summary"] = ""
+            st.session_state["chat_fact_memory"] = {"assumptions": [], "constraints": [], "decisions": [], "kpis": {}}
             _safe_rerun()
 
     with st.expander("Planner memory", expanded=False):
@@ -413,6 +477,13 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
                 )
         else:
             st.caption("No saved plans yet.")
+    with st.expander("Conversation summary & fact memory", expanded=False):
+        st.write(f"Summary: {conversation_summary or 'No summary yet.'}")
+        st.markdown("**Fact memory**")
+        st.write(f"Assumptions: {', '.join(map(str, fact_memory.get('assumptions', []))) or 'None'}")
+        st.write(f"Constraints: {', '.join(map(str, fact_memory.get('constraints', []))) or 'None'}")
+        st.write(f"Recent decisions: {' | '.join(map(str, fact_memory.get('decisions', []))) or 'None'}")
+        st.write(f"Tracked KPIs: {fact_memory.get('kpis', {})}")
 
     use_sandbox = st.checkbox("Use sandbox execution for intermediate calculations", value=True, key="chat_use_sandbox")
     use_web = st.checkbox("Use web search for comparative analysis", value=True, key="chat_use_web")
@@ -479,6 +550,14 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             f"Web references: {web_lines or 'none'}"
         )
         llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        memory_prefix = (
+            f"Conversation summary: {conversation_summary or 'none'}\n"
+            f"Fact memory: assumptions={fact_memory.get('assumptions', [])}, "
+            f"constraints={fact_memory.get('constraints', [])}, "
+            f"decisions={fact_memory.get('decisions', [])}, "
+            f"kpis={fact_memory.get('kpis', {})}"
+        )
+        llm_messages.append({"role": "system", "content": memory_prefix})
         llm_messages.extend([{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in history[-8:]])
         llm_messages.append(
             {
@@ -498,6 +577,13 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         history.append({"role": "user", "content": user_prompt})
         history.append({"role": "assistant", "content": assistant_text})
         st.session_state["chat_history"] = history
+        st.session_state["chat_summary"] = _update_conversation_summary(history, conversation_summary)
+        st.session_state["chat_fact_memory"] = _update_fact_memory(
+            user_prompt=user_prompt,
+            assistant_text=assistant_text,
+            metrics=compact_metrics,
+            existing_facts=fact_memory,
+        )
 
         st.markdown("### Direct answer")
         st.write(assistant_text)
