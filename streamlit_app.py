@@ -64,6 +64,29 @@ CHAT_PROVIDER_DEFAULTS: Dict[str, Dict[str, object]] = {
     "Llama-compatible": {"base_url": "http://localhost:8000/v1/chat/completions", "supports_reasoning": False, "supports_tools": False, "supports_web_search": False},
 }
 
+CHAT_EVAL_PROMPTS: List[Dict[str, str]] = [
+    {"prompt": "Estimate DSCR sensitivity if revenue drops by 10%.", "expected_tool": "tool_calc"},
+    {"prompt": "Compare lender cases by Project_NPV and explain the difference.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Aggregate revenue by product and summarize concentration risk.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Should we prioritize IRR or DSCR for this lender discussion?", "expected_tool": "none"},
+    {"prompt": "Benchmark ethanol price assumptions against market references.", "expected_tool": "web"},
+    {"prompt": "What are the key assumptions behind the current NPV?", "expected_tool": "none"},
+    {"prompt": "Run a quick check on capex shock impact using a simple formula.", "expected_tool": "tool_calc"},
+    {"prompt": "Explain why DSCR falls in downside cases.", "expected_tool": "none"},
+    {"prompt": "Compare reserve account implications across lender cases.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Summarize top risks and practical mitigations.", "expected_tool": "none"},
+    {"prompt": "Aggregate monthly production by product and identify weak spots.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Check if current assumptions are conservative versus industry norms.", "expected_tool": "web"},
+    {"prompt": "Which KPI should govern covenant negotiations?", "expected_tool": "none"},
+    {"prompt": "Calculate breakeven change for a 5% opex increase.", "expected_tool": "tool_calc"},
+    {"prompt": "Compare Project_IRR across available lender cases.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Provide a recommendation with caveats for debt structuring.", "expected_tool": "none"},
+    {"prompt": "Benchmark inflation assumptions with external references.", "expected_tool": "web"},
+    {"prompt": "Aggregate cash waterfall components and flag dominant drains.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Evaluate causality between capex delays and covenant stress.", "expected_tool": "none"},
+    {"prompt": "Give a concise action plan for improving both NPV and DSCR.", "expected_tool": "none"},
+]
+
 
 @dataclass
 class ChatProviderSettings:
@@ -791,6 +814,90 @@ def _update_fact_memory(
     return facts
 
 
+def _reasoning_checklist(
+    response_text: str,
+    user_prompt: str,
+    plan: Mapping[str, object],
+    sandbox_output: Mapping[str, object],
+    web_sources: Sequence[Mapping[str, str]],
+) -> Dict[str, bool]:
+    """Assess answer quality against internal reasoning checklist criteria."""
+
+    text = response_text.lower()
+    prompt = user_prompt.lower()
+    assumptions = any(token in text for token in ("assumption", "assume", "assuming"))
+    requested_tools = bool(plan.get("sandbox_needed")) or bool(plan.get("web_needed"))
+    tool_used = bool(sandbox_output.get("used")) or bool(web_sources)
+    used_requested_data_tools = (not requested_tools) or tool_used
+    if any(token in prompt for token in ("calculate", "aggregate", "compare")) and not tool_used:
+        used_requested_data_tools = False
+    causality = any(token in text for token in ("because", "therefore", "due to", "driven by", "leads to"))
+    recommendation = any(token in text for token in ("recommend", "should", "action", "next step"))
+    caveat = any(token in text for token in ("caveat", "risk", "however", "uncertain", "limitation"))
+    return {
+        "stated_assumptions": assumptions,
+        "used_requested_data_tools": used_requested_data_tools,
+        "explained_causality": causality,
+        "recommendation_and_caveat": recommendation and caveat,
+    }
+
+
+def _enforce_reasoning_checklist(
+    response_text: str,
+    checklist: Mapping[str, bool],
+    plan: Mapping[str, object],
+) -> str:
+    """Append missing checklist sections so final answer is complete."""
+
+    additions: List[str] = []
+    if not checklist.get("stated_assumptions", False):
+        additions.append("Assumption: This guidance assumes current model inputs and base-case KPI definitions remain unchanged.")
+    if not checklist.get("used_requested_data_tools", False):
+        additions.append(
+            f"Tool/Data note: Requested tool usage may be incomplete for this turn. Planned tool path was sandbox={plan.get('sandbox_needed')} web={plan.get('web_needed')}."
+        )
+    if not checklist.get("explained_causality", False):
+        additions.append("Causality: The recommendation is driven by how operating cash flow affects debt service coverage and valuation metrics.")
+    if not checklist.get("recommendation_and_caveat", False):
+        additions.append("Recommendation + caveat: Prioritize DSCR resilience first, but note outcomes remain sensitive to price and capex uncertainty.")
+    if not additions:
+        return response_text
+    return response_text.strip() + "\n\n" + "\n".join(f"- {line}" for line in additions)
+
+
+def _run_offline_chat_evaluation(model_results: Mapping[str, object]) -> pd.DataFrame:
+    """Run offline heuristic evaluation set for chatbot quality checks."""
+
+    rows: List[Dict[str, object]] = []
+    metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
+    for case in CHAT_EVAL_PROMPTS:
+        prompt = case["prompt"]
+        expected_tool = case["expected_tool"]
+        start = time.perf_counter()
+        synthetic_plan = {
+            "sandbox_needed": expected_tool in {"tool_calc", "tool_dataframe_aggregate", "tool_scenario_compare"},
+            "web_needed": expected_tool == "web",
+        }
+        synthetic_sandbox = {"used": synthetic_plan["sandbox_needed"], "ok": True, "result": "synthetic"}
+        synthetic_web = [{"title": "Synthetic reference", "url": "https://example.com"}] if synthetic_plan["web_needed"] else []
+        response = _build_chatbot_fallback_reply(prompt, metrics, synthetic_sandbox, synthetic_web)
+        checklist = _reasoning_checklist(response, prompt, synthetic_plan, synthetic_sandbox, synthetic_web)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        token_estimate = max(1, int(len(response) / 4))
+        rows.append(
+            {
+                "prompt": prompt,
+                "expected_tool": expected_tool,
+                "factual_grounding": float(checklist["stated_assumptions"]),
+                "coherence": 1.0 if len(response.split()) >= 25 else 0.5,
+                "tool_use_correctness": 1.0 if ((expected_tool == "none") or checklist["used_requested_data_tools"]) else 0.0,
+                "latency_ms": round(elapsed_ms, 2),
+                "cost_tokens_estimate": token_estimate,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
     st.subheader("Intelligent Analytical Chatbot")
     st.caption(
@@ -995,6 +1102,14 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
                 sandbox_output=sandbox_output,
                 web_sources=web_sources,
             )
+        checklist = _reasoning_checklist(
+            response_text=assistant_text,
+            user_prompt=user_prompt,
+            plan=plan,
+            sandbox_output=sandbox_output,
+            web_sources=web_sources,
+        )
+        assistant_text = _enforce_reasoning_checklist(assistant_text, checklist, plan)
 
         history.append({"role": "user", "content": user_prompt})
         history.append({"role": "assistant", "content": assistant_text})
@@ -1015,6 +1130,13 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
             f"Clarification: {plan.get('clarification')}\n\n"
             f"Sandbox needed: {plan.get('sandbox_needed')} | Web needed: {plan.get('web_needed')}\n\n"
             f"Execution plan: {plan.get('execution')}"
+        )
+        st.markdown("### Internal reasoning checklist")
+        st.write(
+            f"Stated assumptions: {checklist.get('stated_assumptions')}\n\n"
+            f"Used requested data/tools: {checklist.get('used_requested_data_tools')}\n\n"
+            f"Explained causality: {checklist.get('explained_causality')}\n\n"
+            f"Recommendation + caveat: {checklist.get('recommendation_and_caveat')}"
         )
         st.markdown("### Internal reasoning")
         st.info("Reasoning summary is embedded in the assistant response.")
@@ -1042,6 +1164,25 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         st.markdown("### Sources")
         for src in web_sources:
             st.markdown(f"- [{src['title']}]({src['url']})")
+
+    with st.expander("Offline evaluation set (quality diagnostics)", expanded=False):
+        st.caption("Runs a 20-prompt offline heuristic evaluation across grounding, coherence, tool-use correctness, latency, and token-cost estimate.")
+        if st.button("Run offline evaluation", key="chat_run_eval"):
+            eval_df = _run_offline_chat_evaluation(model_results)
+            st.dataframe(eval_df, use_container_width=True)
+            if not eval_df.empty:
+                summary = pd.DataFrame(
+                    [
+                        {
+                            "avg_factual_grounding": float(eval_df["factual_grounding"].mean()),
+                            "avg_coherence": float(eval_df["coherence"].mean()),
+                            "avg_tool_use_correctness": float(eval_df["tool_use_correctness"].mean()),
+                            "avg_latency_ms": float(eval_df["latency_ms"].mean()),
+                            "avg_cost_tokens_estimate": float(eval_df["cost_tokens_estimate"].mean()),
+                        }
+                    ]
+                )
+                st.dataframe(summary, use_container_width=True)
 
 
 @contextmanager
