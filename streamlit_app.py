@@ -21,6 +21,7 @@ import ast
 import urllib.parse
 import urllib.request
 import datetime
+import time
 from dataclasses import dataclass
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -75,6 +76,158 @@ class ChatProviderSettings:
     reasoning_mode: str
     use_tools: bool
     use_web_search: bool
+
+
+class BaseChatAdapter:
+    """Shared provider adapter interface."""
+
+    provider_name: str = "base"
+
+    def __init__(self, settings: ChatProviderSettings):
+        self.settings = settings
+
+    def supports_tools(self) -> bool:
+        return _chat_supports(self.settings.provider_name, "supports_tools")
+
+    def supports_reasoning(self) -> bool:
+        return _chat_supports(self.settings.provider_name, "supports_reasoning")
+
+    def _request_with_retries(self, url: str, payload: Mapping[str, object], headers: Mapping[str, str]) -> Dict[str, object]:
+        """Issue HTTP request with retry/backoff and basic rate-limit handling."""
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=dict(headers),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                message = str(exc).lower()
+                is_retryable = "429" in message or "rate" in message or "timed out" in message or "temporarily" in message
+                if attempt == max_attempts - 1 or not is_retryable:
+                    raise
+                time.sleep(0.6 * (2 ** attempt))
+        return {}
+
+    def _capability_check(self) -> Optional[str]:
+        model_name = self.settings.model_name.lower()
+        if "reasoning" in model_name and not self.supports_reasoning():
+            return f"Selected model '{self.settings.model_name}' may not support reasoning mode on {self.settings.provider_name}."
+        return None
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        raise NotImplementedError
+
+    def stream(self, messages: List[Dict[str, str]]) -> Iterable[str]:
+        text = self.generate(messages)
+        yield text
+
+
+class OpenAIAdapter(BaseChatAdapter):
+    provider_name = "OpenAI"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.reasoning_mode and self.supports_reasoning():
+            payload["reasoning"] = {"effort": self.settings.reasoning_mode}
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class AnthropicAdapter(BaseChatAdapter):
+    provider_name = "Anthropic"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        system_msgs = [m.get("content", "") for m in messages if m.get("role") == "system"]
+        non_system = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages if m.get("role") != "system"]
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": non_system,
+            "max_tokens": int(self.settings.max_tokens),
+            "temperature": float(self.settings.temperature),
+        }
+        if system_msgs:
+            payload["system"] = "\n\n".join(system_msgs)
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {
+                "Content-Type": "application/json",
+                "x-api-key": self.settings.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class GeminiAdapter(BaseChatAdapter):
+    provider_name = "Google Gemini"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        # Gemini native endpoint shape varies by SDK/version; this adapter assumes
+        # an OpenAI-compatible gateway/base_url for portability in this app.
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class GenericOpenAICompatibleAdapter(BaseChatAdapter):
+    provider_name = "generic"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.reasoning_mode and self.supports_reasoning():
+            payload["reasoning"] = {"effort": self.settings.reasoning_mode}
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
 
 
 def _streamlit_runtime_exists() -> bool:
@@ -419,54 +572,65 @@ def _build_evidence_pipeline(
 
 
 def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str, str]]) -> str:
-    """Send chat request using a provider-agnostic OpenAI-compatible schema."""
+    """Send chat request through provider adapters with shared interface."""
 
     if not settings.api_key.strip():
         return ""
     if not settings.base_url.strip():
         return ""
-
-    payload = {
-        "model": settings.model_name,
-        "messages": messages,
-        "temperature": float(settings.temperature),
-        "max_tokens": int(settings.max_tokens),
-    }
-    if settings.reasoning_mode:
-        payload["reasoning"] = {"effort": settings.reasoning_mode}
-
-    request = urllib.request.Request(
-        settings.base_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {settings.api_key}"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        adapter = _create_provider_adapter(settings)
+        return adapter.generate(messages).strip()
     except Exception:
         return ""
 
-    if isinstance(data, dict):
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            message = choices[0].get("message", {})
-            content = message.get("content")
-            if isinstance(content, str) and content.strip():
-                return content
-            if isinstance(content, list):
-                blocks: List[str] = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text")
-                        if isinstance(text, str) and text.strip():
-                            blocks.append(text.strip())
-                if blocks:
-                    return "\n\n".join(blocks)
-        output = data.get("output_text")
-        if isinstance(output, str) and output.strip():
-            return output
+
+def _extract_text_from_provider_payload(data: Mapping[str, object]) -> str:
+    """Extract assistant text from common provider response payload shapes."""
+
+    if not isinstance(data, Mapping):
+        return ""
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], Mapping) else {}
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            blocks: List[str] = []
+            for block in content:
+                if isinstance(block, Mapping):
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        blocks.append(text.strip())
+            if blocks:
+                return "\n\n".join(blocks)
+    content_blocks = data.get("content")
+    if isinstance(content_blocks, list):
+        blocks: List[str] = []
+        for block in content_blocks:
+            if isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    blocks.append(text.strip())
+        if blocks:
+            return "\n\n".join(blocks)
+    output = data.get("output_text")
+    if isinstance(output, str) and output.strip():
+        return output
     return ""
+
+
+def _create_provider_adapter(settings: ChatProviderSettings) -> BaseChatAdapter:
+    """Factory for provider adapters."""
+
+    if settings.provider_name == "OpenAI":
+        return OpenAIAdapter(settings)
+    if settings.provider_name == "Anthropic":
+        return AnthropicAdapter(settings)
+    if settings.provider_name == "Google Gemini":
+        return GeminiAdapter(settings)
+    return GenericOpenAICompatibleAdapter(settings)
 
 
 def _build_chatbot_fallback_reply(
