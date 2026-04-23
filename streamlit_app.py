@@ -20,6 +20,7 @@ import concurrent.futures
 import ast
 import urllib.parse
 import urllib.request
+import datetime
 from dataclasses import dataclass
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -313,7 +314,7 @@ def _tool_scenario_compare(model_results: Mapping[str, object], metric_name: str
 
 
 def _web_comparison_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
-    """Perform lightweight web lookup for comparative references."""
+    """Perform lightweight web lookup and evidence enrichment for comparative references."""
 
     if not query.strip():
         return []
@@ -328,10 +329,93 @@ def _web_comparison_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     for item in payload.get("RelatedTopics", []):
         if isinstance(item, dict) and item.get("Text") and item.get("FirstURL"):
-            results.append({"title": str(item.get("Text")), "url": str(item.get("FirstURL"))})
+            title = str(item.get("Text"))
+            url = str(item.get("FirstURL"))
+            results.append({"title": title, "url": url})
         if len(results) >= limit:
             break
     return results
+
+
+def _extract_comparable_metrics(text: str) -> Dict[str, str]:
+    """Extract rough comparable fields (date, region, value) from source text."""
+
+    lowered = text.lower()
+    year_match = re.search(r"\b(20\d{2}|19\d{2})\b", text)
+    date_value = year_match.group(0) if year_match else ""
+    value_match = re.search(r"(\$?\d[\d,]*(?:\.\d+)?%?)", text)
+    metric_value = value_match.group(1) if value_match else ""
+    region = ""
+    for candidate in ("global", "us", "usa", "europe", "asia", "brazil", "india", "china", "africa", "latin america"):
+        if candidate in lowered:
+            region = candidate.upper() if len(candidate) <= 3 else candidate.title()
+            break
+    return {"date": date_value, "region": region, "value": metric_value}
+
+
+def _score_credibility(url: str, title: str) -> Tuple[float, str]:
+    """Return heuristic credibility score with rationale."""
+
+    score = 0.4
+    reasons: List[str] = []
+    trusted_domains = ("gov", "edu", "org", "iea.org", "worldbank.org", "oecd.org", "reuters.com", "bloomberg.com")
+    lowered_url = url.lower()
+    lowered_title = title.lower()
+    if any(domain in lowered_url for domain in trusted_domains):
+        score += 0.35
+        reasons.append("trusted domain")
+    if any(keyword in lowered_title for keyword in ("report", "index", "statistics", "official", "benchmark")):
+        score += 0.15
+        reasons.append("benchmark-like content")
+    if re.search(r"\b20\d{2}\b", title):
+        score += 0.1
+        reasons.append("contains explicit year")
+    score = max(0.0, min(score, 1.0))
+    reason_text = ", ".join(reasons) if reasons else "generic web reference"
+    return score, reason_text
+
+
+def _build_evidence_pipeline(
+    query: str,
+    model_metrics: Mapping[str, object],
+    top_n: int = 5,
+) -> List[Dict[str, object]]:
+    """Retrieve sources and enrich them into comparable evidence rows."""
+
+    raw_sources = _web_comparison_search(query, limit=top_n)
+    current_year = datetime.datetime.utcnow().year
+    evidence_rows: List[Dict[str, object]] = []
+    metric_snapshot = {
+        "Project_NPV": model_metrics.get("Project_NPV"),
+        "Project_IRR": model_metrics.get("Project_IRR"),
+        "DSCR_min": model_metrics.get("DSCR_min"),
+    }
+    for src in raw_sources:
+        title = str(src.get("title", ""))
+        url = str(src.get("url", ""))
+        extracted = _extract_comparable_metrics(title)
+        score, why = _score_credibility(url, title)
+        year_value = extracted.get("date", "")
+        recency = "unknown"
+        if year_value.isdigit():
+            delta = current_year - int(year_value)
+            recency = "current (<=1y)" if delta <= 1 else f"{delta} years old"
+        evidence_rows.append(
+            {
+                "source_title": title,
+                "source_url": url,
+                "extracted_date": extracted.get("date", ""),
+                "extracted_region": extracted.get("region", ""),
+                "extracted_value": extracted.get("value", ""),
+                "credibility_score": round(score, 2),
+                "why_used": why,
+                "date_recency": recency,
+                "model_Project_NPV": metric_snapshot.get("Project_NPV"),
+                "model_Project_IRR": metric_snapshot.get("Project_IRR"),
+                "model_DSCR_min": metric_snapshot.get("DSCR_min"),
+            }
+        )
+    return evidence_rows
 
 
 def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str, str]]) -> str:
@@ -692,8 +776,14 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
                 sandbox_output = _run_sandbox(sandbox_code)
 
         web_sources: List[Dict[str, str]] = []
+        evidence_rows: List[Dict[str, object]] = []
         if bool(plan.get("web_needed")):
-            web_sources = _web_comparison_search(user_prompt, limit=5)
+            evidence_rows = _build_evidence_pipeline(
+                query=user_prompt,
+                model_metrics=model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {},
+                top_n=5,
+            )
+            web_sources = [{"title": str(row.get("source_title", "")), "url": str(row.get("source_url", ""))} for row in evidence_rows]
 
         compact_metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
         system_prompt = (
@@ -714,7 +804,8 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         context_blob = (
             f"Model metrics: {metric_lines or 'none'}\n"
             f"Sandbox summary: {sandbox_line}\n"
-            f"Web references: {web_lines or 'none'}"
+            f"Web references: {web_lines or 'none'}\n"
+            f"Evidence summary rows: {evidence_rows[:3] if evidence_rows else 'none'}"
         )
         llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         memory_prefix = (
@@ -775,8 +866,9 @@ def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
         else:
             st.caption("Sandbox execution was not used for this turn.")
         st.markdown("### External comparison via web search")
-        if web_sources:
-            st.dataframe(pd.DataFrame(web_sources), use_container_width=True)
+        if evidence_rows:
+            evidence_df = pd.DataFrame(evidence_rows)
+            st.dataframe(evidence_df, use_container_width=True)
         else:
             st.caption("No web comparison data was collected.")
         st.markdown("### Interpretation")
