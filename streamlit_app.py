@@ -87,6 +87,26 @@ CHAT_EVAL_PROMPTS: List[Dict[str, str]] = [
     {"prompt": "Give a concise action plan for improving both NPV and DSCR.", "expected_tool": "none"},
 ]
 
+INSTITUTION_WHITELIST: Tuple[Tuple[str, str], ...] = (
+    ("iea.org", "International Energy Agency"),
+    ("worldbank.org", "World Bank"),
+    ("imf.org", "International Monetary Fund"),
+    ("oecd.org", "OECD"),
+    ("ifc.org", "International Finance Corporation"),
+    ("reuters.com", "Reuters"),
+    ("bloomberg.com", "Bloomberg"),
+    ("fao.org", "FAO"),
+    ("un.org", "United Nations"),
+    ("gov", "Government source"),
+    ("edu", "Academic source"),
+)
+
+BENCHMARK_METRIC_DEFINITIONS: Dict[str, Tuple[str, ...]] = {
+    "Project_IRR": ("internal rate of return", "irr", "equity irr", "project irr"),
+    "DSCR_min": ("debt service coverage ratio", "dscr", "coverage ratio"),
+    "Project_NPV": ("net present value", "npv", "discounted cash flow"),
+}
+
 
 @dataclass
 class ChatProviderSettings:
@@ -529,6 +549,63 @@ def _extract_comparable_metrics(text: str) -> Dict[str, str]:
     return {"date": date_value, "region": region, "value": metric_value}
 
 
+def _match_whitelisted_institution(url: str) -> Tuple[str, bool]:
+    lowered = url.lower()
+    for domain, label in INSTITUTION_WHITELIST:
+        if domain in lowered:
+            return label, True
+    return "Unclassified source", False
+
+
+def _fetch_source_text(url: str, max_chars: int = 6000) -> str:
+    """Fetch lightweight source text snippet for parsing benchmark signals."""
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StreamlitBot/1.0)"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read(max_chars * 2).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    text = re.sub(r"<script.*?>.*?</script>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _normalize_benchmark_value(raw_value: str) -> Optional[float]:
+    token = raw_value.replace(",", "").strip()
+    if not token:
+        return None
+    try:
+        if token.endswith("%"):
+            return float(token[:-1]) / 100.0
+        if token.startswith("$"):
+            return float(token[1:])
+        return float(token)
+    except Exception:
+        return None
+
+
+def _parse_benchmark_definition_alignment(text: str, query: str) -> Dict[str, object]:
+    """Parse metric mentions and score alignment to known benchmark definitions."""
+
+    combined = f"{query} {text}".lower()
+    best_metric = ""
+    best_score = 0.0
+    for metric_name, phrases in BENCHMARK_METRIC_DEFINITIONS.items():
+        hits = sum(1 for phrase in phrases if phrase in combined)
+        score = min(1.0, hits / max(1, len(phrases)))
+        if score > best_score:
+            best_score = score
+            best_metric = metric_name
+    return {"metric": best_metric, "definition_alignment_score": round(best_score, 2)}
+
+
 def _score_credibility(url: str, title: str) -> Tuple[float, str]:
     """Return heuristic credibility score with rationale."""
 
@@ -537,9 +614,13 @@ def _score_credibility(url: str, title: str) -> Tuple[float, str]:
     trusted_domains = ("gov", "edu", "org", "iea.org", "worldbank.org", "oecd.org", "reuters.com", "bloomberg.com")
     lowered_url = url.lower()
     lowered_title = title.lower()
-    if any(domain in lowered_url for domain in trusted_domains):
+    institution_label, is_whitelisted = _match_whitelisted_institution(url)
+    if is_whitelisted:
         score += 0.35
-        reasons.append("trusted domain")
+        reasons.append(f"whitelisted institution: {institution_label}")
+    elif any(domain in lowered_url for domain in trusted_domains):
+        score += 0.2
+        reasons.append("trusted-like domain pattern")
     if any(keyword in lowered_title for keyword in ("report", "index", "statistics", "official", "benchmark")):
         score += 0.15
         reasons.append("benchmark-like content")
@@ -558,7 +639,7 @@ def _build_evidence_pipeline(
 ) -> List[Dict[str, object]]:
     """Retrieve sources and enrich them into comparable evidence rows."""
 
-    raw_sources = _web_comparison_search(query, limit=top_n)
+    raw_sources = _web_comparison_search(query, limit=max(top_n * 2, top_n))
     current_year = datetime.datetime.utcnow().year
     evidence_rows: List[Dict[str, object]] = []
     metric_snapshot = {
@@ -566,31 +647,49 @@ def _build_evidence_pipeline(
         "Project_IRR": model_metrics.get("Project_IRR"),
         "DSCR_min": model_metrics.get("DSCR_min"),
     }
+    whitelisted_rows: List[Dict[str, object]] = []
+    non_whitelisted_rows: List[Dict[str, object]] = []
     for src in raw_sources:
         title = str(src.get("title", ""))
         url = str(src.get("url", ""))
-        extracted = _extract_comparable_metrics(title)
+        source_text = _fetch_source_text(url)
+        parse_source = f"{title} {source_text}".strip()
+        extracted = _extract_comparable_metrics(parse_source)
+        normalized_value = _normalize_benchmark_value(extracted.get("value", ""))
+        alignment = _parse_benchmark_definition_alignment(parse_source, query)
         score, why = _score_credibility(url, title)
+        institution_label, is_whitelisted = _match_whitelisted_institution(url)
         year_value = extracted.get("date", "")
         recency = "unknown"
         if year_value.isdigit():
             delta = current_year - int(year_value)
             recency = "current (<=1y)" if delta <= 1 else f"{delta} years old"
-        evidence_rows.append(
-            {
-                "source_title": title,
-                "source_url": url,
-                "extracted_date": extracted.get("date", ""),
-                "extracted_region": extracted.get("region", ""),
-                "extracted_value": extracted.get("value", ""),
-                "credibility_score": round(score, 2),
-                "why_used": why,
-                "date_recency": recency,
-                "model_Project_NPV": metric_snapshot.get("Project_NPV"),
-                "model_Project_IRR": metric_snapshot.get("Project_IRR"),
-                "model_DSCR_min": metric_snapshot.get("DSCR_min"),
-            }
-        )
+        confidence = round(min(1.0, score * 0.6 + float(alignment.get("definition_alignment_score", 0.0)) * 0.4), 2)
+        row = {
+            "source_title": title,
+            "source_url": url,
+            "institution": institution_label,
+            "whitelisted_institution": is_whitelisted,
+            "extracted_date": extracted.get("date", ""),
+            "extracted_region": extracted.get("region", ""),
+            "benchmark_metric": alignment.get("metric", ""),
+            "extracted_value": extracted.get("value", ""),
+            "normalized_benchmark_value": normalized_value,
+            "definition_alignment_score": alignment.get("definition_alignment_score", 0.0),
+            "credibility_score": round(score, 2),
+            "confidence_score": confidence,
+            "why_used": why if why else "Relevant to query and benchmark extraction",
+            "date_recency": recency,
+            "model_Project_NPV": metric_snapshot.get("Project_NPV"),
+            "model_Project_IRR": metric_snapshot.get("Project_IRR"),
+            "model_DSCR_min": metric_snapshot.get("DSCR_min"),
+        }
+        if is_whitelisted:
+            whitelisted_rows.append(row)
+        else:
+            non_whitelisted_rows.append(row)
+
+    evidence_rows = (whitelisted_rows + non_whitelisted_rows)[:top_n]
     return evidence_rows
 
 
