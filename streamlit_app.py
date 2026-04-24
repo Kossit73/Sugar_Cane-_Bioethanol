@@ -1537,6 +1537,26 @@ def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     st.dataframe(df, use_container_width=True, key=f"df_{key}")
 
 
+def _ensure_statement_columns(statement_key: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee key financial columns exist so statement views stay complete."""
+
+    required: Dict[str, List[str]] = {
+        "pnl": ["DirectCosts", "StaffCosts", "OtherOpexCosts", "Interest"],
+        "cashflow": ["CFO", "CFI", "CFF"],
+        "balancesheet": ["Inventory", "PPE_Gross", "Debt", "AccountsPayable", "TotalLiabilities"],
+    }
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    columns = required.get(statement_key, [])
+    if not columns:
+        return df
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = 0.0
+    return out
+
+
 def _ensure_matplotlib() -> bool:
     """Return True when matplotlib is available, showing guidance otherwise."""
 
@@ -4387,11 +4407,31 @@ def main() -> None:
         ("Statement of Financial Position", "balancesheet"),
     ]
     with financial_tab:
+        with st.expander("Where key operating/financing fields appear", expanded=False):
+            mapping_df = pd.DataFrame(
+                [
+                    {"Field": "DirectCosts", "Statement": "Income Statement (P&L)", "Column": "DirectCosts"},
+                    {"Field": "StaffCosts", "Statement": "Income Statement (P&L)", "Column": "StaffCosts"},
+                    {"Field": "Other Opex", "Statement": "Income Statement (P&L)", "Column": "OtherOpexCosts"},
+                    {"Field": "Interest", "Statement": "Income Statement (P&L)", "Column": "Interest"},
+                    {"Field": "CFI", "Statement": "Cash Flow", "Column": "CFI"},
+                    {"Field": "CFF", "Statement": "Cash Flow", "Column": "CFF"},
+                    {"Field": "Inventory", "Statement": "Balance Sheet", "Column": "Inventory"},
+                    {"Field": "PPE Gross", "Statement": "Balance Sheet", "Column": "PPE_Gross"},
+                    {"Field": "Debt", "Statement": "Balance Sheet", "Column": "Debt"},
+                    {"Field": "Accounts Payable", "Statement": "Balance Sheet", "Column": "AccountsPayable"},
+                    {"Field": "Total Liabilities", "Statement": "Balance Sheet", "Column": "TotalLiabilities"},
+                ]
+            )
+            st.dataframe(mapping_df, use_container_width=True)
+
         fs_tabs = st.tabs([label for label, _ in statement_configs])
         for tab, (label, key) in zip(fs_tabs, statement_configs):
             with tab:
                 monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
                 annual_df = results["statements_annual"].get(key, pd.DataFrame())
+                monthly_df = _ensure_statement_columns(key, monthly_df)
+                annual_df = _ensure_statement_columns(key, annual_df)
                 safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
                 _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
                 _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
