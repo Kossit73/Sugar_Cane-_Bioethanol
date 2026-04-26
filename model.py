@@ -2876,6 +2876,8 @@ def working_capital_block(revenue_df: pd.DataFrame, cost_df: pd.DataFrame, cfg: 
     dso = wc_days.get("dso_days", DEFAULTS["working_capital"]["dso_days"])
     dio = wc_days.get("dio_days", DEFAULTS["working_capital"]["dio_days"])
     dpo = wc_days.get("dpo_days", DEFAULTS["working_capital"]["dpo_days"])
+    opex_factor = get_increment_series(cfg, timeline, "opex_factor")
+    cost = cost * opex_factor
     wc_factor = get_increment_series(cfg, timeline, "wc_factor")
     dso_series = float(dso) * wc_factor
     dio_series = float(dio) * wc_factor
@@ -5627,6 +5629,55 @@ def break_even_analysis(
 ###############################################################################
 
 
+def _sync_feedstock_purchase_costs(
+    cfg: Mapping[str, object], timeline: Timeline, direct_costs: pd.DataFrame
+) -> pd.DataFrame:
+    """Inject monthly feedstock purchase rows from sourcing split (farm vs purchase)."""
+
+    monthly_index = timeline.monthly_index()
+    production_cfg = cfg.get("production", {}) if isinstance(cfg, Mapping) else {}
+    opex_cfg = cfg.get("opex", {}) if isinstance(cfg, Mapping) else {}
+    annual_feedstock = max(float(production_cfg.get("annual_feedstock_ton", DEFAULTS["production"]["annual_feedstock_ton"]) or 0.0), 0.0)
+    scenario = str(production_cfg.get("feedstock_scenario", "HYBRID")).strip().upper()
+    farm_share = float(production_cfg.get("farm_share", 0.5) or 0.0)
+    if scenario == "FARM_ONLY":
+        farm_share = 1.0
+    elif scenario == "BUY_ONLY":
+        farm_share = 0.0
+    farm_share = max(0.0, min(1.0, farm_share))
+    purchase_share = max(0.0, 1.0 - farm_share)
+    purchase_price = max(float(opex_cfg.get("purchase_price_per_ton", DEFAULTS["opex"]["purchase_price_per_ton"]) or 0.0), 0.0)
+    monthly_qty = annual_feedstock * purchase_share / 12.0
+
+    cleaned = direct_costs.copy() if isinstance(direct_costs, pd.DataFrame) else pd.DataFrame()
+    if not cleaned.empty:
+        if "date" in cleaned.columns:
+            cleaned["date"] = pd.to_datetime(cleaned["date"], errors="coerce")
+            cleaned = cleaned.dropna(subset=["date"])
+        else:
+            cleaned["date"] = pd.NaT
+        if "cost_type" not in cleaned.columns:
+            cleaned["cost_type"] = ""
+        feedstock_mask = cleaned["cost_type"].astype(str).str.strip().str.lower().eq("feedstock purchase")
+        cleaned = cleaned.loc[~feedstock_mask].copy()
+    base_currency = str(
+        cfg.get("global_inputs", {}).get("base_currency", DEFAULTS["global"].get("base_currency", "USD"))
+    )
+    auto_rows = pd.DataFrame(
+        {
+            "date": monthly_index,
+            "cost_type": "feedstock purchase",
+            "product_link": "sugarcane",
+            "unit_price": purchase_price,
+            "quantity": monthly_qty,
+            "amount": monthly_qty * purchase_price,
+            "currency": base_currency,
+        }
+    )
+    merged = pd.concat([cleaned, auto_rows], ignore_index=True, sort=False)
+    return _derive_direct_costs(merged)
+
+
 def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None) -> Dict[str, object]:
     cfg = copy.deepcopy(dict(cfg))
     cfg.setdefault("increment_profile", "base")
@@ -5665,7 +5716,8 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     else:
         cost_df = cost_df.copy()
         cost_df["date"] = pd.to_datetime(cost_df["date"], errors="coerce")
-    cost_df = _derive_direct_costs(cost_df)
+    cost_df = _sync_feedstock_purchase_costs(cfg, timeline, cost_df)
+    cfg["direct_costs_monthly"] = cost_df.copy()
     sustain_adj = apply_sustainability_to_cashflows(cfg, revenue_df, capex_info["capex"], cost_df)
     revenue_df = sustain_adj.get("revenue", revenue_df)
     capex_info["capex"] = sustain_adj.get("capex", capex_info["capex"])
