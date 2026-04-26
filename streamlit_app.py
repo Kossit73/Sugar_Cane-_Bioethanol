@@ -2413,6 +2413,26 @@ def _generate_excel_bytes(
             sens_df.head(12), "driver" if "driver" in sens_df.columns else sens_df.columns[0], ["delta"] if "delta" in sens_df.columns else [sens_df.columns[-1]], "Sensitivity tornado (top drivers)"
         )
 
+    for label, key in (
+        ("IFRS_SoPL_OCI_Monthly", "sopl_oci_monthly"),
+        ("IFRS_SoPL_OCI_Annual", "sopl_oci_annual"),
+        ("IFRS_SoFP_Monthly", "sofp_monthly"),
+        ("IFRS_SoFP_Annual", "sofp_annual"),
+        ("IFRS_SoCE_Monthly", "socie_monthly"),
+        ("IFRS_SoCE_Annual", "socie_annual"),
+        ("IFRS_SCF_Indirect_Monthly", "scf_indirect_monthly"),
+        ("IFRS_SCF_Indirect_Annual", "scf_indirect_annual"),
+        ("IFRS_Note_PPE", "ifrs_note_ppe_rollforward"),
+        ("IFRS_Note_Debt_Maturity", "ifrs_note_debt_maturity"),
+        ("IFRS_Note_WC_Bridge", "ifrs_note_wc_bridge"),
+        ("IFRS_Note_Deferred_Tax", "ifrs_note_deferred_tax"),
+        ("IFRS_Note_Lease", "ifrs_note_lease"),
+        ("IFRS_Note_Hedge_Reserve", "ifrs_note_hedge_reserve"),
+    ):
+        df = results.get(key) if isinstance(results, Mapping) else None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            sheets[label] = df
+
     for label, key in (("CAPEX", "capex"), ("Debt", "debt_schedule"), ("WorkingCapital", "working_capital")):
         df = results.get(key) if isinstance(results, Mapping) else None
         if isinstance(df, pd.DataFrame) and not df.empty:
@@ -4578,6 +4598,33 @@ def main() -> None:
                         _render_cumulative_cash_chart(cumulative_cf)
                 if key == "balancesheet" and isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty:
                     _render_balance_sheet_chart(monthly_df)
+
+        with st.expander("IFRS primary statements (SPV + consolidation adjustments)", expanded=False):
+            ifrs_configs = [
+                ("Statement of Profit or Loss and OCI", "sopl_oci_monthly", "sopl_oci_annual"),
+                ("Statement of Financial Position", "sofp_monthly", "sofp_annual"),
+                ("Statement of Changes in Equity", "socie_monthly", "socie_annual"),
+                ("Statement of Cash Flows (Indirect method)", "scf_indirect_monthly", "scf_indirect_annual"),
+            ]
+            ifrs_tabs = st.tabs([label for label, _, _ in ifrs_configs])
+            for tab, (label, monthly_key, annual_key) in zip(ifrs_tabs, ifrs_configs):
+                with tab:
+                    monthly_df = results.get(monthly_key, pd.DataFrame())
+                    annual_df = results.get(annual_key, pd.DataFrame())
+                    safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
+                    _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_ifrs_{safe_key}")
+                    _render_dataframe(annual_df, f"Annual {label}", key=f"annual_ifrs_{safe_key}")
+            note_configs = [
+                ("PPE roll-forward note", "ifrs_note_ppe_rollforward"),
+                ("Debt maturity note", "ifrs_note_debt_maturity"),
+                ("Working capital bridge note", "ifrs_note_wc_bridge"),
+                ("Deferred tax note", "ifrs_note_deferred_tax"),
+                ("Lease note (IFRS 16)", "ifrs_note_lease"),
+                ("Hedge reserve note (IFRS 9)", "ifrs_note_hedge_reserve"),
+            ]
+            for title, key in note_configs:
+                note_df = results.get(key, pd.DataFrame())
+                _render_dataframe(note_df, title, key=f"ifrs_note_{key}")
 
     with production_tab:
         prod_monthly = results["production_monthly"].copy()

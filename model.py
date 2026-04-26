@@ -637,6 +637,22 @@ DEFAULTS = {
             {"metric": "irr_threshold", "region": "GLOBAL", "year": 2025, "value": 0.14, "risk_tier": "equity"},
         ]
     ),
+    "consolidation_adjustments": pd.DataFrame(
+        [
+            {"date": "2025-01-01", "statement": "sofp", "line_item": "Cash and cash equivalents", "amount": 0.0, "entity": "group_adj"},
+            {"date": "2025-01-01", "statement": "sopl_oci", "line_item": "Other income", "amount": 0.0, "entity": "group_adj"},
+        ]
+    ),
+    "ifrs_policy_inputs": pd.DataFrame(
+        [
+            {"ifrs15_contract_liability_pct": 0.02, "ifrs9_ecl_rate": 0.01, "ias36_dscr_trigger": 1.0, "ias36_impairment_pct": 0.05, "tax_rate_deferred": 0.25}
+        ]
+    ),
+    "lease_contracts": pd.DataFrame(
+        [
+            {"lease_name": "Land lease", "start_date": "2025-01-01", "end_date": "2034-12-01", "monthly_payment": 10000.0, "discount_rate": 0.08}
+        ]
+    ),
 }
 
 
@@ -1591,6 +1607,18 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
         columns={"metric": "str", "region": "str", "year": "int", "value": "float", "risk_tier": "str"},
         defaults={"region": "GLOBAL", "risk_tier": "base"},
     ),
+    "consolidation_adjustments": TableSchema(
+        columns={"date": "date", "statement": "str", "line_item": "str", "amount": "float", "entity": "str"},
+        defaults={"statement": "sofp", "amount": 0.0, "entity": "group_adj"},
+    ),
+    "ifrs_policy_inputs": TableSchema(
+        columns={"ifrs15_contract_liability_pct": "float", "ifrs9_ecl_rate": "float", "ias36_dscr_trigger": "float", "ias36_impairment_pct": "float", "tax_rate_deferred": "float"},
+        defaults={"ifrs15_contract_liability_pct": 0.02, "ifrs9_ecl_rate": 0.01, "ias36_dscr_trigger": 1.0, "ias36_impairment_pct": 0.05, "tax_rate_deferred": 0.25},
+    ),
+    "lease_contracts": TableSchema(
+        columns={"lease_name": "str", "start_date": "date", "end_date": "date", "monthly_payment": "float", "discount_rate": "float"},
+        defaults={"monthly_payment": 0.0, "discount_rate": 0.08},
+    ),
 }
 
 
@@ -1746,6 +1774,9 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "hedging_program": DEFAULTS["hedging_program"].copy(),
         "sustainability_compliance": DEFAULTS["sustainability_compliance"].copy(),
         "benchmark_library": DEFAULTS["benchmark_library"].copy(),
+        "consolidation_adjustments": DEFAULTS["consolidation_adjustments"].copy(),
+        "ifrs_policy_inputs": DEFAULTS["ifrs_policy_inputs"].copy(),
+        "lease_contracts": DEFAULTS["lease_contracts"].copy(),
     }
 
     for key, value in assumptions.items():
@@ -1850,6 +1881,9 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "hedging_program",
         "sustainability_compliance",
         "benchmark_library",
+        "consolidation_adjustments",
+        "ifrs_policy_inputs",
+        "lease_contracts",
     ):
         df = tables.ensure_table(table_name)
         if not df.empty:
@@ -3108,6 +3142,154 @@ def statements_monthly(cfg: Mapping[str, object], timeline: Timeline, revenue_df
         "cashflow": cash_flow_df,
         "balancesheet": balance_sheet,
         "staff_costs_detail": staff_costs_detail,
+    }
+
+
+def build_ifrs_statements(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    statements: Mapping[str, pd.DataFrame],
+    debt_schedule: pd.DataFrame,
+    capex_info: Mapping[str, pd.DataFrame],
+    revenue_df: pd.DataFrame,
+    credit_outputs: Optional[Mapping[str, pd.DataFrame]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Build IFRS-style primary statements and key note schedules (phase 1)."""
+
+    monthly_index = timeline.monthly_index()
+    pnl = statements.get("pnl", pd.DataFrame()).copy()
+    cashflow = statements.get("cashflow", pd.DataFrame()).copy()
+    bs = statements.get("balancesheet", pd.DataFrame()).copy()
+    for frame in (pnl, cashflow, bs):
+        if isinstance(frame, pd.DataFrame) and "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    pnl = pnl.set_index("date").reindex(monthly_index, fill_value=0.0) if not pnl.empty else pd.DataFrame(index=monthly_index)
+    cashflow = cashflow.set_index("date").reindex(monthly_index, fill_value=0.0) if not cashflow.empty else pd.DataFrame(index=monthly_index)
+    bs = bs.set_index("date").reindex(monthly_index, fill_value=0.0) if not bs.empty else pd.DataFrame(index=monthly_index)
+    debt = debt_schedule.copy() if isinstance(debt_schedule, pd.DataFrame) else pd.DataFrame()
+    if not debt.empty and "date" in debt.columns:
+        debt["date"] = pd.to_datetime(debt["date"], errors="coerce")
+    debt = debt.groupby("date").sum(numeric_only=True).reindex(monthly_index, fill_value=0.0) if not debt.empty else pd.DataFrame(index=monthly_index)
+
+    pol = cfg.get("ifrs_policy_inputs")
+    pol_row = pol.iloc[0] if isinstance(pol, pd.DataFrame) and not pol.empty else {}
+    contract_liab_pct = float(pol_row.get("ifrs15_contract_liability_pct", 0.02) or 0.0)
+    ecl_rate = float(pol_row.get("ifrs9_ecl_rate", 0.01) or 0.0)
+    imp_trigger = float(pol_row.get("ias36_dscr_trigger", 1.0) or 1.0)
+    imp_pct = float(pol_row.get("ias36_impairment_pct", 0.05) or 0.0)
+    deferred_tax_rate = float(pol_row.get("tax_rate_deferred", cfg.get("global_inputs", {}).get("corp_tax_rate", 0.25)) or 0.25)
+
+    revenue = pd.to_numeric(pnl.get("Revenue", 0.0), errors="coerce").fillna(0.0)
+    cost_of_sales = pd.to_numeric(pnl.get("COGS", 0.0), errors="coerce").fillna(0.0)
+    admin_exp = pd.to_numeric(pnl.get("StaffCosts", 0.0), errors="coerce").fillna(0.0)
+    other_operating = pd.to_numeric(pnl.get("OtherOpexCosts", 0.0), errors="coerce").fillna(0.0)
+    depn = pd.to_numeric(pnl.get("Depreciation", 0.0), errors="coerce").fillna(0.0)
+    finance_costs = pd.to_numeric(pnl.get("Interest", 0.0), errors="coerce").fillna(0.0)
+    tax_current = pd.to_numeric(pnl.get("tax", 0.0), errors="coerce").fillna(0.0)
+
+    ifrs15_contract_liability = revenue * contract_liab_pct
+    ifrs9_ecl = pd.to_numeric(bs.get("AccountsReceivable", 0.0), errors="coerce").fillna(0.0) * ecl_rate
+
+    lease_cfg = cfg.get("lease_contracts")
+    lease_interest = pd.Series(0.0, index=monthly_index)
+    lease_depr = pd.Series(0.0, index=monthly_index)
+    lease_principal = pd.Series(0.0, index=monthly_index)
+    lease_liability_close = pd.Series(0.0, index=monthly_index)
+    rou_asset_close = pd.Series(0.0, index=monthly_index)
+    if isinstance(lease_cfg, pd.DataFrame) and not lease_cfg.empty:
+        for _, lr in lease_cfg.iterrows():
+            start = parse_date_str(lr.get("start_date"), monthly_index[0])
+            end = parse_date_str(lr.get("end_date"), monthly_index[-1])
+            payment = float(lr.get("monthly_payment", 0.0) or 0.0)
+            rate_annual = float(lr.get("discount_rate", 0.08) or 0.08)
+            rate_m = (1 + max(rate_annual, 0.0)) ** (1 / 12) - 1
+            lease_months = pd.date_range(start=start, end=end, freq="MS")
+            if lease_months.empty:
+                continue
+            n = len(lease_months)
+            pv = payment * n if rate_m <= 0 else float(np.sum([payment / ((1 + rate_m) ** (i + 1)) for i in range(n)]))
+            liability = pv
+            rou = pv
+            dep_per_month = rou / max(n, 1)
+            for dt in monthly_index:
+                if dt < start or dt > end:
+                    continue
+                interest = liability * rate_m
+                principal = max(payment - interest, 0.0)
+                liability = max(liability - principal, 0.0)
+                rou = max(rou - dep_per_month, 0.0)
+                lease_interest.loc[dt] += interest
+                lease_depr.loc[dt] += dep_per_month
+                lease_principal.loc[dt] += principal
+                lease_liability_close.loc[dt] += liability
+                rou_asset_close.loc[dt] += rou
+
+    cod_date = monthly_index[0]
+    if isinstance(revenue_df, pd.DataFrame) and not revenue_df.empty and "date" in revenue_df.columns and "revenue" in revenue_df.columns:
+        rev_work = revenue_df.copy()
+        rev_work["date"] = pd.to_datetime(rev_work["date"], errors="coerce")
+        rev_work = rev_work.groupby("date")["revenue"].sum().reindex(monthly_index, fill_value=0.0)
+        positive = rev_work[rev_work > 0]
+        if not positive.empty:
+            cod_date = positive.index.min()
+    ias23_capitalized = pd.Series(np.where(monthly_index < cod_date, pd.to_numeric(debt.get("interest", 0.0), errors="coerce").fillna(0.0).values, 0.0), index=monthly_index)
+
+    impairment = pd.Series(0.0, index=monthly_index)
+    dscr_df = credit_outputs.get("covenant_monitor", pd.DataFrame()) if isinstance(credit_outputs, Mapping) else pd.DataFrame()
+    if isinstance(dscr_df, pd.DataFrame) and not dscr_df.empty and {"date", "DSCR"}.issubset(dscr_df.columns):
+        dtmp = dscr_df.copy()
+        dtmp["date"] = pd.to_datetime(dtmp["date"], errors="coerce")
+        dtmp = dtmp.set_index("date").reindex(monthly_index, fill_value=np.nan)
+        trigger_mask = pd.to_numeric(dtmp["DSCR"], errors="coerce").fillna(np.inf) < imp_trigger
+        ppe_net = pd.to_numeric(bs.get("PPE_Net", 0.0), errors="coerce").fillna(0.0)
+        impairment = pd.Series(np.where(trigger_mask.values, ppe_net.values * imp_pct, 0.0), index=monthly_index)
+
+    profit_before_tax = revenue - cost_of_sales - admin_exp - other_operating - depn - lease_depr - impairment - finance_costs - lease_interest + ias23_capitalized
+    deferred_tax = (ias23_capitalized) * deferred_tax_rate
+    profit_after_tax = profit_before_tax - tax_current - deferred_tax
+    oci_hedge_reserve = pd.Series(0.0, index=monthly_index)
+    if isinstance(revenue_df, pd.DataFrame) and {"date", "hedge_pnl", "hedge_cost"}.issubset(revenue_df.columns):
+        htmp = revenue_df.copy()
+        htmp["date"] = pd.to_datetime(htmp["date"], errors="coerce")
+        hedge_effective = (pd.to_numeric(htmp["hedge_pnl"], errors="coerce").fillna(0.0) - pd.to_numeric(htmp["hedge_cost"], errors="coerce").fillna(0.0)).groupby(htmp["date"]).sum().reindex(monthly_index, fill_value=0.0)
+        oci_hedge_reserve = hedge_effective * 0.5
+    total_comprehensive_income = profit_after_tax + oci_hedge_reserve
+
+    sopl_oci = pd.DataFrame({"date": monthly_index, "Revenue (IFRS 15)": revenue.values, "Cost of sales": cost_of_sales.values, "Gross profit": (revenue - cost_of_sales).values, "Administrative expenses": admin_exp.values, "Other operating expenses": other_operating.values, "Expected credit loss (IFRS 9)": ifrs9_ecl.values, "Depreciation and amortisation": (depn + lease_depr).values, "Impairment loss (IAS 36)": impairment.values, "Operating profit": (revenue - cost_of_sales - admin_exp - other_operating - ifrs9_ecl - depn - lease_depr - impairment).values, "Finance costs": (finance_costs + lease_interest - ias23_capitalized).values, "Profit before tax": profit_before_tax.values, "Current tax": tax_current.values, "Deferred tax (IAS 12)": deferred_tax.values, "Profit for the period": profit_after_tax.values, "OCI - cash flow hedge reserve (IFRS 9)": oci_hedge_reserve.values, "Total comprehensive income": total_comprehensive_income.values})
+
+    retained_earnings = profit_after_tax.cumsum()
+    hedge_reserve = oci_hedge_reserve.cumsum()
+    share_capital = pd.Series(float(cfg.get("global_inputs", {}).get("initial_investment", 0.0) or 0.0), index=monthly_index)
+    socie = pd.DataFrame({"date": monthly_index, "Share capital": share_capital.values, "Retained earnings": retained_earnings.values, "Hedge reserve": hedge_reserve.values, "Total equity": (share_capital + retained_earnings + hedge_reserve).values})
+
+    sofp = pd.DataFrame({"date": monthly_index, "Cash and cash equivalents": pd.to_numeric(bs.get("Cash", 0.0), errors="coerce").fillna(0.0).values, "Trade receivables": pd.to_numeric(bs.get("AccountsReceivable", 0.0), errors="coerce").fillna(0.0).values, "Expected credit loss allowance": (-ifrs9_ecl).values, "Inventories": pd.to_numeric(bs.get("Inventory", 0.0), errors="coerce").fillna(0.0).values, "Property, plant and equipment": pd.to_numeric(bs.get("PPE_Net", 0.0), errors="coerce").fillna(0.0).values, "Right-of-use assets (IFRS 16)": rou_asset_close.values, "Total assets": 0.0, "Trade and other payables": pd.to_numeric(bs.get("AccountsPayable", 0.0), errors="coerce").fillna(0.0).values, "Contract liabilities (IFRS 15)": ifrs15_contract_liability.values, "Borrowings": pd.to_numeric(bs.get("Debt", 0.0), errors="coerce").fillna(0.0).values, "Lease liabilities (IFRS 16)": lease_liability_close.values, "Deferred tax liabilities": deferred_tax.cumsum().values, "Total liabilities": 0.0, "Share capital": socie["Share capital"].values, "Retained earnings": socie["Retained earnings"].values, "Hedge reserve": socie["Hedge reserve"].values, "Total equity": socie["Total equity"].values})
+    sofp["Total assets"] = sofp[["Cash and cash equivalents", "Trade receivables", "Expected credit loss allowance", "Inventories", "Property, plant and equipment", "Right-of-use assets (IFRS 16)"]].sum(axis=1)
+    sofp["Total liabilities"] = sofp[["Trade and other payables", "Contract liabilities (IFRS 15)", "Borrowings", "Lease liabilities (IFRS 16)", "Deferred tax liabilities"]].sum(axis=1)
+
+    scf_indirect = pd.DataFrame({"date": monthly_index, "Profit before tax": profit_before_tax.values, "Depreciation and amortisation": (depn + lease_depr).values, "Impairment losses": impairment.values, "Finance costs": (finance_costs + lease_interest - ias23_capitalized).values, "Working capital movement": -pd.to_numeric(cashflow.get("CFO", 0.0), errors="coerce").fillna(0.0).values + (profit_before_tax.values - tax_current.values), "Income taxes paid": (-tax_current).values, "Net cash from operating activities": pd.to_numeric(cashflow.get("CFO", 0.0), errors="coerce").fillna(0.0).values, "Net cash from investing activities": pd.to_numeric(cashflow.get("CFI", 0.0), errors="coerce").fillna(0.0).values, "Net cash from financing activities": (pd.to_numeric(cashflow.get("CFF", 0.0), errors="coerce").fillna(0.0) - lease_principal).values, "Lease principal payments": (-lease_principal).values, "Net increase/(decrease) in cash": pd.to_numeric(cashflow.get("NetCashFlow", 0.0), errors="coerce").fillna(0.0).values})
+
+    ppe_note = pd.DataFrame({"date": monthly_index, "Additions": pd.to_numeric(capex_info.get("capex", pd.DataFrame()).set_index("date").reindex(monthly_index, fill_value=0.0).get("amount", 0.0), errors="coerce").fillna(0.0).values if isinstance(capex_info.get("capex"), pd.DataFrame) else 0.0, "Depreciation": depn.values, "Impairment": impairment.values, "PPE closing": pd.to_numeric(sofp["Property, plant and equipment"], errors="coerce").fillna(0.0).values})
+    debt_maturity_note = pd.DataFrame({"date": monthly_index, "Debt balance": pd.to_numeric(sofp["Borrowings"], errors="coerce").fillna(0.0), "Debt service next 12m": pd.to_numeric(debt.get("debt_service", 0.0), errors="coerce").fillna(0.0).rolling(12, min_periods=1).sum().values})
+    wc_bridge_note = pd.DataFrame({"date": monthly_index, "Receivables": pd.to_numeric(sofp["Trade receivables"], errors="coerce").fillna(0.0), "Inventory": pd.to_numeric(sofp["Inventories"], errors="coerce").fillna(0.0), "Payables": pd.to_numeric(sofp["Trade and other payables"], errors="coerce").fillna(0.0)})
+    deferred_tax_note = pd.DataFrame({"date": monthly_index, "Deferred tax movement": deferred_tax.values, "Deferred tax closing": deferred_tax.cumsum().values})
+    lease_note = pd.DataFrame({"date": monthly_index, "ROU asset closing": rou_asset_close.values, "Lease liability closing": lease_liability_close.values, "Lease interest": lease_interest.values, "Lease principal": lease_principal.values})
+    hedge_reserve_note = pd.DataFrame({"date": monthly_index, "OCI hedge movement": oci_hedge_reserve.values, "Hedge reserve closing": hedge_reserve.values})
+
+    return {
+        "sopl_oci_monthly": sopl_oci.reset_index(drop=True),
+        "sofp_monthly": sofp.reset_index(drop=True),
+        "socie_monthly": socie.reset_index(drop=True),
+        "scf_indirect_monthly": scf_indirect.reset_index(drop=True),
+        "sopl_oci_annual": aggregate_annual(sopl_oci.reset_index(drop=True)),
+        "sofp_annual": aggregate_annual(sofp.reset_index(drop=True)),
+        "socie_annual": aggregate_annual(socie.reset_index(drop=True)),
+        "scf_indirect_annual": aggregate_annual(scf_indirect.reset_index(drop=True)),
+        "ifrs_note_ppe_rollforward": ppe_note.reset_index(drop=True),
+        "ifrs_note_debt_maturity": debt_maturity_note.reset_index(drop=True),
+        "ifrs_note_wc_bridge": wc_bridge_note.reset_index(drop=True),
+        "ifrs_note_deferred_tax": deferred_tax_note.reset_index(drop=True),
+        "ifrs_note_lease": lease_note.reset_index(drop=True),
+        "ifrs_note_hedge_reserve": hedge_reserve_note.reset_index(drop=True),
     }
 
 
@@ -5524,6 +5706,15 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
     valuation = project_cashflows(statements, cfg, timeline, debt_schedule=debt_schedule, cfads_bridge=cfads_bridge)
     credit_outputs = evaluate_credit_and_waterfall(cfg, timeline, statements, debt_schedule, cfads_bridge=cfads_bridge, case_name="base")
+    ifrs_outputs = build_ifrs_statements(
+        cfg,
+        timeline,
+        statements,
+        debt_schedule,
+        capex_info,
+        revenue_df,
+        credit_outputs=credit_outputs,
+    )
     be_inputs_cfg = cfg.get("break_even_inputs") if isinstance(cfg.get("break_even_inputs"), pd.DataFrame) else None
     be = break_even_analysis(
         statements,
@@ -5596,6 +5787,7 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "yearly_increments": cfg.get("yearly_increments").copy() if isinstance(cfg.get("yearly_increments"), pd.DataFrame) else cfg.get("yearly_increments"),
         "increment_factors": cfg.get("_increment_factors").copy() if isinstance(cfg.get("_increment_factors"), pd.DataFrame) else cfg.get("_increment_factors"),
     }
+    results.update(ifrs_outputs)
     results["benchmark_distance"] = compute_benchmark_distances(results, cfg)
     governance = run_governance_checks(results, timeline)
     results.update(governance)
