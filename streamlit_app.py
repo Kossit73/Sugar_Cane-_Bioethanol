@@ -322,6 +322,20 @@ def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     st.session_state.pop(f"editor_{table_name}", None)
 
 
+def _sync_table_mutation_state(table_name: str, tables: "InputTables") -> None:
+    """Keep editor/default/cache state coherent after table mutations."""
+
+    _update_editor_state(table_name, tables)
+    # Clear derived caches so downstream pages (scenarios/downloads) recompute
+    # from the latest edited inputs.
+    st.session_state.pop("scenario_payload_cache", None)
+    st.session_state.pop("excel_bytes_map", None)
+    # Close default row editor if active table changed/reset.
+    edit_state = st.session_state.get(DEFAULT_EDIT_STATE_KEY)
+    if isinstance(edit_state, Mapping) and edit_state.get("table") == table_name:
+        st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+
+
 def _total_capex_from_inputs(tables: "InputTables") -> float:
     """Return the aggregate CAPEX amount from the current input schedule."""
 
@@ -3018,7 +3032,7 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
             except Exception as exc:
                 st.error(f"Default saved but unable to update table: {exc}")
             else:
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
                 st.session_state[f"default_feedback_{table_name}"] = "Default row updated and applied."
                 _safe_rerun()
@@ -3657,7 +3671,7 @@ def _render_table_editor(
                         st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
                     if share_amount_key is not None:
                         st.session_state.pop(share_amount_key, None)
-                    _update_editor_state(table_name, tables)
+                    _sync_table_mutation_state(table_name, tables)
                     _safe_rerun()
 
     if not df.empty:
@@ -3673,7 +3687,7 @@ def _render_table_editor(
             except Exception as exc:  # pragma: no cover - defensive feedback
                 st.error(f"Unable to remove row: {exc}")
             df = tables.ensure_table(table_name).copy()
-            _update_editor_state(table_name, tables)
+            _sync_table_mutation_state(table_name, tables)
             _safe_rerun()
     state_key = _editor_state_key(table_name)
     # Clear any legacy widget state that may have been set by previous builds
@@ -3784,7 +3798,7 @@ def _render_table_editor(
             except Exception as exc:
                 st.error(f"Unable to update table: {exc}")
             else:
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
 
     current_df = tables.ensure_table(table_name).copy()
@@ -3801,7 +3815,7 @@ def _render_table_editor(
                 st.error(f"Unable to reset table: {exc}")
             else:
                 st.session_state[feedback_key] = "Table reset to stored defaults."
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
         if action_cols[1].button("Save current as defaults", key=f"save_defaults_{table_name}"):
             try:
@@ -3810,6 +3824,7 @@ def _render_table_editor(
                 st.error(f"Unable to save defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Stored defaults updated from current table."
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
         if action_cols[2].button("Restore factory defaults", key=f"factory_defaults_{table_name}"):
             try:
@@ -3819,7 +3834,7 @@ def _render_table_editor(
                 st.error(f"Unable to restore factory defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Factory defaults restored and applied."
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
 
         defaults_df = _get_default_table(table_name)
