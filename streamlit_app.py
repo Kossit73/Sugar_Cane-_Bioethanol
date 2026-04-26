@@ -2290,25 +2290,114 @@ def _generate_excel_bytes(
     buffer = BytesIO()
     engine = resolve_excel_engine()
     sheets: OrderedDict[str, pd.DataFrame] = OrderedDict()
+    chart_builders: OrderedDict[str, Callable[[], Optional["plt.Figure"]]] = OrderedDict()
+
+    def _to_sheet_name(name: str) -> str:
+        clean = re.sub(r"[:\\\\/?*\\[\\]]", "_", name).strip()
+        return clean[:31] if len(clean) > 31 else clean
+
+    def _make_line_figure(df: pd.DataFrame, x_col: str, value_cols: Sequence[str], title: str, ylabel: str = "Value") -> Optional["plt.Figure"]:
+        if plt is None or not isinstance(df, pd.DataFrame) or df.empty or x_col not in df.columns:
+            return None
+        cols = [c for c in value_cols if c in df.columns]
+        if not cols:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for col in cols:
+            ax.plot(df[x_col], pd.to_numeric(df[col], errors="coerce"), label=_friendly_label(col))
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        return fig
+
+    def _make_bar_figure(df: pd.DataFrame, category_col: str, value_cols: Sequence[str], title: str, ylabel: str = "Value") -> Optional["plt.Figure"]:
+        if plt is None or not isinstance(df, pd.DataFrame) or df.empty or category_col not in df.columns:
+            return None
+        cols = [c for c in value_cols if c in df.columns]
+        if not cols:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        plot_df = df[[category_col, *cols]].copy().set_index(category_col)
+        plot_df = plot_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        plot_df.plot(kind="bar", ax=ax)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        fig.tight_layout()
+        return fig
 
     dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
+    metrics = results.get("metrics", {}) if isinstance(results, Mapping) else {}
+    statements_monthly = results.get("statements_monthly", {}) if isinstance(results, Mapping) else {}
+    statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+
+    summary_rows = [
+        {"Metric": k, "Value": v}
+        for k, v in (metrics.items() if isinstance(metrics, Mapping) else [])
+    ]
+    if summary_rows:
+        sheets["Summary"] = pd.DataFrame(summary_rows)
     if isinstance(dashboard, Mapping):
         snapshot = dashboard.get("assumptions_snapshot")
         if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
-            sheets["Summary"] = snapshot
-        overview = dashboard.get("overview_metrics")
-        if isinstance(overview, pd.DataFrame) and not overview.empty:
-            sheets["Metrics"] = overview
-        annual_prod = dashboard.get("annual_production")
-        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
-            sheets["Production"] = annual_prod
+            sheets["Summary_Assumptions"] = snapshot
+    if "Summary" in sheets:
+        chart_builders[_to_sheet_name("Summary_Plots")] = lambda: _make_bar_figure(
+            sheets["Summary"].head(10), "Metric", ["Value"], "Summary KPI snapshot"
+        )
 
-    statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+    financial_sheet = []
     if isinstance(statements_annual, Mapping):
         for key in ("pnl", "cashflow", "balancesheet"):
             df = statements_annual.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                sheets[f"Annual_{key}"] = df
+                sheets[f"Financial_{key}"] = df
+                financial_sheet.append((key, df))
+    if financial_sheet:
+        def _financial_fig() -> Optional["plt.Figure"]:
+            if plt is None:
+                return None
+            key, df = financial_sheet[0]
+            x_col = "year" if "year" in df.columns else "date"
+            value_cols = [c for c in df.columns if c not in {x_col}][:4]
+            return _make_line_figure(df, x_col, value_cols, f"Financial Statements ({key.upper()})", "Amount")
+        chart_builders[_to_sheet_name("Financial_Statements_Plots")] = _financial_fig
+
+    prod_df = results.get("production_monthly") if isinstance(results, Mapping) else None
+    price_df = results.get("price_curves") if isinstance(results, Mapping) else None
+    revenue_df = results.get("revenue") if isinstance(results, Mapping) else None
+    if isinstance(prod_df, pd.DataFrame) and not prod_df.empty:
+        sheets["Production_Pricing_Prod"] = prod_df
+    if isinstance(price_df, pd.DataFrame) and not price_df.empty:
+        sheets["Production_Pricing_Price"] = price_df
+    if isinstance(revenue_df, pd.DataFrame) and not revenue_df.empty:
+        sheets["Production_Pricing_Revenue"] = revenue_df
+
+    def _prod_price_fig() -> Optional["plt.Figure"]:
+        if plt is None:
+            return None
+        if isinstance(price_df, pd.DataFrame) and not price_df.empty and {"date", "product", "price"}.issubset(price_df.columns):
+            pivot = price_df.pivot_table(index="date", columns="product", values="price", aggfunc="mean").reset_index()
+            return _make_line_figure(pivot, "date", [c for c in pivot.columns if c != "date"], "Production & Pricing - Price curves", "Price")
+        if isinstance(prod_df, pd.DataFrame) and not prod_df.empty and {"date", "product", "volume"}.issubset(prod_df.columns):
+            pivot = prod_df.pivot_table(index="date", columns="product", values="volume", aggfunc="sum").reset_index()
+            return _make_line_figure(pivot, "date", [c for c in pivot.columns if c != "date"], "Production & Pricing - Volume", "Volume")
+        return None
+    chart_builders[_to_sheet_name("Production_Pricing_Plots")] = _prod_price_fig
+
+    # Sensitivity page content
+    sens_df = results.get("sensitivities") if isinstance(results, Mapping) else None
+    if not isinstance(sens_df, pd.DataFrame) or sens_df.empty:
+        try:
+            if isinstance(cfg, Mapping):
+                sens_df = sensitivity_tornado(cfg, {"metrics": results.get("metrics", {})}, lambda c: run_full_model(c), None)
+        except Exception:
+            sens_df = pd.DataFrame()
+    if isinstance(sens_df, pd.DataFrame) and not sens_df.empty:
+        sheets["Sensitivities"] = sens_df
+        chart_builders[_to_sheet_name("Sensitivities_Plots")] = lambda: _make_bar_figure(
+            sens_df.head(12), "driver" if "driver" in sens_df.columns else sens_df.columns[0], ["delta"] if "delta" in sens_df.columns else [sens_df.columns[-1]], "Sensitivity tornado (top drivers)"
+        )
 
     for label, key in (("CAPEX", "capex"), ("Debt", "debt_schedule"), ("WorkingCapital", "working_capital")):
         df = results.get(key) if isinstance(results, Mapping) else None
@@ -2335,7 +2424,37 @@ def _generate_excel_bytes(
     else:
         with pd.ExcelWriter(buffer, engine=engine) as writer:
             for sheet_name, df in sheets.items():
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                df.to_excel(writer, sheet_name=_to_sheet_name(sheet_name), index=False)
+            # Add chart sheets where supported.
+            if plt is not None:
+                for raw_sheet_name, fig_builder in chart_builders.items():
+                    fig = None
+                    try:
+                        fig = fig_builder()
+                    except Exception:
+                        fig = None
+                    if fig is None:
+                        continue
+                    image_stream = BytesIO()
+                    fig.savefig(image_stream, format="png", dpi=140, bbox_inches="tight")
+                    image_stream.seek(0)
+                    plt.close(fig)
+                    sheet_name = _to_sheet_name(raw_sheet_name)
+                    if engine == "xlsxwriter":
+                        worksheet = writer.book.add_worksheet(sheet_name)
+                        writer.sheets[sheet_name] = worksheet
+                        worksheet.write(0, 0, f"{sheet_name} ({scenario_name})")
+                        worksheet.insert_image(2, 0, "chart.png", {"image_data": image_stream})
+                    elif engine == "openpyxl":
+                        ws = writer.book.create_sheet(title=sheet_name)
+                        ws["A1"] = f"{sheet_name} ({scenario_name})"
+                        try:
+                            from openpyxl.drawing.image import Image as OpenPyxlImage
+                            image_stream.seek(0)
+                            img = OpenPyxlImage(image_stream)
+                            ws.add_image(img, "A3")
+                        except Exception:
+                            ws["A3"] = "Chart image embedding unavailable (install pillow)."
 
     buffer.seek(0)
     return buffer.read()
