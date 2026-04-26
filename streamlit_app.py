@@ -3339,6 +3339,94 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
         st.warning(f"Unable to align {message}")
 
 
+def _apply_master_assumptions_automation(tables: InputTables, cfg: Dict[str, object]) -> None:
+    """Auto-populate key operating tables from master production assumptions."""
+
+    projection = cfg.get("projection_horizon", {})
+    start_year = int(projection.get("start_year", DEFAULTS["horizon"]["start_year"]))
+    end_year = int(projection.get("end_year", DEFAULTS["horizon"]["end_year"]))
+    start_month = int(projection.get("start_month", DEFAULTS["horizon"].get("start_month", 1)))
+    months = pd.date_range(f"{start_year}-{start_month:02d}-01", f"{end_year}-12-01", freq="MS")
+
+    production_cfg = cfg.get("production", {})
+    annual_feedstock = float(production_cfg.get("annual_feedstock_ton", DEFAULTS["production"]["annual_feedstock_ton"]))
+    availability = float(production_cfg.get("plant_availability", DEFAULTS["production"]["plant_availability"]))
+    loss_factor = float(production_cfg.get("loss_factor", DEFAULTS["production"]["loss_factor"]))
+    scenario = str(production_cfg.get("feedstock_scenario", "HYBRID")).strip().upper()
+    farm_share = float(production_cfg.get("farm_share", 0.5))
+    if scenario == "FARM_ONLY":
+        farm_share = 1.0
+    elif scenario == "BUY_ONLY":
+        farm_share = 0.0
+    farm_share = max(0.0, min(1.0, farm_share))
+    purchase_share = max(0.0, 1.0 - farm_share)
+
+    conversion_map = {
+        "ethanol": DEFAULTS["production"]["ethanol_litre_per_ton"],
+        "sugar": DEFAULTS["production"]["sugar_ton_per_ton_cane"],
+        "electricity": DEFAULTS["production"]["electricity_mwh_per_ton_cane"],
+        "animal_feed": DEFAULTS["production"]["animal_feed_ton_per_ton_cane"],
+    }
+    annual_rows: List[Dict[str, object]] = []
+    for product in PRODUCTS:
+        annual_rows.append(
+            {
+                "product": product,
+                "annual_volume": annual_feedstock * conversion_map.get(product, 0.0) * availability * (1 - loss_factor),
+                "availability": availability,
+                "loss_factor": loss_factor,
+                "startup_ramp": "0.7;0.9;1.0",
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": float(production_cfg.get("sugarcane_yield_ton_per_ha", DEFAULTS["production"]["sugarcane_yield_ton_per_ha"])),
+                "farm_area_ha": annual_feedstock / max(float(production_cfg.get("sugarcane_yield_ton_per_ha", DEFAULTS["production"]["sugarcane_yield_ton_per_ha"])), 1e-9),
+            }
+        )
+    production_annual = pd.DataFrame(annual_rows)
+    tables.set_table("production_annual", production_annual)
+    _update_editor_state("production_annual", tables)
+
+    monthly_rows: List[Dict[str, object]] = []
+    for row in annual_rows:
+        monthly_volume = float(row["annual_volume"]) / 12.0
+        for dt in months:
+            monthly_rows.append(
+                {
+                    "date": dt.strftime("%Y-%m"),
+                    "product": row["product"],
+                    "volume": monthly_volume,
+                    "availability_override": np.nan,
+                    "maintenance_downtime": np.nan,
+                    "loss_override": np.nan,
+                }
+            )
+    production_monthly = pd.DataFrame(monthly_rows)
+    tables.set_table("production_monthly", production_monthly)
+    _update_editor_state("production_monthly", tables)
+
+    base_currency = str(cfg.get("global_inputs", {}).get("base_currency", DEFAULTS["global"]["base_currency"]))
+    purchase_price = float(cfg.get("opex", {}).get("purchase_price_per_ton", DEFAULTS["opex"]["purchase_price_per_ton"]))
+    monthly_purchase_qty = annual_feedstock * purchase_share / 12.0
+    direct_cost_rows = [
+        {
+            "date": dt.strftime("%Y-%m"),
+            "cost_type": "feedstock purchase",
+            "product_link": "sugarcane",
+            "unit_price": purchase_price,
+            "quantity": monthly_purchase_qty,
+            "amount": purchase_price * monthly_purchase_qty,
+            "currency": base_currency,
+        }
+        for dt in months
+    ]
+    direct_costs = pd.DataFrame(direct_cost_rows)
+    tables.set_table("direct_costs_monthly", direct_costs)
+    _update_editor_state("direct_costs_monthly", tables)
+
+    st.success(
+        "Automation applied: regenerated production annual/monthly tables and synced monthly feedstock purchase rows."
+    )
+
+
 def _auto_step(value: float) -> float:
     magnitude = abs(float(value))
     if magnitude == 0:
@@ -4241,6 +4329,11 @@ def main() -> None:
                     format_func=lambda value: f"{value:.0%}",
                 )
                 production_cfg["farm_share"] = float(farm_share)
+            if st.button("Auto-sync operating tables", key="auto_sync_operating_tables"):
+                try:
+                    _apply_master_assumptions_automation(tables, cfg)
+                except Exception as exc:
+                    st.warning(f"Automation failed: {exc}")
 
         pricing_cfg = cfg.setdefault("prices", {})
         with control_tabs[3]:
