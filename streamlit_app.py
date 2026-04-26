@@ -3093,6 +3093,27 @@ def _sync_tables_from_state(tables: InputTables) -> Dict[str, str]:
                 tables.set_table(table_name, value)
             except Exception as exc:  # pragma: no cover - validation feedback for UI edits
                 errors[table_name] = str(exc)
+
+    # Keep production horizon fused with projection horizon whenever start/end
+    # years are edited from any table editor entry point (not only Model Controls).
+    try:
+        proj_df = tables.ensure_table("projection_horizon")
+        if isinstance(proj_df, pd.DataFrame) and not proj_df.empty:
+            row = proj_df.iloc[0]
+            start_year = int(row.get("start_year", DEFAULTS["horizon"]["start_year"]))
+            end_year = int(row.get("end_year", DEFAULTS["horizon"]["end_year"]))
+            prod_target = pd.DataFrame([{"start_year": start_year, "end_year": end_year}])
+            current_prod = tables.ensure_table("production_horizon")
+            current_tuple = None
+            if isinstance(current_prod, pd.DataFrame) and not current_prod.empty:
+                cur_row = current_prod.iloc[0]
+                current_tuple = (int(cur_row.get("start_year", start_year)), int(cur_row.get("end_year", end_year)))
+            target_tuple = (start_year, end_year)
+            if current_tuple != target_tuple:
+                tables.set_table("production_horizon", prod_target)
+                _sync_table_mutation_state("production_horizon", tables)
+    except Exception as exc:  # pragma: no cover - defensive sync guard
+        errors["production_horizon"] = str(exc)
     return errors
 
 
@@ -3207,6 +3228,21 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
     """Update time-indexed tables in the UI after horizon edits."""
 
     errors: List[str] = []
+    prod_horizon_cfg = cfg.get("production_horizon", {})
+    if isinstance(prod_horizon_cfg, Mapping):
+        try:
+            prod_df = pd.DataFrame(
+                [
+                    {
+                        "start_year": int(prod_horizon_cfg.get("start_year", cfg.get("projection_horizon", {}).get("start_year", DEFAULTS["horizon"]["start_year"]))),
+                        "end_year": int(prod_horizon_cfg.get("end_year", cfg.get("projection_horizon", {}).get("end_year", DEFAULTS["horizon"]["end_year"]))),
+                    }
+                ]
+            )
+            tables.set_table("production_horizon", prod_df)
+            _update_editor_state("production_horizon", tables)
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"production_horizon: {exc}")
     for table in HORIZON_SYNC_TABLES:
         df = cfg.get(table)
         if not isinstance(df, pd.DataFrame):
