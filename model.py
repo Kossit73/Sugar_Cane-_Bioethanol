@@ -563,6 +563,80 @@ DEFAULTS = {
             {"profile": "break", "year": 2025, "global_increment_pct": 0.0, "price_increment_pct": -0.02, "opex_increment_pct": 0.02, "debt_increment_pct": 0.01, "capex_increment_pct": 0.02, "wc_increment_pct": 0.01, "tax_increment_pct": 0.0},
         ]
     ),
+    "debt_sizing_params": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "min_dscr": 1.25,
+                "llcr_floor": 1.35,
+                "plcr_floor": 1.5,
+                "max_tenor_years": 12,
+                "reserve_buffer_pct": 0.05,
+                "target_debt_amount": np.nan,
+            }
+        ]
+    ),
+    "covenant_cure_rules": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "case": "base",
+                "lockup_grace_months": 3,
+                "default_grace_months": 1,
+                "cash_sweep_stepup_pct": 0.15,
+                "waiver_fee_pct": 0.005,
+                "waiver_probability": 0.5,
+            }
+        ]
+    ),
+    "construction_risk_mc": pd.DataFrame(
+        [
+            {
+                "enabled": True,
+                "iterations": 200,
+                "delay_mean_months": 1.0,
+                "delay_std_months": 2.0,
+                "ld_per_day": 20_000.0,
+                "dsu_monthly_payout": 500_000.0,
+                "idc_capitalize": True,
+            }
+        ]
+    ),
+    "hedging_program": pd.DataFrame(
+        [
+            {
+                "product": "ethanol",
+                "hedge_ratio": 0.5,
+                "tenor_months": 12,
+                "fx_basis_pct": 0.01,
+                "correlation_shock": 0.15,
+                "hedge_cost_pct": 0.01,
+                "collateral_pct": 0.03,
+                "effectiveness": 0.85,
+            }
+        ]
+    ),
+    "sustainability_compliance": pd.DataFrame(
+        [
+            {
+                "standard": "Bonsucro",
+                "status": "compliant",
+                "price_premium_pct": 0.01,
+                "low_carbon_credit_per_unit": 0.0,
+                "capex_gap_closure_pct": 0.0,
+                "opex_gap_closure_pct": 0.0,
+                "delay_penalty_pct": 0.0,
+            }
+        ]
+    ),
+    "benchmark_library": pd.DataFrame(
+        [
+            {"metric": "capex_per_litre", "region": "LATAM", "year": 2025, "value": 0.6, "risk_tier": "base"},
+            {"metric": "opex_per_litre", "region": "LATAM", "year": 2025, "value": 0.35, "risk_tier": "base"},
+            {"metric": "dscr_min_threshold", "region": "GLOBAL", "year": 2025, "value": 1.2, "risk_tier": "senior"},
+            {"metric": "irr_threshold", "region": "GLOBAL", "year": 2025, "value": 0.14, "risk_tier": "equity"},
+        ]
+    ),
 }
 
 
@@ -1477,6 +1551,46 @@ INPUT_SCHEMAS: Dict[str, TableSchema] = {
             "tax_increment_pct": 0.0,
         },
     ),
+    "debt_sizing_params": TableSchema(
+        columns={
+            "enabled": "bool",
+            "min_dscr": "float",
+            "llcr_floor": "float",
+            "plcr_floor": "float",
+            "max_tenor_years": "int",
+            "reserve_buffer_pct": "float",
+            "target_debt_amount": "float",
+        },
+        defaults={"enabled": True, "min_dscr": 1.25, "llcr_floor": 1.35, "plcr_floor": 1.5, "max_tenor_years": 12, "reserve_buffer_pct": 0.05},
+    ),
+    "covenant_cure_rules": TableSchema(
+        columns={
+            "enabled": "bool",
+            "case": "str",
+            "lockup_grace_months": "int",
+            "default_grace_months": "int",
+            "cash_sweep_stepup_pct": "float",
+            "waiver_fee_pct": "float",
+            "waiver_probability": "float",
+        },
+        defaults={"enabled": True, "case": "base", "lockup_grace_months": 3, "default_grace_months": 1, "cash_sweep_stepup_pct": 0.15, "waiver_fee_pct": 0.005, "waiver_probability": 0.5},
+    ),
+    "construction_risk_mc": TableSchema(
+        columns={"enabled": "bool", "iterations": "int", "delay_mean_months": "float", "delay_std_months": "float", "ld_per_day": "float", "dsu_monthly_payout": "float", "idc_capitalize": "bool"},
+        defaults={"enabled": True, "iterations": 200, "delay_mean_months": 1.0, "delay_std_months": 2.0, "ld_per_day": 20_000.0, "dsu_monthly_payout": 500_000.0, "idc_capitalize": True},
+    ),
+    "hedging_program": TableSchema(
+        columns={"product": "str", "hedge_ratio": "float", "tenor_months": "int", "fx_basis_pct": "float", "correlation_shock": "float", "hedge_cost_pct": "float", "collateral_pct": "float", "effectiveness": "float"},
+        defaults={"hedge_ratio": 0.0, "tenor_months": 12, "fx_basis_pct": 0.0, "correlation_shock": 0.0, "hedge_cost_pct": 0.0, "collateral_pct": 0.0, "effectiveness": 1.0},
+    ),
+    "sustainability_compliance": TableSchema(
+        columns={"standard": "str", "status": "str", "price_premium_pct": "float", "low_carbon_credit_per_unit": "float", "capex_gap_closure_pct": "float", "opex_gap_closure_pct": "float", "delay_penalty_pct": "float"},
+        defaults={"status": "compliant", "price_premium_pct": 0.0, "low_carbon_credit_per_unit": 0.0, "capex_gap_closure_pct": 0.0, "opex_gap_closure_pct": 0.0, "delay_penalty_pct": 0.0},
+    ),
+    "benchmark_library": TableSchema(
+        columns={"metric": "str", "region": "str", "year": "int", "value": "float", "risk_tier": "str"},
+        defaults={"region": "GLOBAL", "risk_tier": "base"},
+    ),
 }
 
 
@@ -1626,6 +1740,12 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "covenant_thresholds": DEFAULTS["covenant_thresholds"].copy(),
         "lender_cases": DEFAULTS["lender_cases"].copy(),
         "yearly_increments": DEFAULTS["yearly_increments"].copy(),
+        "debt_sizing_params": DEFAULTS["debt_sizing_params"].copy(),
+        "covenant_cure_rules": DEFAULTS["covenant_cure_rules"].copy(),
+        "construction_risk_mc": DEFAULTS["construction_risk_mc"].copy(),
+        "hedging_program": DEFAULTS["hedging_program"].copy(),
+        "sustainability_compliance": DEFAULTS["sustainability_compliance"].copy(),
+        "benchmark_library": DEFAULTS["benchmark_library"].copy(),
     }
 
     for key, value in assumptions.items():
@@ -1724,6 +1844,12 @@ def build_config(assumptions: Mapping[str, object], tables: InputTables) -> Dict
         "covenant_thresholds",
         "lender_cases",
         "yearly_increments",
+        "debt_sizing_params",
+        "covenant_cure_rules",
+        "construction_risk_mc",
+        "hedging_program",
+        "sustainability_compliance",
+        "benchmark_library",
     ):
         df = tables.ensure_table(table_name)
         if not df.empty:
@@ -2879,6 +3005,96 @@ def aggregate_annual(monthly_df: pd.DataFrame) -> pd.DataFrame:
 
 def npv(rate: float, cashflows: Sequence[float]) -> float:
     return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cashflows))
+
+
+def build_cfads_bridge(
+    statements: Dict[str, pd.DataFrame],
+    timeline: Timeline,
+    debt_schedule: Optional[pd.DataFrame] = None,
+    reserve_effects: Optional[pd.DataFrame] = None,
+    cfg: Optional[Mapping[str, object]] = None,
+) -> pd.DataFrame:
+    """Build lender-style CFADS bridge used consistently across debt metrics."""
+
+    monthly_index = timeline.monthly_index()
+    pnl = statements.get("pnl", pd.DataFrame()).copy()
+    cashflow = statements.get("cashflow", pd.DataFrame()).copy()
+    for frame in (pnl, cashflow):
+        if isinstance(frame, pd.DataFrame) and "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    pnl = pnl.set_index("date").reindex(monthly_index, fill_value=0.0) if isinstance(pnl, pd.DataFrame) and not pnl.empty else pd.DataFrame(index=monthly_index)
+    cashflow = cashflow.set_index("date").reindex(monthly_index, fill_value=0.0) if isinstance(cashflow, pd.DataFrame) and not cashflow.empty else pd.DataFrame(index=monthly_index)
+
+    ebitda = pd.to_numeric(pnl.get("EBITDA", pd.Series(0.0, index=monthly_index)), errors="coerce").fillna(0.0)
+    cash_tax = pd.to_numeric(pnl.get("tax", pd.Series(0.0, index=monthly_index)), errors="coerce").fillna(0.0)
+    maintenance_capex_pct = float(cfg.get("global_inputs", {}).get("maintenance_capex_pct", 0.05)) if isinstance(cfg, Mapping) else 0.05
+    maintenance_capex = np.maximum(ebitda.values, 0.0) * maintenance_capex_pct
+    delta_wc = pd.to_numeric(cashflow.get("CFO", pd.Series(0.0, index=monthly_index)), errors="coerce").fillna(0.0) - (ebitda - cash_tax)
+    reserve_moves = pd.Series(0.0, index=monthly_index)
+    if isinstance(reserve_effects, pd.DataFrame) and not reserve_effects.empty and "date" in reserve_effects.columns:
+        tmp = reserve_effects.copy()
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+        tmp = tmp.dropna(subset=["date"]).set_index("date")
+        reserve_moves = pd.to_numeric(tmp.get("reserve_net_movement", 0.0), errors="coerce").reindex(monthly_index, fill_value=0.0)
+    lender_adjustments = pd.Series(0.0, index=monthly_index)
+    if isinstance(debt_schedule, pd.DataFrame) and not debt_schedule.empty and {"date", "fees"}.issubset(debt_schedule.columns):
+        fee_series = debt_schedule.groupby("date")["fees"].sum()
+        lender_adjustments = -pd.to_numeric(fee_series, errors="coerce").reindex(monthly_index, fill_value=0.0)
+
+    cfads = ebitda - cash_tax - maintenance_capex - delta_wc - reserve_moves + lender_adjustments
+    bridge = pd.DataFrame(
+        {
+            "date": monthly_index,
+            "EBITDA": ebitda.values,
+            "cash_taxes": cash_tax.values,
+            "maintenance_capex": maintenance_capex,
+            "working_capital_movement": delta_wc.values,
+            "reserve_movement": reserve_moves.values,
+            "lender_adjustments": lender_adjustments.values,
+            "CFADS": cfads.values,
+        }
+    )
+    return bridge
+
+
+def size_debt_from_cfads(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    cfads_bridge: pd.DataFrame,
+    discount_rate: float,
+) -> Dict[str, object]:
+    """Compute lender-style debt sizing envelope using DSCR/LLCR/PLCR constraints."""
+
+    sizing = cfg.get("debt_sizing_params")
+    if not isinstance(sizing, pd.DataFrame) or sizing.empty or not bool(sizing.iloc[0].get("enabled", True)):
+        return {"enabled": False, "sized_debt": np.nan, "debt_scale_factor": 1.0}
+    row = sizing.iloc[0]
+    min_dscr = float(row.get("min_dscr", 1.25) or 1.25)
+    llcr_floor = float(row.get("llcr_floor", 1.35) or 1.35)
+    plcr_floor = float(row.get("plcr_floor", 1.5) or 1.5)
+    reserve_buffer = float(row.get("reserve_buffer_pct", 0.05) or 0.0)
+
+    cfads = pd.to_numeric(cfads_bridge.get("CFADS", pd.Series(dtype=float)), errors="coerce").fillna(0.0).values
+    if cfads.size == 0:
+        return {"enabled": True, "sized_debt": 0.0, "debt_scale_factor": 0.0}
+    monthly_discount = (1 + max(discount_rate, 0.0)) ** (1 / 12) - 1
+    rem = np.arange(len(cfads))
+    pv_cfads = float(np.sum(np.maximum(cfads, 0.0) / ((1 + monthly_discount) ** rem)))
+    dscr_capacity = float(np.sum(np.maximum(cfads, 0.0) / max(min_dscr, 1e-6)))
+    llcr_capacity = pv_cfads / max(llcr_floor, 1e-6)
+    plcr_capacity = pv_cfads / max(plcr_floor, 1e-6)
+    sized_debt = max(0.0, min(dscr_capacity, llcr_capacity, plcr_capacity) * max(0.0, 1.0 - reserve_buffer))
+    capex_df = cfg.get("capex_lines")
+    total_capex = float(pd.to_numeric(capex_df.get("amount"), errors="coerce").fillna(0.0).sum()) if isinstance(capex_df, pd.DataFrame) and "amount" in capex_df.columns else 0.0
+    scale_factor = sized_debt / total_capex if total_capex > 1e-9 else 1.0
+    return {
+        "enabled": True,
+        "sized_debt": sized_debt,
+        "capacity_dscr": dscr_capacity,
+        "capacity_llcr": llcr_capacity,
+        "capacity_plcr": plcr_capacity,
+        "debt_scale_factor": max(0.0, min(scale_factor, 1.5)),
+    }
 
 
 def irr_bisection(cashflows: Sequence[float], lo: float = -0.9, hi: float = 1.5, tol: float = 1e-6, max_iter: int = 200) -> float:
