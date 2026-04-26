@@ -2352,6 +2352,105 @@ def build_revenue_stack(cfg: Mapping[str, object], production_monthly: pd.DataFr
     if not math.isclose(revenue_multiplier, 1.0):
         df["revenue"] *= revenue_multiplier
     return df
+
+
+def apply_sustainability_to_cashflows(
+    cfg: Mapping[str, object],
+    revenue_df: pd.DataFrame,
+    capex_df: pd.DataFrame,
+    direct_costs_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Apply compliance-linked incentives/penalties to revenue, capex, and opex."""
+
+    sustain = cfg.get("sustainability_compliance")
+    if not isinstance(sustain, pd.DataFrame) or sustain.empty:
+        return {"revenue": revenue_df, "capex": capex_df, "direct_costs": direct_costs_df if isinstance(direct_costs_df, pd.DataFrame) else pd.DataFrame(), "report": pd.DataFrame()}
+    row = sustain.iloc[0]
+    status = str(row.get("status", "compliant")).strip().lower()
+    price_premium = float(row.get("price_premium_pct", 0.0) or 0.0)
+    carbon_credit_per_unit = float(row.get("low_carbon_credit_per_unit", 0.0) or 0.0)
+    capex_gap = float(row.get("capex_gap_closure_pct", 0.0) or 0.0)
+    opex_gap = float(row.get("opex_gap_closure_pct", 0.0) or 0.0)
+    delay_penalty = float(row.get("delay_penalty_pct", 0.0) or 0.0)
+    compliant = status == "compliant"
+
+    rev = revenue_df.copy()
+    if "revenue" in rev.columns:
+        rev["sustainability_price_adjustment"] = rev["revenue"] * (price_premium if compliant else -abs(delay_penalty))
+        unit_volume = pd.to_numeric(rev.get("volume", 0.0), errors="coerce").fillna(0.0)
+        rev["low_carbon_credit_revenue"] = unit_volume * (carbon_credit_per_unit if compliant else 0.0)
+        rev["revenue"] = rev["revenue"] + rev["sustainability_price_adjustment"] + rev["low_carbon_credit_revenue"]
+
+    capex_adj = capex_df.copy()
+    if "amount" in capex_adj.columns and capex_gap != 0:
+        capex_adj["sustainability_gap_capex"] = pd.to_numeric(capex_adj["amount"], errors="coerce").fillna(0.0) * capex_gap
+        capex_adj["amount"] = pd.to_numeric(capex_adj["amount"], errors="coerce").fillna(0.0) + capex_adj["sustainability_gap_capex"]
+        capex_adj["cumulative_capex"] = capex_adj["amount"].cumsum()
+
+    dcost = direct_costs_df.copy() if isinstance(direct_costs_df, pd.DataFrame) else pd.DataFrame()
+    if not dcost.empty and "amount" in dcost.columns and opex_gap != 0:
+        dcost["sustainability_gap_opex"] = pd.to_numeric(dcost["amount"], errors="coerce").fillna(0.0) * opex_gap
+        dcost["amount"] = pd.to_numeric(dcost["amount"], errors="coerce").fillna(0.0) + dcost["sustainability_gap_opex"]
+
+    report = pd.DataFrame(
+        [
+            {
+                "standard": row.get("standard", ""),
+                "status": status,
+                "price_premium_pct_applied": price_premium if compliant else -abs(delay_penalty),
+                "carbon_credit_per_unit_applied": carbon_credit_per_unit if compliant else 0.0,
+                "capex_gap_closure_pct": capex_gap,
+                "opex_gap_closure_pct": opex_gap,
+            }
+        ]
+    )
+    return {"revenue": rev, "capex": capex_adj, "direct_costs": dcost, "report": report}
+
+
+def apply_hedging_to_revenue(cfg: Mapping[str, object], revenue_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Apply basis-risk and hedging economics to revenue stream."""
+
+    hedging = cfg.get("hedging_program")
+    if not isinstance(hedging, pd.DataFrame) or hedging.empty or revenue_df.empty:
+        return {"revenue": revenue_df, "hedging_report": pd.DataFrame()}
+    out = revenue_df.copy()
+    out["hedge_cost"] = 0.0
+    out["hedge_pnl"] = 0.0
+    out["hedge_collateral"] = 0.0
+    reports: List[Dict[str, object]] = []
+    for _, row in hedging.iterrows():
+        product = str(row.get("product", "")).strip().lower()
+        mask = out["product"].astype(str).str.lower().eq(product) if "product" in out.columns else pd.Series(False, index=out.index)
+        if not bool(mask.any()):
+            continue
+        hedge_ratio = float(row.get("hedge_ratio", 0.0) or 0.0)
+        fx_basis = float(row.get("fx_basis_pct", 0.0) or 0.0)
+        corr_shock = float(row.get("correlation_shock", 0.0) or 0.0)
+        hedge_cost_pct = float(row.get("hedge_cost_pct", 0.0) or 0.0)
+        collateral_pct = float(row.get("collateral_pct", 0.0) or 0.0)
+        effectiveness = float(row.get("effectiveness", 1.0) or 1.0)
+        base_rev = pd.to_numeric(out.loc[mask, "revenue"], errors="coerce").fillna(0.0)
+        hedged_notional = base_rev * hedge_ratio
+        pnl = hedged_notional * (-(fx_basis + corr_shock) * max(0.0, min(effectiveness, 1.0)))
+        cost = hedged_notional * hedge_cost_pct
+        collateral = np.abs(hedged_notional) * collateral_pct
+        out.loc[mask, "hedge_pnl"] = pnl.values
+        out.loc[mask, "hedge_cost"] = cost.values
+        out.loc[mask, "hedge_collateral"] = collateral.values
+        out.loc[mask, "revenue"] = base_rev.values + pnl.values - cost.values
+        reports.append(
+            {
+                "product": product,
+                "hedge_ratio": hedge_ratio,
+                "fx_basis_pct": fx_basis,
+                "correlation_shock": corr_shock,
+                "hedge_cost_pct": hedge_cost_pct,
+                "collateral_pct": collateral_pct,
+                "effectiveness": effectiveness,
+                "net_hedge_effect": float((pnl - cost).sum()),
+            }
+        )
+    return {"revenue": out, "hedging_report": pd.DataFrame(reports)}
 ###############################################################################
 # Section 8: CAPEX and depreciation
 ###############################################################################
@@ -2507,6 +2606,66 @@ def apply_construction_risk(cfg: Mapping[str, object], timeline: Timeline, capex
     adjusted["amount"] = capex_series.values
     adjusted["cumulative_capex"] = adjusted["amount"].cumsum()
     return adjusted, pd.DataFrame(records)
+
+
+def run_construction_risk_mc(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    capex_df: pd.DataFrame,
+    debt_schedule: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    """Estimate schedule-critical-path delay and cost effects via Monte Carlo."""
+
+    mc_cfg = cfg.get("construction_risk_mc")
+    if not isinstance(mc_cfg, pd.DataFrame) or mc_cfg.empty or not bool(mc_cfg.iloc[0].get("enabled", True)):
+        return {"capex": capex_df, "mc_report": pd.DataFrame(), "reserve_effects": pd.DataFrame()}
+    row = mc_cfg.iloc[0]
+    iterations = max(50, int(row.get("iterations", 200) or 200))
+    delay_mean = float(row.get("delay_mean_months", 1.0) or 1.0)
+    delay_std = max(0.1, float(row.get("delay_std_months", 2.0) or 2.0))
+    ld_per_day = float(row.get("ld_per_day", 0.0) or 0.0)
+    dsu_monthly = float(row.get("dsu_monthly_payout", 0.0) or 0.0)
+    idc_capitalize = bool(row.get("idc_capitalize", True))
+
+    delays = np.maximum(np.random.normal(delay_mean, delay_std, size=iterations), 0.0)
+    p50_delay = float(np.percentile(delays, 50))
+    p90_delay = float(np.percentile(delays, 90))
+    expected_delay = int(round(p50_delay))
+    expected_ld = float(np.mean(delays * 30.0 * ld_per_day))
+    expected_dsu = float(np.mean(delays * dsu_monthly))
+    net_delay_cost = max(expected_ld - expected_dsu, 0.0)
+
+    capex_adj = capex_df.copy()
+    if "date" in capex_adj.columns:
+        capex_adj["date"] = pd.to_datetime(capex_adj["date"], errors="coerce") + pd.DateOffset(months=expected_delay)
+        capex_adj = capex_adj.dropna(subset=["date"]).groupby("date", as_index=False).sum(numeric_only=True)
+    if "amount" not in capex_adj.columns:
+        capex_adj["amount"] = 0.0
+    if idc_capitalize and net_delay_cost > 0:
+        capex_adj.loc[capex_adj.index.max(), "amount"] = capex_adj.loc[capex_adj.index.max(), "amount"] + net_delay_cost
+    capex_adj = capex_adj.sort_values("date").reset_index(drop=True)
+    capex_adj["cumulative_capex"] = pd.to_numeric(capex_adj["amount"], errors="coerce").fillna(0.0).cumsum()
+
+    monthly_index = timeline.monthly_index()
+    reserve_effects = pd.DataFrame({"date": monthly_index, "reserve_net_movement": 0.0, "construction_delay_months": expected_delay})
+    if expected_delay > 0:
+        reserve_effects.loc[: min(expected_delay - 1, len(reserve_effects) - 1), "reserve_net_movement"] = expected_dsu / max(expected_delay, 1)
+
+    mc_report = pd.DataFrame(
+        [
+            {
+                "iterations": iterations,
+                "delay_p50_months": p50_delay,
+                "delay_p90_months": p90_delay,
+                "expected_delay_months": expected_delay,
+                "expected_ld_cost": expected_ld,
+                "expected_dsu_payout": expected_dsu,
+                "net_delay_cost": net_delay_cost,
+                "idc_capitalize": idc_capitalize,
+            }
+        ]
+    )
+    return {"capex": capex_adj, "mc_report": mc_report, "reserve_effects": reserve_effects}
 ###############################################################################
 # Section 9: Debt modeling
 ###############################################################################
@@ -3097,6 +3256,67 @@ def size_debt_from_cfads(
     }
 
 
+def optimize_debt_sizing_structure(
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    base_capex: pd.DataFrame,
+    statements: Dict[str, pd.DataFrame],
+    reserve_effects: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
+    """Iteratively size debt and tune tenor/profile using a consistent CFADS bridge."""
+
+    tranches_df = cfg.get("debt_tranches")
+    if not isinstance(tranches_df, pd.DataFrame) or tranches_df.empty:
+        return {"enabled": False, "debt_schedule": pd.DataFrame(), "summary": {"enabled": False}}
+
+    cfg_local = copy.deepcopy(dict(cfg))
+    debt_cfg = cfg_local.get("debt_sizing_params")
+    if not isinstance(debt_cfg, pd.DataFrame) or debt_cfg.empty or not bool(debt_cfg.iloc[0].get("enabled", True)):
+        schedule = build_debt_schedule(cfg_local, timeline, base_capex)
+        return {"enabled": False, "debt_schedule": schedule, "summary": {"enabled": False}}
+
+    max_tenor = max(3, int(debt_cfg.iloc[0].get("max_tenor_years", 12) or 12))
+    target_debt = debt_cfg.iloc[0].get("target_debt_amount")
+    discount_rate = float(cfg_local.get("global_inputs", {}).get("discount_rate", DEFAULTS["global"]["discount_rate"]))
+    current_tenor = int(pd.to_numeric(tranches_df.get("tenor_years", 8), errors="coerce").fillna(8).median())
+    current_tenor = max(3, min(max_tenor, current_tenor))
+
+    best: Dict[str, object] = {"sized_debt": 0.0, "tenor_years": current_tenor, "debt_schedule": pd.DataFrame()}
+    for _ in range(6):
+        tr_local = tranches_df.copy()
+        tr_local["tenor_years"] = current_tenor
+        cfg_local["debt_tranches"] = tr_local
+        trial_schedule = build_debt_schedule(cfg_local, timeline, base_capex)
+        trial_bridge = build_cfads_bridge(statements, timeline, debt_schedule=trial_schedule, reserve_effects=reserve_effects, cfg=cfg_local)
+        sizing = size_debt_from_cfads(cfg_local, timeline, trial_bridge, discount_rate=discount_rate)
+        sized_debt = float(sizing.get("sized_debt", 0.0) or 0.0)
+        if pd.notna(target_debt):
+            sized_debt = min(sized_debt, float(target_debt))
+        capex_total = float(pd.to_numeric(base_capex.get("amount"), errors="coerce").fillna(0.0).sum()) if "amount" in base_capex.columns else 0.0
+        scale = sized_debt / capex_total if capex_total > 1e-9 else 1.0
+        tr_local["share"] = pd.to_numeric(tr_local.get("share", 0.0), errors="coerce").fillna(0.0) * max(0.0, scale)
+        cfg_local["debt_tranches"] = tr_local
+        resized_schedule = build_debt_schedule(cfg_local, timeline, base_capex, cfads_series=trial_bridge.set_index("date")["CFADS"])
+
+        best = {
+            **sizing,
+            "tenor_years": current_tenor,
+            "debt_schedule": resized_schedule,
+            "cfads_bridge": trial_bridge,
+        }
+        avg_dscr = float(np.nanmean(np.where(resized_schedule.groupby("date")["debt_service"].sum().reindex(timeline.monthly_index(), fill_value=0.0).values > 1e-9, trial_bridge["CFADS"].values / np.maximum(resized_schedule.groupby("date")["debt_service"].sum().reindex(timeline.monthly_index(), fill_value=0.0).values, 1e-9), np.nan)))
+        min_target = float(debt_cfg.iloc[0].get("min_dscr", 1.25) or 1.25)
+        if np.isnan(avg_dscr):
+            break
+        if avg_dscr < min_target and current_tenor < max_tenor:
+            current_tenor += 1
+        elif avg_dscr > (min_target + 0.15) and current_tenor > 3:
+            current_tenor -= 1
+        else:
+            break
+    return {"enabled": True, "debt_schedule": best.get("debt_schedule", pd.DataFrame()), "summary": best}
+
+
 def irr_bisection(cashflows: Sequence[float], lo: float = -0.9, hi: float = 1.5, tol: float = 1e-6, max_iter: int = 200) -> float:
     def f(r):
         return sum(cf / ((1 + r) ** t) for t, cf in enumerate(cashflows))
@@ -3119,7 +3339,13 @@ def irr_bisection(cashflows: Sequence[float], lo: float = -0.9, hi: float = 1.5,
     return mid
 
 
-def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, object], timeline: Timeline) -> Dict[str, object]:
+def project_cashflows(
+    statements: Dict[str, pd.DataFrame],
+    cfg: Mapping[str, object],
+    timeline: Timeline,
+    debt_schedule: Optional[pd.DataFrame] = None,
+    cfads_bridge: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
     cashflow = statements["cashflow"].copy()
     pnl = statements["pnl"].copy()
     monthly_index = timeline.monthly_index()
@@ -3139,8 +3365,14 @@ def project_cashflows(statements: Dict[str, pd.DataFrame], cfg: Mapping[str, obj
     payback_month = next((i for i, val in enumerate(cumulative_fcf) if val >= 0), None)
     payback_year = monthly_index[payback_month].year if payback_month is not None else None
 
-    debt_service = -cashflow["CFF"].values
-    cfads = cashflow["CFO"].values
+    if isinstance(debt_schedule, pd.DataFrame) and not debt_schedule.empty and {"date", "debt_service"}.issubset(debt_schedule.columns):
+        debt_service = debt_schedule.groupby("date")["debt_service"].sum().reindex(monthly_index, fill_value=0.0).values
+    else:
+        debt_service = -cashflow["CFF"].values
+    if isinstance(cfads_bridge, pd.DataFrame) and not cfads_bridge.empty and {"date", "CFADS"}.issubset(cfads_bridge.columns):
+        cfads = pd.to_numeric(cfads_bridge.set_index("date")["CFADS"], errors="coerce").reindex(monthly_index, fill_value=0.0).values
+    else:
+        cfads = cashflow["CFO"].values
     dscr_series = [cf / ds if ds != 0 else np.nan for cf, ds in zip(cfads, debt_service)]
     metrics = {
         "Project_NPV": project_npv,
@@ -3180,6 +3412,7 @@ def evaluate_credit_and_waterfall(
     timeline: Timeline,
     statements: Dict[str, pd.DataFrame],
     debt_schedule: pd.DataFrame,
+    cfads_bridge: Optional[pd.DataFrame] = None,
     case_name: str = "base",
 ) -> Dict[str, pd.DataFrame]:
     monthly_index = timeline.monthly_index()
@@ -3200,7 +3433,10 @@ def evaluate_credit_and_waterfall(
         cashflow["CFO"] = 0.0
     if "NetCashFlow" not in cashflow.columns:
         cashflow["NetCashFlow"] = 0.0
-    cfads = cashflow.set_index("date")["CFO"].reindex(monthly_index, fill_value=0.0)
+    if isinstance(cfads_bridge, pd.DataFrame) and not cfads_bridge.empty and {"date", "CFADS"}.issubset(cfads_bridge.columns):
+        cfads = pd.to_numeric(cfads_bridge.set_index("date")["CFADS"], errors="coerce").reindex(monthly_index, fill_value=0.0)
+    else:
+        cfads = cashflow.set_index("date")["CFO"].reindex(monthly_index, fill_value=0.0)
     dscr = np.where(debt_monthly["debt_service"].values > 1e-9, cfads.values / debt_monthly["debt_service"].values, np.nan)
     dscr_df = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "DSCR": dscr, "balance": debt_monthly["balance"].values})
     annual_dist = _annual_credit_distributions(dscr_df)
@@ -3248,6 +3484,17 @@ def evaluate_credit_and_waterfall(
     dscr_df["lockup_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_lockup"]
     dscr_df["default_triggered"] = dscr_df["DSCR"] < dscr_df["dscr_default"]
     dscr_df["llcr_breach"] = dscr_df["LLCR"] < dscr_df["llcr_min"]
+    cure_cfg = cfg.get("covenant_cure_rules")
+    cure_row = cure_cfg.iloc[0] if isinstance(cure_cfg, pd.DataFrame) and not cure_cfg.empty else {}
+    lockup_grace = max(0, int(cure_row.get("lockup_grace_months", 0) or 0))
+    default_grace = max(0, int(cure_row.get("default_grace_months", 0) or 0))
+    waiver_prob = float(cure_row.get("waiver_probability", 0.0) or 0.0)
+    waiver_fee_pct = float(cure_row.get("waiver_fee_pct", 0.0) or 0.0)
+    sweep_stepup = float(cure_row.get("cash_sweep_stepup_pct", 0.0) or 0.0)
+    dscr_df["lockup_in_force"] = dscr_df["lockup_triggered"].rolling(lockup_grace + 1, min_periods=1).max().astype(bool)
+    dscr_df["default_in_force"] = dscr_df["default_triggered"].rolling(default_grace + 1, min_periods=1).max().astype(bool)
+    dscr_df["waiver_granted"] = np.where(dscr_df["default_in_force"], waiver_prob >= 0.5, False)
+    dscr_df["technical_default"] = dscr_df["default_in_force"] & ~dscr_df["waiver_granted"]
 
     reserve_cfg = cfg.get("reserve_accounts")
     reserve_row = reserve_cfg.iloc[0] if isinstance(reserve_cfg, pd.DataFrame) and not reserve_cfg.empty else {}
@@ -3266,15 +3513,17 @@ def evaluate_credit_and_waterfall(
     sweep_trigger_series = sweep_trigger * global_factor
     rolling_ds = debt_monthly["debt_service"].rolling(12, min_periods=1).mean()
     dsra_target = rolling_ds * dsra_months_series.values
-    sweep_amount = np.where(dscr_df["DSCR"].fillna(0.0) >= sweep_trigger_series.values, np.maximum(cfads.values - debt_monthly["debt_service"].values, 0.0) * sweep_pct, 0.0)
+    base_sweep = np.where(dscr_df["DSCR"].fillna(0.0) >= sweep_trigger_series.values, np.maximum(cfads.values - debt_monthly["debt_service"].values, 0.0) * sweep_pct, 0.0)
+    sweep_amount = np.where(dscr_df["lockup_in_force"], base_sweep * (1.0 + max(0.0, sweep_stepup)), base_sweep)
     mmra_balance = np.cumsum(mmra_monthly_series.values)
     dsra_funding = np.maximum(dsra_target.values - np.concatenate([[0.0], dsra_target.values[:-1]]), 0.0)
     restricted_cash = np.maximum(dsra_target.values + mmra_balance, restricted_cash_min_series.values)
     wc_draw = np.minimum(np.maximum(-project_cf.values, 0.0), wc_limit_series.values)
     wc_interest = wc_draw * wc_rate_series.values / 12.0
-    distributable = np.maximum(cfads.values - debt_monthly["debt_service"].values - dsra_funding - mmra_monthly_series.values - sweep_amount - wc_interest, 0.0)
-    distributable = np.where(dscr_df["lockup_triggered"], 0.0, distributable)
-    cash_waterfall = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "dsra_target": dsra_target.values, "dsra_funding": dsra_funding, "mmra_contribution": mmra_monthly_series.values, "cash_sweep": sweep_amount, "wc_facility_draw": wc_draw, "wc_facility_interest": wc_interest, "restricted_cash": restricted_cash, "distributable_cash": distributable})
+    waiver_fee = np.where(dscr_df["waiver_granted"], debt_monthly["balance"].values * waiver_fee_pct / 12.0, 0.0)
+    distributable = np.maximum(cfads.values - debt_monthly["debt_service"].values - dsra_funding - mmra_monthly_series.values - sweep_amount - wc_interest - waiver_fee, 0.0)
+    distributable = np.where(dscr_df["lockup_in_force"] | dscr_df["technical_default"], 0.0, distributable)
+    cash_waterfall = pd.DataFrame({"date": monthly_index, "CFADS": cfads.values, "debt_service": debt_monthly["debt_service"].values, "dsra_target": dsra_target.values, "dsra_funding": dsra_funding, "mmra_contribution": mmra_monthly_series.values, "cash_sweep": sweep_amount, "waiver_fee": waiver_fee, "wc_facility_draw": wc_draw, "wc_facility_interest": wc_interest, "restricted_cash": restricted_cash, "distributable_cash": distributable})
 
     completion_table = cfg.get("completion_tests")
     completion_rows: List[Dict[str, object]] = []
@@ -3293,6 +3542,86 @@ def evaluate_credit_and_waterfall(
             completion_rows.append({"metric": metric_name, "threshold": threshold_value, "measured": measure, "passed": bool(pd.notna(measure) and measure >= threshold_value), "test_date": row.get("test_date")})
     completion_df = pd.DataFrame(completion_rows)
     return {"credit_metrics_yearly": credit_metrics, "covenant_monitor": dscr_df, "cash_waterfall": cash_waterfall, "completion_tests": completion_df}
+
+
+def compute_benchmark_distances(results: Mapping[str, object], cfg: Mapping[str, object]) -> pd.DataFrame:
+    """Compute normalized distance-to-benchmark metrics for key lender KPIs."""
+
+    bench = cfg.get("benchmark_library")
+    if not isinstance(bench, pd.DataFrame) or bench.empty:
+        return pd.DataFrame()
+    metrics = results.get("metrics", {}) if isinstance(results, Mapping) else {}
+    capex_df = results.get("capex", pd.DataFrame()) if isinstance(results, Mapping) else pd.DataFrame()
+    production_df = results.get("production_monthly", pd.DataFrame()) if isinstance(results, Mapping) else pd.DataFrame()
+    total_capex = float(pd.to_numeric(capex_df.get("amount"), errors="coerce").fillna(0.0).sum()) if isinstance(capex_df, pd.DataFrame) and "amount" in capex_df.columns else np.nan
+    total_ethanol = float(pd.to_numeric(production_df.loc[production_df.get("product", "").astype(str).str.lower() == "ethanol", "volume"], errors="coerce").fillna(0.0).sum()) if isinstance(production_df, pd.DataFrame) and {"product", "volume"}.issubset(production_df.columns) else np.nan
+    capex_per_litre = total_capex / total_ethanol if np.isfinite(total_capex) and total_ethanol > 0 else np.nan
+    dscr_min = float(metrics.get("DSCR_min", np.nan)) if isinstance(metrics, Mapping) else np.nan
+    irr = float(metrics.get("Project_IRR", np.nan)) if isinstance(metrics, Mapping) else np.nan
+
+    actual_map = {"capex_per_litre": capex_per_litre, "dscr_min_threshold": dscr_min, "irr_threshold": irr}
+    rows: List[Dict[str, object]] = []
+    for _, row in bench.iterrows():
+        metric = str(row.get("metric", "")).strip().lower()
+        benchmark_val = float(row.get("value", np.nan))
+        actual = actual_map.get(metric, np.nan)
+        if not np.isfinite(actual) or not np.isfinite(benchmark_val) or abs(benchmark_val) < 1e-9:
+            distance = np.nan
+        else:
+            distance = (actual - benchmark_val) / abs(benchmark_val)
+        rows.append(
+            {
+                "metric": metric,
+                "region": row.get("region", "GLOBAL"),
+                "year": row.get("year", np.nan),
+                "risk_tier": row.get("risk_tier", ""),
+                "benchmark_value": benchmark_val,
+                "actual_value": actual,
+                "distance_to_benchmark": distance,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_governance_checks(results: Mapping[str, object], timeline: Timeline) -> Dict[str, pd.DataFrame]:
+    """Run plausibility, accounting identity, and provenance diagnostics."""
+
+    issues: List[Dict[str, object]] = []
+    statements = results.get("statements_monthly", {}) if isinstance(results, Mapping) else {}
+    cashflow = statements.get("cashflow", pd.DataFrame()) if isinstance(statements, Mapping) else pd.DataFrame()
+    bs = statements.get("balancesheet", pd.DataFrame()) if isinstance(statements, Mapping) else pd.DataFrame()
+    metrics = results.get("metrics", {}) if isinstance(results, Mapping) else {}
+    if isinstance(bs, pd.DataFrame) and not bs.empty and {"TotalAssets", "TotalLiabilities", "Equity"}.issubset(bs.columns):
+        delta = (pd.to_numeric(bs["TotalAssets"], errors="coerce") - (pd.to_numeric(bs["TotalLiabilities"], errors="coerce") + pd.to_numeric(bs["Equity"], errors="coerce"))).abs()
+        max_delta = float(delta.max())
+        if max_delta > 1e-4:
+            issues.append({"check": "balance_sheet_balance", "status": "fail", "detail": f"max delta {max_delta:.6f}"})
+    if isinstance(cashflow, pd.DataFrame) and not cashflow.empty and {"CFO", "CFI", "CFF", "NetCashFlow"}.issubset(cashflow.columns):
+        ident = (pd.to_numeric(cashflow["CFO"], errors="coerce") + pd.to_numeric(cashflow["CFI"], errors="coerce") + pd.to_numeric(cashflow["CFF"], errors="coerce") - pd.to_numeric(cashflow["NetCashFlow"], errors="coerce")).abs()
+        max_ident = float(ident.max())
+        if max_ident > 1e-4:
+            issues.append({"check": "cashflow_identity", "status": "fail", "detail": f"max delta {max_ident:.6f}"})
+    dscr_min = float(metrics.get("DSCR_min", np.nan)) if isinstance(metrics, Mapping) else np.nan
+    irr = float(metrics.get("Project_IRR", np.nan)) if isinstance(metrics, Mapping) else np.nan
+    if np.isfinite(dscr_min) and (dscr_min < 0 or dscr_min > 5):
+        issues.append({"check": "dscr_bounds", "status": "warn", "detail": f"DSCR_min out of range: {dscr_min:.3f}"})
+    if np.isfinite(irr) and (irr < -1 or irr > 1):
+        issues.append({"check": "irr_bounds", "status": "warn", "detail": f"Project_IRR out of range: {irr:.3f}"})
+    wc = results.get("working_capital", pd.DataFrame()) if isinstance(results, Mapping) else pd.DataFrame()
+    if isinstance(wc, pd.DataFrame) and not wc.empty and "Inventory" in wc.columns and (pd.to_numeric(wc["Inventory"], errors="coerce") < -1e-9).any():
+        issues.append({"check": "negative_inventory_guard", "status": "fail", "detail": "Negative inventory detected"})
+    checks = pd.DataFrame(issues) if issues else pd.DataFrame([{"check": "all", "status": "pass", "detail": "No issues detected"}])
+    provenance = pd.DataFrame(
+        [
+            {
+                "run_timestamp_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "scenario_name": str(results.get("scenario_name", "base")),
+                "timeline_start": timeline.monthly_index()[0].isoformat() if len(timeline.monthly_index()) else "",
+                "timeline_end": timeline.monthly_index()[-1].isoformat() if len(timeline.monthly_index()) else "",
+            }
+        ]
+    )
+    return {"governance_checks": checks, "scenario_provenance": provenance}
 ###############################################################################
 # Section 13: Dashboard and charts
 ###############################################################################
@@ -5129,6 +5458,10 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
     capex_info = build_capex_depr_monthly(cfg, timeline)
     capex_adjusted, construction_report = apply_construction_risk(cfg, timeline, capex_info["capex"])
     capex_info["capex"] = capex_adjusted
+    construction_mc = run_construction_risk_mc(cfg, timeline, capex_info["capex"])
+    capex_info["capex"] = construction_mc.get("capex", capex_info["capex"])
+    construction_mc_report = construction_mc.get("mc_report", pd.DataFrame())
+    reserve_effects = construction_mc.get("reserve_effects", pd.DataFrame())
     debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"])
 
     cost_df = cfg.get("direct_costs_monthly") if "direct_costs_monthly" in cfg else pd.DataFrame({"date": timeline.monthly_index(), "amount": 0.0})
@@ -5143,9 +5476,26 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         cost_df = cost_df.copy()
         cost_df["date"] = pd.to_datetime(cost_df["date"], errors="coerce")
     cost_df = _derive_direct_costs(cost_df)
+    sustain_adj = apply_sustainability_to_cashflows(cfg, revenue_df, capex_info["capex"], cost_df)
+    revenue_df = sustain_adj.get("revenue", revenue_df)
+    capex_info["capex"] = sustain_adj.get("capex", capex_info["capex"])
+    if isinstance(sustain_adj.get("direct_costs"), pd.DataFrame) and not sustain_adj["direct_costs"].empty:
+        cost_df = sustain_adj["direct_costs"]
+    sustainability_report = sustain_adj.get("report", pd.DataFrame())
+    hedge_adj = apply_hedging_to_revenue(cfg, revenue_df)
+    revenue_df = hedge_adj.get("revenue", revenue_df)
+    hedging_report = hedge_adj.get("hedging_report", pd.DataFrame())
     wc_df = working_capital_block(revenue_df, cost_df, cfg, timeline)
 
     statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+    cfads_bridge = build_cfads_bridge(statements, timeline, debt_schedule=debt_schedule, reserve_effects=reserve_effects, cfg=cfg)
+    debt_sizing = optimize_debt_sizing_structure(cfg, timeline, capex_info["capex"], statements, reserve_effects=reserve_effects)
+    if bool(debt_sizing.get("enabled", False)):
+        sized_schedule = debt_sizing.get("debt_schedule")
+        if isinstance(sized_schedule, pd.DataFrame) and not sized_schedule.empty:
+            debt_schedule = sized_schedule
+            statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+            cfads_bridge = build_cfads_bridge(statements, timeline, debt_schedule=debt_schedule, reserve_effects=reserve_effects, cfg=cfg)
     tranches_df = cfg.get("debt_tranches")
     has_sculpted = isinstance(tranches_df, pd.DataFrame) and (
         ("sculpting_enabled" in tranches_df.columns and tranches_df["sculpting_enabled"].fillna(False).astype(bool).any())
@@ -5162,9 +5512,10 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
                 cfads_series = cfads_source.set_index("date")["CFO"]
         debt_schedule = build_debt_schedule(cfg, timeline, capex_info["capex"], cfads_series=cfads_series)
         statements = statements_monthly(cfg, timeline, revenue_df, production_monthly, capex_info, debt_schedule, wc_df)
+        cfads_bridge = build_cfads_bridge(statements, timeline, debt_schedule=debt_schedule, reserve_effects=reserve_effects, cfg=cfg)
     staff_detail = statements.get("staff_costs_detail", pd.DataFrame())
-    valuation = project_cashflows(statements, cfg, timeline)
-    credit_outputs = evaluate_credit_and_waterfall(cfg, timeline, statements, debt_schedule, case_name="base")
+    valuation = project_cashflows(statements, cfg, timeline, debt_schedule=debt_schedule, cfads_bridge=cfads_bridge)
+    credit_outputs = evaluate_credit_and_waterfall(cfg, timeline, statements, debt_schedule, cfads_bridge=cfads_bridge, case_name="base")
     be_inputs_cfg = cfg.get("break_even_inputs") if isinstance(cfg.get("break_even_inputs"), pd.DataFrame) else None
     be = break_even_analysis(
         statements,
@@ -5210,10 +5561,15 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         ),
         "risk_profile": cfg.get("risk_profile", {}),
         "construction_report": construction_report,
+        "construction_risk_mc_report": construction_mc_report,
         "credit_metrics_yearly": credit_outputs.get("credit_metrics_yearly", pd.DataFrame()),
         "covenant_monitor": credit_outputs.get("covenant_monitor", pd.DataFrame()),
         "cash_waterfall": credit_outputs.get("cash_waterfall", pd.DataFrame()),
         "completion_tests_result": credit_outputs.get("completion_tests", pd.DataFrame()),
+        "cfads_bridge": cfads_bridge,
+        "debt_sizing_summary": debt_sizing.get("summary", pd.DataFrame()) if isinstance(debt_sizing, Mapping) else pd.DataFrame(),
+        "hedging_report": hedging_report,
+        "sustainability_report": sustainability_report,
         "tornado_drivers": cfg.get("tornado_drivers").copy()
         if isinstance(cfg.get("tornado_drivers"), pd.DataFrame)
         else cfg.get("tornado_drivers"),
@@ -5232,6 +5588,9 @@ def run_full_model(cfg: Mapping[str, object], export_dir: Optional[Path] = None)
         "yearly_increments": cfg.get("yearly_increments").copy() if isinstance(cfg.get("yearly_increments"), pd.DataFrame) else cfg.get("yearly_increments"),
         "increment_factors": cfg.get("_increment_factors").copy() if isinstance(cfg.get("_increment_factors"), pd.DataFrame) else cfg.get("_increment_factors"),
     }
+    results["benchmark_distance"] = compute_benchmark_distances(results, cfg)
+    governance = run_governance_checks(results, timeline)
+    results.update(governance)
     if not bool(cfg.get("_disable_lender_case_eval", False)):
         lender_case_rows = cfg.get("lender_cases")
         case_outputs: List[Dict[str, object]] = []
