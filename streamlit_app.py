@@ -2399,6 +2399,87 @@ def _generate_excel_bytes(
         return None
     chart_builders[_to_sheet_name("Production_Pricing_Plots")] = _prod_price_fig
 
+    if isinstance(dashboard, Mapping):
+        dashboard_sheet_map: OrderedDict[str, str] = OrderedDict(
+            [
+                ("Dashboard_Annual_Production", "annual_production"),
+                ("Dashboard_Annual_Cashflow", "annual_cashflow"),
+                ("Dashboard_DSCR_Trend", "dscr_trend"),
+                ("Dashboard_Debt_Service", "debt_service_summary"),
+                ("Dashboard_Working_Capital", "working_capital_trend"),
+                ("Dashboard_Cost_Structure", "cost_structure_annual"),
+                ("Dashboard_Labour_Summary", "labour_summary"),
+                ("Dashboard_Break_Even", "break_even_per_product"),
+                ("Dashboard_Cumulative_CF", "cumulative_cashflows"),
+                ("Dashboard_Revenue_vs_Prod", "revenue_vs_production"),
+            ]
+        )
+        for sheet_name, dashboard_key in dashboard_sheet_map.items():
+            df = dashboard.get(dashboard_key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sheets[sheet_name] = df
+
+        annual_production_df = dashboard.get("annual_production")
+        if isinstance(annual_production_df, pd.DataFrame) and not annual_production_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Annual_Production_Plots")] = lambda: _make_bar_figure(
+                annual_production_df, "year", [c for c in annual_production_df.columns if c != "year"], "Annual production by product", "Volume"
+            )
+
+        annual_cashflow_df = dashboard.get("annual_cashflow")
+        if isinstance(annual_cashflow_df, pd.DataFrame) and not annual_cashflow_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Annual_Cashflow_Plots")] = lambda: _make_bar_figure(
+                annual_cashflow_df, "year", [c for c in ("NetCashFlow", "CFO") if c in annual_cashflow_df.columns], "Annual cash flow", "Amount"
+            )
+
+        dscr_df = dashboard.get("dscr_trend")
+        if isinstance(dscr_df, pd.DataFrame) and not dscr_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_DSCR_Trend_Plots")] = lambda: _make_line_figure(
+                dscr_df, "date", [c for c in ("DSCR", "CFADS", "debt_service") if c in dscr_df.columns], "DSCR and debt service trend", "Value"
+            )
+
+        debt_service_df = dashboard.get("debt_service_summary")
+        if isinstance(debt_service_df, pd.DataFrame) and not debt_service_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Debt_Service_Plots")] = lambda: _make_bar_figure(
+                debt_service_df, "year", [c for c in ("interest", "principal", "draw") if c in debt_service_df.columns], "Debt service summary", "Amount"
+            )
+
+        wc_df = dashboard.get("working_capital_trend")
+        if isinstance(wc_df, pd.DataFrame) and not wc_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Working_Capital_Plots")] = lambda: _make_line_figure(
+                wc_df, "date", [c for c in ("accounts_receivable", "inventory", "accounts_payable") if c in wc_df.columns], "Working capital components", "Amount"
+            )
+
+        cost_df = dashboard.get("cost_structure_annual")
+        if isinstance(cost_df, pd.DataFrame) and not cost_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Cost_Structure_Plots")] = lambda: _make_bar_figure(
+                cost_df, "year", [c for c in cost_df.columns if c != "year"], "Annual cost structure", "Amount"
+            )
+
+        labour_df = dashboard.get("labour_summary")
+        if isinstance(labour_df, pd.DataFrame) and not labour_df.empty and {"date", "dept", "total_cost"}.issubset(labour_df.columns):
+            def _labour_fig() -> Optional["plt.Figure"]:
+                labour_plot = labour_df.groupby(["date", "dept"])["total_cost"].sum().unstack(fill_value=0.0).reset_index()
+                return _make_line_figure(labour_plot, "date", [c for c in labour_plot.columns if c != "date"], "Labour cost by department", "Amount")
+            chart_builders[_to_sheet_name("Dashboard_Labour_Plots")] = _labour_fig
+
+        break_even_df = dashboard.get("break_even_per_product")
+        if isinstance(break_even_df, pd.DataFrame) and not break_even_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Break_Even_Plots")] = lambda: _make_bar_figure(
+                break_even_df, "product", [c for c in ("actual_volume", "break_even_units") if c in break_even_df.columns], "Actual vs break-even volume", "Units"
+            )
+
+        cumulative_cf_df = dashboard.get("cumulative_cashflows")
+        if isinstance(cumulative_cf_df, pd.DataFrame) and not cumulative_cf_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Cumulative_CF_Plots")] = lambda: _make_line_figure(
+                cumulative_cf_df, "date", [c for c in ("project_cumulative", "equity_cumulative") if c in cumulative_cf_df.columns], "Cumulative cash flows", "Amount"
+            )
+
+        rev_prod_df = dashboard.get("revenue_vs_production")
+        if isinstance(rev_prod_df, pd.DataFrame) and not rev_prod_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Revenue_vs_Prod_Plots")] = lambda: _make_line_figure(
+                rev_prod_df, "volume", [c for c in ("revenue", "average_price") if c in rev_prod_df.columns], "Revenue vs production", "Value"
+            )
+
     # Sensitivity page content
     sens_df = results.get("sensitivities") if isinstance(results, Mapping) else None
     if not isinstance(sens_df, pd.DataFrame) or sens_df.empty:
