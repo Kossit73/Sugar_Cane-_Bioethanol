@@ -2639,11 +2639,13 @@ def run_construction_risk_mc(
     if "date" in capex_adj.columns:
         capex_adj["date"] = pd.to_datetime(capex_adj["date"], errors="coerce") + pd.DateOffset(months=expected_delay)
         capex_adj = capex_adj.dropna(subset=["date"]).groupby("date", as_index=False).sum(numeric_only=True)
+    else:
+        capex_adj["date"] = timeline.monthly_index()[: len(capex_adj)] if len(capex_adj) else pd.NaT
     if "amount" not in capex_adj.columns:
         capex_adj["amount"] = 0.0
-    if idc_capitalize and net_delay_cost > 0:
+    if idc_capitalize and net_delay_cost > 0 and not capex_adj.empty:
         capex_adj.loc[capex_adj.index.max(), "amount"] = capex_adj.loc[capex_adj.index.max(), "amount"] + net_delay_cost
-    capex_adj = capex_adj.sort_values("date").reset_index(drop=True)
+    capex_adj = capex_adj.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     capex_adj["cumulative_capex"] = pd.to_numeric(capex_adj["amount"], errors="coerce").fillna(0.0).cumsum()
 
     monthly_index = timeline.monthly_index()
@@ -3304,7 +3306,10 @@ def optimize_debt_sizing_structure(
             "debt_schedule": resized_schedule,
             "cfads_bridge": trial_bridge,
         }
-        avg_dscr = float(np.nanmean(np.where(resized_schedule.groupby("date")["debt_service"].sum().reindex(timeline.monthly_index(), fill_value=0.0).values > 1e-9, trial_bridge["CFADS"].values / np.maximum(resized_schedule.groupby("date")["debt_service"].sum().reindex(timeline.monthly_index(), fill_value=0.0).values, 1e-9), np.nan)))
+        if not isinstance(resized_schedule, pd.DataFrame) or resized_schedule.empty or "date" not in resized_schedule.columns:
+            break
+        debt_service_series = resized_schedule.groupby("date")["debt_service"].sum().reindex(timeline.monthly_index(), fill_value=0.0)
+        avg_dscr = float(np.nanmean(np.where(debt_service_series.values > 1e-9, trial_bridge["CFADS"].values / np.maximum(debt_service_series.values, 1e-9), np.nan)))
         min_target = float(debt_cfg.iloc[0].get("min_dscr", 1.25) or 1.25)
         if np.isnan(avg_dscr):
             break
@@ -3428,7 +3433,10 @@ def evaluate_credit_and_waterfall(
     if cashflow.empty:
         empty = pd.DataFrame()
         return {"credit_metrics_yearly": empty, "covenant_monitor": empty, "cash_waterfall": empty, "completion_tests": empty}
-    debt_monthly = debt_schedule.groupby("date")[["debt_service", "balance"]].sum().reindex(monthly_index, fill_value=0.0)
+    if not isinstance(debt_schedule, pd.DataFrame) or debt_schedule.empty or "date" not in debt_schedule.columns:
+        debt_monthly = pd.DataFrame(index=monthly_index, data={"debt_service": 0.0, "balance": 0.0})
+    else:
+        debt_monthly = debt_schedule.groupby("date")[["debt_service", "balance"]].sum().reindex(monthly_index, fill_value=0.0)
     if "CFO" not in cashflow.columns:
         cashflow["CFO"] = 0.0
     if "NetCashFlow" not in cashflow.columns:
