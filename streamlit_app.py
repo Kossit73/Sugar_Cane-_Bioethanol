@@ -15,6 +15,7 @@ import json
 import importlib
 import math
 import re
+import zipfile
 import sys
 import concurrent.futures
 import ast
@@ -3339,6 +3340,91 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
         st.warning(f"Unable to align {message}")
 
 
+def _horizon_sync_preview_diff(
+    tables: "InputTables",
+    current_cfg: Mapping[str, object],
+    proposed_horizon: Mapping[str, int],
+) -> pd.DataFrame:
+    """Return row-count/date-span impacts for horizon synchronization."""
+
+    preview_cfg = copy.deepcopy(dict(current_cfg))
+    preview_cfg["projection_horizon"] = {
+        "start_year": int(proposed_horizon["start_year"]),
+        "end_year": int(proposed_horizon["end_year"]),
+        "start_month": int(proposed_horizon["start_month"]),
+        "frequency": preview_cfg.get("projection_horizon", {}).get("frequency", "M"),
+    }
+    preview_cfg["production_horizon"] = {
+        "start_year": int(proposed_horizon["start_year"]),
+        "end_year": int(proposed_horizon["end_year"]),
+    }
+    preview_cfg = align_with_projection_horizon(preview_cfg)
+
+    def _span(df: pd.DataFrame) -> str:
+        if not isinstance(df, pd.DataFrame) or df.empty or "date" not in df.columns:
+            return "-"
+        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+        if dates.empty:
+            return "-"
+        return f"{dates.min().date()} → {dates.max().date()}"
+
+    rows: List[Dict[str, object]] = []
+    for table_name in HORIZON_SYNC_TABLES:
+        before_df = tables.ensure_table(table_name).copy()
+        after_df = preview_cfg.get(table_name) if isinstance(preview_cfg.get(table_name), pd.DataFrame) else pd.DataFrame()
+        before_rows = len(before_df.index) if isinstance(before_df, pd.DataFrame) else 0
+        after_rows = len(after_df.index) if isinstance(after_df, pd.DataFrame) else 0
+        rows.append(
+            {
+                "table": table_name,
+                "rows_before": int(before_rows),
+                "rows_after": int(after_rows),
+                "delta_rows": int(after_rows - before_rows),
+                "date_span_before": _span(before_df),
+                "date_span_after": _span(after_df),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _build_run_pack_bundle(
+    base_cfg: Mapping[str, object],
+    base_results: Mapping[str, object],
+    scenario_overrides: Mapping[str, Dict[str, object]],
+) -> bytes:
+    """Generate a zip bundle with model outputs, scenario metrics, lender cases, and Excel workbooks."""
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        metrics = base_results.get("metrics", {}) if isinstance(base_results, Mapping) else {}
+        if isinstance(metrics, Mapping) and metrics:
+            zf.writestr("base_metrics.csv", pd.DataFrame([metrics]).to_csv(index=False))
+
+        lender_cases = base_results.get("lender_case_results") if isinstance(base_results, Mapping) else None
+        if isinstance(lender_cases, pd.DataFrame) and not lender_cases.empty:
+            zf.writestr("lender_case_results.csv", lender_cases.to_csv(index=False))
+
+        if scenario_overrides:
+            scenario_df = run_scenarios(base_cfg, lambda c: run_full_model(c), scenario_overrides)
+            if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty:
+                zf.writestr("scenario_comparison.csv", scenario_df.to_csv(index=False))
+
+        scenario_names = [BASE_SCENARIO_LABEL, *list(scenario_overrides.keys())]
+        for scenario_name in scenario_names:
+            cfg_payload, results_payload = _ensure_scenario_payload(
+                scenario_name,
+                dict(base_cfg),
+                base_results,
+                scenario_overrides,
+            )
+            excel_bytes = _generate_excel_bytes(cfg_payload, results_payload, scenario_name)
+            safe_name = normalize_key(scenario_name) or "base"
+            zf.writestr(f"excel/Sugarcane_Financial_Model_{safe_name}.xlsx", excel_bytes)
+
+    buffer.seek(0)
+    return buffer.read()
+
+
 def _apply_master_assumptions_automation(tables: InputTables, cfg: Dict[str, object]) -> None:
     """Auto-populate key operating tables from master production assumptions."""
 
@@ -4215,26 +4301,37 @@ def main() -> None:
                 max_value=12,
                 value=int(horizon.get("start_month", 1)),
             )
-            horizon.update(
-                {
-                    "start_year": int(start_year),
-                    "end_year": int(end_year),
-                    "start_month": int(start_month),
-                }
+            proposed_horizon = {
+                "start_year": int(start_year),
+                "end_year": int(end_year),
+                "start_month": int(start_month),
+            }
+            changed = any(
+                int(horizon.get(key, proposed_horizon[key])) != int(proposed_horizon[key])
+                for key in ("start_year", "end_year", "start_month")
             )
-            production_horizon.update({"start_year": int(start_year), "end_year": int(end_year)})
-            cfg["production_horizon"] = production_horizon
             st.caption("Production horizon is automatically aligned to the projection horizon.")
-            try:
-                tables.set_table("projection_horizon", pd.DataFrame([horizon]))
-                _update_editor_state("projection_horizon", tables)
-                tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
-                _update_editor_state("production_horizon", tables)
-            except Exception as exc:
-                st.warning(f"Projection inputs not saved due to validation error: {exc}")
+            if changed:
+                with st.expander("Horizon sync preview", expanded=True):
+                    preview_df = _horizon_sync_preview_diff(tables, cfg, proposed_horizon)
+                    _render_dataframe(preview_df, "Horizon synchronization impacts", key="horizon_sync_preview")
+                if st.button("Apply horizon changes", key="apply_horizon_changes"):
+                    horizon.update(proposed_horizon)
+                    production_horizon.update({"start_year": int(start_year), "end_year": int(end_year)})
+                    cfg["production_horizon"] = production_horizon
+                    try:
+                        tables.set_table("projection_horizon", pd.DataFrame([horizon]))
+                        _update_editor_state("projection_horizon", tables)
+                        tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
+                        _update_editor_state("production_horizon", tables)
+                    except Exception as exc:
+                        st.warning(f"Projection inputs not saved due to validation error: {exc}")
+                    else:
+                        cfg = align_with_projection_horizon(cfg)
+                        _sync_tables_to_horizon(tables, cfg)
+                        st.success("Horizon changes applied.")
             else:
-                cfg = align_with_projection_horizon(cfg)
-                _sync_tables_to_horizon(tables, cfg)
+                cfg["production_horizon"] = production_horizon
 
         global_inputs = cfg["global_inputs"]
         with control_tabs[1]:
@@ -4561,6 +4658,31 @@ def main() -> None:
                         excel_bytes = None
                 if not excel_bytes:
                     st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
+
+            st.markdown("#### One-click Run Pack")
+            pack_bytes = st.session_state.get("run_pack_bytes")
+            if st.button("Prepare Run Pack", key="prepare_run_pack"):
+                with st.spinner("Building run pack (base + scenarios + lender + excel bundle)..."):
+                    try:
+                        pack_bytes = _build_run_pack_bundle(cfg, results, scenario_overrides)
+                    except Exception as exc:
+                        st.error(f"Run pack generation failed: {exc}")
+                        pack_bytes = None
+                    else:
+                        st.session_state["run_pack_bytes"] = pack_bytes
+            if isinstance(pack_bytes, (bytes, bytearray)) and len(pack_bytes) > 0:
+                ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                st.download_button(
+                    "Download Run Pack (.zip)",
+                    data=pack_bytes,
+                    file_name=f"Sugarcane_RunPack_{ts}.zip",
+                    mime="application/zip",
+                    key="download_run_pack",
+                )
+                if st.button("Clear Run Pack", key="clear_run_pack"):
+                    st.session_state.pop("run_pack_bytes", None)
+            else:
+                st.caption("Includes base metrics, scenario comparison CSV, lender case CSV, and Excel files per scenario.")
 
         st.markdown("### Horizon overview")
         _render_horizon_timeline_chart(horizon)
