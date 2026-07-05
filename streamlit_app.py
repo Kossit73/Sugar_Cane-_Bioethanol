@@ -1546,6 +1546,117 @@ DEFAULT_EDIT_STATE_KEY = "default_edit_state"
 _FACTORY_DEFAULT_FRAMES_CACHE: Optional[Dict[str, pd.DataFrame]] = None
 
 
+def _inject_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --sugar-ink: #172033;
+            --sugar-muted: #5f6f85;
+            --sugar-brand: #15803d;
+            --sugar-gold: #b7791f;
+            --sugar-panel: rgba(255, 255, 255, 0.9);
+        }
+        .block-container {
+            padding-top: 1.35rem;
+            padding-bottom: 3rem;
+            max-width: 1450px;
+        }
+        .sugar-hero {
+            margin-bottom: 1rem;
+            padding: 1.6rem 1.75rem;
+            border-radius: 24px;
+            border: 1px solid rgba(21, 128, 61, 0.16);
+            background:
+                linear-gradient(135deg, rgba(240, 253, 244, 0.98), rgba(255, 255, 255, 0.94)),
+                radial-gradient(circle at top right, rgba(183, 121, 31, 0.12), transparent 32%);
+            box-shadow: 0 18px 42px rgba(15, 23, 42, 0.07);
+        }
+        .sugar-kicker {
+            margin: 0 0 0.4rem;
+            color: var(--sugar-brand);
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .sugar-title {
+            margin: 0;
+            color: var(--sugar-ink);
+            font-size: clamp(2rem, 2.7vw, 3rem);
+            font-weight: 800;
+            line-height: 1.05;
+        }
+        .sugar-copy {
+            max-width: 60rem;
+            margin: 0.65rem 0 0;
+            color: var(--sugar-muted);
+            font-size: 0.98rem;
+            line-height: 1.55;
+        }
+        .sugar-workflow {
+            border: 1px solid rgba(21, 128, 61, 0.12);
+            border-radius: 8px;
+            background: var(--sugar-panel);
+            color: var(--sugar-muted);
+            margin: 0 0 1rem;
+            padding: 0.85rem 1rem;
+        }
+        .sugar-workflow strong {
+            color: var(--sugar-ink);
+        }
+        div[data-baseweb="tab-list"] {
+            gap: 0.45rem;
+            margin-bottom: 0.9rem;
+        }
+        div[data-baseweb="tab-list"] button {
+            min-height: 2.8rem;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            background: rgba(255, 255, 255, 0.78);
+            color: var(--sugar-muted);
+            padding: 0.2rem 0.9rem;
+        }
+        div[data-baseweb="tab-list"] button[aria-selected="true"] {
+            background: linear-gradient(135deg, #15803d, #b7791f);
+            border-color: transparent;
+            color: #ffffff;
+            box-shadow: 0 10px 22px rgba(21, 128, 61, 0.15);
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 0.65rem 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_model_hero() -> None:
+    st.markdown(
+        """
+        <section class="sugar-hero">
+            <p class="sugar-kicker">Bioethanol project finance</p>
+            <h1 class="sugar-title">Sugar Cane Bioethanol</h1>
+            <p class="sugar-copy">
+                Model the full cane-to-product value stack across ethanol, sugar,
+                electricity, animal feed, financing, lender cases, sensitivities,
+                and scenario comparisons.
+            </p>
+        </section>
+        <div class="sugar-workflow">
+            <strong>Workflow</strong><br>
+            Use Model Controls for high-level drivers, refine canonical input tables,
+            then review statements, production economics, sensitivities, and AI-assisted checks.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     """Render a dataframe without exposing download controls."""
     st.subheader(title)
@@ -4161,64 +4272,13 @@ def _render_table_editor(
 def main() -> None:
     try:
         if _streamlit_runtime_exists():
-            st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
+            st.set_page_config(page_title="Sugarcane Bioethanol Finance Model", layout="wide")
     except (StreamlitAPIException, RuntimeError, Exception):  # pragma: no cover - defensive guard
         # Some Streamlit versions raise a generic Exception when page config is invoked
         # outside a live runtime; swallow and continue so local execution still works.
         pass
 
-    # Ensure the hero title has sufficient breathing room while keeping the layout
-    # nearly full-width on large monitors.
-    st.markdown(
-        """
-        <style>
-        html, body, .stApp {
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-            overflow-x: hidden !important;
-        }
-        [data-testid="stAppViewContainer"] {
-            margin: 0 !important;
-            padding: 3.5rem 0 2.5rem !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        [data-testid="stAppViewContainer"] > .main {
-            margin: 0 auto !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        [data-testid="stAppViewContainer"] .main .block-container,
-        .block-container {
-            margin: 0 auto !important;
-            width: 100% !important;
-            max-width: none !important;
-            padding-left: clamp(20px, 3vw, 48px) !important;
-            padding-right: clamp(20px, 3vw, 48px) !important;
-        }
-        [data-testid="stVerticalBlock"],
-        [data-testid="stHorizontalBlock"] {
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-            padding-left: 0 !important;
-            padding-right: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        h1, h1 span, .stMarkdown h1 {
-            font-size: clamp(2.2rem, 3vw, 2.8rem) !important;
-            line-height: 1.2 !important;
-            margin-top: 0 !important;
-            margin-bottom: 1.2rem !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    _inject_app_theme()
 
     if MATPLOTLIB_INSTALL_ERROR and plt is None:
         st.info(
@@ -4236,13 +4296,7 @@ def main() -> None:
         )
         st.stop()
 
-    st.title("Sugarcane Bioethanol Project Finance Model")
-    st.markdown(
-        "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
-        "electricity, and animal feed project finance model. Adjust critical drivers "
-        "in the control tabs above and review the resulting statements, dashboards, "
-        "sensitivities, and scenarios."
-    )
+    _render_model_hero()
 
     page_tabs_container = st.container()
     (
@@ -5858,6 +5912,54 @@ def main() -> None:
         _render_chatbot_tab(results)
 
     st.success("Model run complete.")
+
+
+def get_state() -> dict:
+    """Snapshot user-editable tables/defaults for NumQuants saved cases."""
+    import streamlit as _st
+
+    state: dict = {}
+    tables = _st.session_state.get("input_tables")
+    if MODEL_IMPORT_ERROR is None and tables is not None:
+        state["input_tables"] = {
+            name: tables.ensure_table(name).copy()
+            for name in INPUT_SCHEMAS.keys()
+        }
+    default_store = _st.session_state.get(DEFAULT_TABLE_STORE_KEY)
+    if isinstance(default_store, dict):
+        state[DEFAULT_TABLE_STORE_KEY] = {
+            name: table.copy() if hasattr(table, "copy") else table
+            for name, table in default_store.items()
+        }
+    for key in (
+        "excel_download_selected",
+        "ai_chat_history",
+        "ai_provider_settings",
+    ):
+        if key in _st.session_state:
+            state[key] = _st.session_state[key]
+    return state
+
+
+def set_state(state: dict) -> None:
+    """Restore saved table/default state before ``main()`` initialises widgets."""
+    import streamlit as _st
+
+    if MODEL_IMPORT_ERROR is None and "input_tables" in state:
+        tables = InputTables()
+        for name, table in state["input_tables"].items():
+            frame = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table)
+            tables.set_table(name, frame)
+        _st.session_state["input_tables"] = tables
+    if DEFAULT_TABLE_STORE_KEY in state and isinstance(state[DEFAULT_TABLE_STORE_KEY], dict):
+        _st.session_state[DEFAULT_TABLE_STORE_KEY] = state[DEFAULT_TABLE_STORE_KEY]
+    for key in (
+        "excel_download_selected",
+        "ai_chat_history",
+        "ai_provider_settings",
+    ):
+        if key in state:
+            _st.session_state[key] = state[key]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation helper
