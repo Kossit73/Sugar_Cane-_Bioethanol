@@ -11,6 +11,7 @@ Run with:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import importlib
 import math
@@ -37,7 +38,7 @@ from pandas.testing import assert_frame_equal
 
 from dependencies import ensure_package, get_package_error
 
-MATPLOTLIB_INSTALL_ERROR: Optional[str]
+MATPLOTLIB_INSTALL_ERROR: Optional[str] = None
 if ensure_package("matplotlib"):
     try:  # pragma: no cover - optional dependency
         import matplotlib.dates as mdates
@@ -4269,6 +4270,56 @@ def _render_table_editor(
     st.divider()
 
 
+
+def _fingerprint_model_config(value: object) -> str:
+    """Return a stable digest for nested model config objects and dataframes."""
+
+    def normalise(item: object) -> object:
+        if isinstance(item, pd.DataFrame):
+            return {
+                "columns": [str(column) for column in item.columns],
+                "records": [
+                    {str(key): normalise(cell) for key, cell in row.items()}
+                    for row in item.to_dict("records")
+                ],
+            }
+        if isinstance(item, pd.Series):
+            return [normalise(cell) for cell in item.tolist()]
+        if isinstance(item, Mapping):
+            return {str(key): normalise(item[key]) for key in sorted(item, key=str)}
+        if isinstance(item, (list, tuple, set)):
+            return [normalise(cell) for cell in item]
+        if isinstance(item, (np.integer, np.floating, np.bool_)):
+            return item.item()
+        if isinstance(item, (datetime.date, datetime.datetime, pd.Timestamp)):
+            return item.isoformat()
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        return repr(item)
+
+    payload = json.dumps(normalise(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _activate_sugar_model_run(cfg: Mapping[str, object], fingerprint: str) -> tuple[dict, bool]:
+    cache = st.session_state.setdefault("sugar_model_result_cache", {})
+    bundle = cache.get(fingerprint)
+    cache_hit = isinstance(bundle, dict)
+    if not cache_hit:
+        run_cfg = copy.deepcopy(dict(cfg))
+        bundle = {
+            "fingerprint": fingerprint,
+            "config": run_cfg,
+            "results": run_full_model(run_cfg),
+        }
+        cache[fingerprint] = bundle
+    st.session_state["sugar_active_result"] = bundle
+    st.session_state["sugar_last_run_fingerprint"] = fingerprint
+    st.session_state["sugar_model_results_stale"] = False
+    st.session_state.pop("scenario_payload_cache", None)
+    st.session_state.pop("run_pack_bytes", None)
+    return bundle, cache_hit
+
 def main() -> None:
     try:
         if _streamlit_runtime_exists():
@@ -4298,49 +4349,50 @@ def main() -> None:
 
     _render_model_hero()
 
-    page_tabs_container = st.container()
-    (
-        model_controls_tab,
-        landing_tab,
-        summary_tab,
-        financial_tab,
-        production_tab,
-        sensitivity_tab,
-        chatbot_tab,
-    ) = page_tabs_container.tabs(
-        [
-            "Model Controls",
-            "Input & Assumptions",
-            "Summary",
-            "Financial Statements",
-            "Production & Pricing",
-            "Sensitivities",
-            "AI Chatbot",
-        ]
+    workspace_sections = [
+        "Model Controls",
+        "Input & Assumptions",
+        "Summary",
+        "Financial Statements",
+        "Production & Pricing",
+        "Sensitivities",
+        "AI Chatbot",
+    ]
+    active_section = st.radio(
+        "Workspace section",
+        workspace_sections,
+        horizontal=True,
+        key="sugar_active_workspace_section",
+        label_visibility="collapsed",
     )
+    run_controls = st.empty()
 
     tables = _get_tables()
     sync_errors = _sync_tables_from_state(tables)
     assumptions: Dict[str, object] = {}
     cfg = build_config(assumptions, tables)
-    st.session_state.pop("scenario_payload_cache", None)
 
     horizon = cfg["projection_horizon"]
     production_horizon = {"start_year": horizon["start_year"], "end_year": horizon["end_year"]}
 
-    with model_controls_tab:
+    if active_section == "Model Controls":
         st.subheader("Model Controls")
-        control_tabs = st.tabs(
-            [
-                "Projection",
-                "Financial",
-                "Production",
-                "Pricing",
-                "Risk & Scenarios",
-            ]
+        control_sections = [
+            "Projection",
+            "Financial",
+            "Production",
+            "Pricing",
+            "Risk & Scenarios",
+        ]
+        active_control_section = st.radio(
+            "Control section",
+            control_sections,
+            horizontal=True,
+            key="sugar_active_control_section",
+            label_visibility="collapsed",
         )
 
-        with control_tabs[0]:
+        if active_control_section == "Projection":
             st.markdown("### Projection horizon")
             start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
             end_year = st.number_input(
@@ -4388,7 +4440,7 @@ def main() -> None:
                 cfg["production_horizon"] = production_horizon
 
         global_inputs = cfg["global_inputs"]
-        with control_tabs[1]:
+        if active_control_section == "Financial":
             st.markdown("### Financial assumptions")
             discount_rate = st.number_input(
                 "Discount rate (WACC)",
@@ -4432,7 +4484,7 @@ def main() -> None:
                 st.warning(f"Global inputs not saved due to validation error: {exc}")
 
         production_cfg = cfg.setdefault("production", {})
-        with control_tabs[2]:
+        if active_control_section == "Production":
             st.markdown("### Production assumptions")
             feedstock = st.number_input(
                 "Annual feedstock (t)",
@@ -4487,7 +4539,7 @@ def main() -> None:
                     st.warning(f"Automation failed: {exc}")
 
         pricing_cfg = cfg.setdefault("prices", {})
-        with control_tabs[3]:
+        if active_control_section == "Pricing":
             st.markdown("### Product pricing")
             for product in PRODUCTS:
                 params = pricing_cfg.setdefault(product, {})
@@ -4543,7 +4595,7 @@ def main() -> None:
             else:
                 _update_editor_state("revenue_params", tables)
 
-        with control_tabs[4]:
+        if active_control_section == "Risk & Scenarios":
             st.markdown("### Risk and scenario options")
             risk_targets, risk_applies = _get_risk_select_options(tables)
             risk_column_config = {
@@ -4601,18 +4653,56 @@ def main() -> None:
             )
             _render_risk_schedule_preview(tables)
 
+    draft_fingerprint = _fingerprint_model_config(cfg)
+    active_bundle = st.session_state.get("sugar_active_result")
+    run_label = "Run Model" if not isinstance(active_bundle, dict) else "Recalculate"
+    with run_controls.container():
+        run_clicked = st.button(
+            run_label,
+            key="sugar_run_model",
+            type="primary",
+            use_container_width=True,
+        )
+    if run_clicked:
+        try:
+            with st.spinner("Running sugar cane bioethanol model..."):
+                active_bundle, cache_hit = _activate_sugar_model_run(cfg, draft_fingerprint)
+        except Exception as exc:  # pragma: no cover - runtime feedback for the UI
+            st.error(f"Model execution failed: {exc}")
+        else:
+            source = "cached results" if cache_hit else "a fresh calculation"
+            st.success(f"Model run activated from {source}.")
+
+    active_bundle = st.session_state.get("sugar_active_result")
+    active_fingerprint = (
+        str(active_bundle.get("fingerprint", ""))
+        if isinstance(active_bundle, dict)
+        else ""
+    )
+    results_stale = not isinstance(active_bundle, dict) or active_fingerprint != draft_fingerprint
+    st.session_state["sugar_model_results_stale"] = results_stale
+    if isinstance(active_bundle, dict) and results_stale:
+        st.warning(
+            "Draft inputs have changed. Outputs, analytics, and exports still use "
+            "the last completed run until you press Recalculate."
+        )
+    elif not isinstance(active_bundle, dict):
+        st.info("Draft inputs are ready. Press Run Model to generate results.")
+
+    if not isinstance(active_bundle, dict):
+        return
+
+    cfg = copy.deepcopy(active_bundle["config"])
+    results = active_bundle["results"]
+    analytics_cache = st.session_state.setdefault("sugar_analytics_cache", {}).setdefault(
+        active_fingerprint, {}
+    )
+    horizon = cfg["projection_horizon"]
     timeline = Timeline(
         int(horizon["start_year"]),
         int(horizon["end_year"]),
         int(horizon.get("start_month", 1)),
     )
-
-    with st.spinner("Running base model..."):
-        try:
-            results = run_full_model(cfg)
-        except Exception as exc:  # pragma: no cover - runtime feedback for the UI
-            st.error(f"Model execution failed: {exc}")
-            st.stop()
 
     metrics = results["metrics"]
     dashboard = results["dashboard"]
@@ -4631,7 +4721,7 @@ def main() -> None:
     scenario_options: List[str] = [BASE_SCENARIO_LABEL, *list(scenario_overrides.keys())]
 
 
-    with landing_tab:
+    if active_section == "Input & Assumptions":
         top_left, top_right = st.columns([3, 2])
         with top_left:
             st.subheader("Input & assumptions tables")
@@ -4656,24 +4746,14 @@ def main() -> None:
 
             download_container = st.container()
             excel_map: Dict[str, bytes] = st.session_state.setdefault("excel_bytes_map", {})
-            stale_keys = [key for key in excel_map if key not in scenario_options]
+            valid_export_keys = {f"{active_fingerprint}:{name}" for name in scenario_options}
+            stale_keys = [key for key in excel_map if key not in valid_export_keys]
             for key in stale_keys:
                 excel_map.pop(key, None)
             st.session_state.excel_bytes_map = excel_map
 
-            scenario_cfg_payload, scenario_results_payload = _ensure_scenario_payload(
-                selected_scenario,
-                cfg,
-                results,
-                scenario_overrides,
-            )
-            cfg_for_excel = copy.deepcopy(scenario_cfg_payload)
-            metadata = cfg_for_excel.setdefault("metadata", {}) if isinstance(cfg_for_excel, dict) else {}
-            if isinstance(metadata, dict):
-                metadata["scenario"] = selected_scenario
-            st.session_state.model_results = (cfg_for_excel, scenario_results_payload)
-
-            excel_bytes = excel_map.get(selected_scenario)
+            export_cache_key = f"{active_fingerprint}:{selected_scenario}"
+            excel_bytes = excel_map.get(export_cache_key)
 
             with download_container:
                 if not excel_bytes:
@@ -4683,16 +4763,34 @@ def main() -> None:
                     ):
                         with st.spinner("Preparing Excel workbook..."):
                             try:
+                                scenario_cfg_payload, scenario_results_payload = _ensure_scenario_payload(
+                                    selected_scenario,
+                                    cfg,
+                                    results,
+                                    scenario_overrides,
+                                )
+                                cfg_for_excel = copy.deepcopy(scenario_cfg_payload)
+                                metadata = (
+                                    cfg_for_excel.setdefault("metadata", {})
+                                    if isinstance(cfg_for_excel, dict)
+                                    else {}
+                                )
+                                if isinstance(metadata, dict):
+                                    metadata["scenario"] = selected_scenario
                                 excel_bytes = _generate_excel_bytes(
                                     cfg_for_excel,
                                     scenario_results_payload,
                                     selected_scenario,
                                 )
+                                st.session_state.model_results = (
+                                    cfg_for_excel,
+                                    scenario_results_payload,
+                                )
                             except RuntimeError as exc:
                                 st.error(str(exc))
                                 excel_bytes = None
                             else:
-                                excel_map[selected_scenario] = excel_bytes
+                                excel_map[export_cache_key] = excel_bytes
                                 st.session_state.excel_bytes_map = excel_map
                 if excel_bytes:
                     file_scenario = normalize_key(selected_scenario) or "base"
@@ -4707,7 +4805,7 @@ def main() -> None:
                         "Clear Prepared Excel",
                         key=f"clear_excel_{normalize_key(selected_scenario) or 'base'}",
                     ):
-                        excel_map.pop(selected_scenario, None)
+                        excel_map.pop(export_cache_key, None)
                         st.session_state.excel_bytes_map = excel_map
                         excel_bytes = None
                 if not excel_bytes:
@@ -4858,7 +4956,7 @@ def main() -> None:
                 helper=helper,
             )
 
-    with summary_tab:
+    if active_section == "Summary":
         st.subheader("Headline metrics")
         for idx in range(0, len(metric_items), 3):
             cols = st.columns(3)
@@ -4946,7 +5044,7 @@ def main() -> None:
         ("Statement of Cash Flows", "cashflow"),
         ("Statement of Financial Position", "balancesheet"),
     ]
-    with financial_tab:
+    if active_section == "Financial Statements":
         with st.expander("Where key operating/financing fields appear", expanded=False):
             mapping_df = pd.DataFrame(
                 [
@@ -5012,7 +5110,7 @@ def main() -> None:
                 note_df = results.get(key, pd.DataFrame())
                 _render_dataframe(note_df, title, key=f"ifrs_note_{key}")
 
-    with production_tab:
+    if active_section == "Production & Pricing":
         prod_monthly = results["production_monthly"].copy()
         prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
         _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
@@ -5391,21 +5489,26 @@ def main() -> None:
                 key="break_even_overall_table",
             )
 
-    with sensitivity_tab:
+    if active_section == "Sensitivities":
         st.subheader("Advanced sensitivity analytics")
-        sensitivity_sections = st.tabs(
-            [
-                "Metaheuristic optimiser",
-                "Neural forecasts",
-                "Statistical forecasts",
-                "Decision tree",
-                "Sensitivity tornado",
-                "Monte Carlo simulation",
-                "Scenario comparison",
-            ]
+        sensitivity_section_labels = [
+            "Metaheuristic optimiser",
+            "Neural forecasts",
+            "Statistical forecasts",
+            "Decision tree",
+            "Sensitivity tornado",
+            "Monte Carlo simulation",
+            "Scenario comparison",
+        ]
+        active_sensitivity_section = st.radio(
+            "Analytics section",
+            sensitivity_section_labels,
+            horizontal=True,
+            key="sugar_active_analytics_section",
+            label_visibility="collapsed",
         )
 
-        with sensitivity_sections[0]:
+        if active_sensitivity_section == "Metaheuristic optimiser":
             optimizer_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "variable": st.column_config.SelectboxColumn(
@@ -5476,7 +5579,7 @@ def main() -> None:
                             delta=_format_metric(best_row.get("delta_vs_base"), metric_kind),
                         )
 
-        with sensitivity_sections[1]:
+        if active_sensitivity_section == "Neural forecasts":
             neural_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "product": st.column_config.SelectboxColumn(
@@ -5534,7 +5637,7 @@ def main() -> None:
                             key=f"neural_{idx}",
                         )
 
-        with sensitivity_sections[2]:
+        if active_sensitivity_section == "Statistical forecasts":
             stat_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "series": st.column_config.SelectboxColumn(
@@ -5595,7 +5698,7 @@ def main() -> None:
                         f"Equipment failure risk proxy: {forecast_result.get('equipment_failure_risk', 0.0):.2%}"
                     )
 
-        with sensitivity_sections[3]:
+        if active_sensitivity_section == "Decision tree":
             decision_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "path_name": st.column_config.TextColumn("Path name"),
@@ -5653,7 +5756,7 @@ def main() -> None:
                         )
                         _render_decision_tree_chart(paths_df, selected_objective)
 
-        with sensitivity_sections[4]:
+        if active_sensitivity_section == "Sensitivity tornado":
             _render_table_editor(
                 tables,
                 "tornado_drivers",
@@ -5685,17 +5788,23 @@ def main() -> None:
                 if not drivers:
                     st.info("Enable at least one driver with a valid percentage change to run the tornado analysis.")
                 else:
-                    with st.spinner("Calculating sensitivity tornado..."):
-                        tornado_results = sensitivity_tornado(
-                            cfg,
-                            {"metrics": metrics},
-                            lambda c: run_full_model(c),
-                            drivers,
-                        )
-                    _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
-                    _render_tornado_chart(tornado_results)
+                    tornado_results = analytics_cache.get("tornado")
+                    if st.button("Run Sensitivity Tornado", key="run_sugar_tornado", type="primary"):
+                        with st.spinner("Calculating sensitivity tornado..."):
+                            tornado_results = sensitivity_tornado(
+                                cfg,
+                                {"metrics": metrics},
+                                lambda c: run_full_model(c),
+                                drivers,
+                            )
+                        analytics_cache["tornado"] = tornado_results
+                    if tornado_results is None:
+                        st.info("Press Run Sensitivity Tornado to generate this analysis.")
+                    else:
+                        _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
+                        _render_tornado_chart(tornado_results)
 
-        with sensitivity_sections[5]:
+        if active_sensitivity_section == "Monte Carlo simulation":
             distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
             variable_label_map = dict(MONTE_CARLO_VARIABLE_LABELS)
             variable_options = list(variable_label_map.values())
@@ -5857,21 +5966,27 @@ def main() -> None:
                     random_seed = int(float(active_row.get("random_seed", 42)))
                 except (TypeError, ValueError):
                     random_seed = 42
-                with st.spinner("Running Monte Carlo simulation..."):
-                    monte_results = monte_carlo(
-                        cfg,
-                        lambda c: run_full_model(c),
-                        iterations=iterations,
-                        random_seed=random_seed,
+                monte_results = analytics_cache.get("monte_carlo")
+                if st.button("Run Monte Carlo Simulation", key="run_sugar_monte_carlo", type="primary"):
+                    with st.spinner("Running Monte Carlo simulation..."):
+                        monte_results = monte_carlo(
+                            cfg,
+                            lambda c: run_full_model(c),
+                            iterations=iterations,
+                            random_seed=random_seed,
+                        )
+                    analytics_cache["monte_carlo"] = monte_results
+                if monte_results is None:
+                    st.info("Press Run Monte Carlo Simulation to generate samples.")
+                else:
+                    percentiles = (
+                        monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"})
                     )
-                percentiles = (
-                    monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"})
-                )
-                _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
-                _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
-                _render_monte_carlo_histograms(monte_results["samples"])
+                    _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
+                    _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+                    _render_monte_carlo_histograms(monte_results["samples"])
 
-        with sensitivity_sections[6]:
+        if active_sensitivity_section == "Scenario comparison":
             _render_table_editor(
                 tables,
                 "scenario_comparison",
@@ -5884,34 +5999,42 @@ def main() -> None:
             if not scenario_overrides_active:
                 st.info("Add scenario rows with overrides to compare against the base configuration.")
             else:
-                with st.spinner("Evaluating scenarios..."):
-                    scenario_df = run_scenarios(
-                        cfg,
-                        lambda c: run_full_model(c),
-                        scenario_overrides_active,
-                    )
-                base_metrics = pd.DataFrame([metrics]).assign(scenario=BASE_SCENARIO_LABEL)
-                scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-                _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
-                scenario_results_map: Dict[str, Mapping[str, object]] = {}
-                for scenario_name in scenario_df["scenario"].dropna().astype(str).unique():
-                    cfg_payload, res_payload = _ensure_scenario_payload(
-                        scenario_name,
-                        cfg,
-                        results,
-                        scenario_overrides_active,
-                    )
-                    scenario_results_map[scenario_name] = res_payload
-                _render_scenario_metric_chart(scenario_df)
-                if scenario_results_map:
-                    _render_scenario_cashflow_stack(scenario_results_map)
-                    _render_scenario_dscr_chart(scenario_results_map)
-                    _render_scenario_scatter_chart(scenario_results_map)
+                scenario_artifact = analytics_cache.get("scenario_comparison")
+                if st.button("Run Scenario Comparison", key="run_sugar_scenarios", type="primary"):
+                    with st.spinner("Evaluating scenarios..."):
+                        scenario_df = run_scenarios(
+                            cfg,
+                            lambda c: run_full_model(c),
+                            scenario_overrides_active,
+                        )
+                        base_metrics = pd.DataFrame([metrics]).assign(scenario=BASE_SCENARIO_LABEL)
+                        scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+                        scenario_results_map: Dict[str, Mapping[str, object]] = {}
+                        for scenario_name in scenario_df["scenario"].dropna().astype(str).unique():
+                            cfg_payload, res_payload = _ensure_scenario_payload(
+                                scenario_name,
+                                cfg,
+                                results,
+                                scenario_overrides_active,
+                            )
+                            scenario_results_map[scenario_name] = res_payload
+                        scenario_artifact = (scenario_df, scenario_results_map)
+                        analytics_cache["scenario_comparison"] = scenario_artifact
+                if scenario_artifact is None:
+                    st.info("Press Run Scenario Comparison to evaluate the configured cases.")
+                else:
+                    scenario_df, scenario_results_map = scenario_artifact
+                    _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+                    _render_scenario_metric_chart(scenario_df)
+                    if scenario_results_map:
+                        _render_scenario_cashflow_stack(scenario_results_map)
+                        _render_scenario_dscr_chart(scenario_results_map)
+                        _render_scenario_scatter_chart(scenario_results_map)
 
-    with chatbot_tab:
+    if active_section == "AI Chatbot":
         _render_chatbot_tab(results)
 
-    st.success("Model run complete.")
+    st.caption("Showing the last completed model run.")
 
 
 def get_state() -> dict:
