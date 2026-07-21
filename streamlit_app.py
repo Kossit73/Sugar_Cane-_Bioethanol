@@ -6085,6 +6085,14 @@ def set_state(state: dict) -> None:
             _st.session_state[key] = state[key]
 
 
+# The Cassava-style modular application is authoritative. The legacy engine
+# remains importable for saved-case compatibility while all interactive traffic
+# is delegated through this compact entry point.
+from cassava_streamlit_app import get_state as get_state  # noqa: E402,F401
+from cassava_streamlit_app import main as main  # noqa: E402,F401
+from cassava_streamlit_app import set_state as set_state  # noqa: E402,F401
+
+
 if __name__ == "__main__":  # pragma: no cover - manual invocation helper
     if _streamlit_runtime_exists():
         main()
