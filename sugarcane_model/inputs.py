@@ -181,6 +181,7 @@ class SugarcaneBioethanolInputs(BaseModel):
     costs: CostAssumptions = Field(default_factory=CostAssumptions)
     working_capital: WorkingCapitalAssumptions = Field(default_factory=WorkingCapitalAssumptions)
     financing: FinancingAssumptions = Field(default_factory=FinancingAssumptions)
+    yearly_schedules: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
     def grouped_sections(self) -> "OrderedDict[str, BaseModel]":
         return OrderedDict(

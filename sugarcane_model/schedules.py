@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from sugarcane_finance_math import npf
+from .driver_schedules import escalation_factor, parameter_series
 
 from .inputs import CapexItem, SugarcaneBioethanolInputs
 
@@ -75,8 +76,6 @@ def _annual_last(frame: pd.DataFrame) -> pd.DataFrame:
     return annual
 
 
-def _inflation(rate: float, month_index: np.ndarray) -> np.ndarray:
-    return np.power(1.0 + rate, month_index / 12.0)
 
 
 def _scenario_farm_share(inputs: SugarcaneBioethanolInputs, scenario: str) -> float:
@@ -123,19 +122,34 @@ def build_timeline(inputs: SugarcaneBioethanolInputs) -> pd.DatetimeIndex:
 
 def compute_cycle_plan(inputs: SugarcaneBioethanolInputs) -> ScheduleOutput:
     dates = build_timeline(inputs)
-    planning = inputs.cycle_planning
     planning_start = pd.Period(inputs.global_assumptions.planning_start, freq="M").to_timestamp()
-    active = dates >= planning_start
-    month_index = np.arange(len(dates))
-    operating_month = np.maximum(0, (dates.year - planning_start.year) * 12 + dates.month - planning_start.month)
-    cycle_month = operating_month % planning.crop_cycle_months + 1
+    active = np.asarray(dates >= planning_start)
+    operating_month = np.maximum(
+        0,
+        (dates.year - planning_start.year) * 12
+        + dates.month
+        - planning_start.month,
+    ).to_numpy(dtype=int)
+    crop_cycle = parameter_series(
+        inputs, "cycle_planning", "crop_cycle_months", dates, dtype=int
+    )
+    establishment = parameter_series(
+        inputs, "cycle_planning", "establishment_months", dates, dtype=int
+    )
+    harvest_window = parameter_series(
+        inputs, "cycle_planning", "harvest_window_months", dates, dtype=int
+    )
+    replant_share = parameter_series(
+        inputs, "cycle_planning", "replant_share_per_cycle", dates
+    )
+    cycle_month = operating_month % crop_cycle + 1
     phases = np.where(
         active,
         np.where(
-            cycle_month <= planning.establishment_months,
+            cycle_month <= establishment,
             "Establishment",
             np.where(
-                cycle_month > planning.crop_cycle_months - planning.harvest_window_months,
+                cycle_month > crop_cycle - harvest_window,
                 "Harvest",
                 "Growing",
             ),
@@ -143,23 +157,24 @@ def compute_cycle_plan(inputs: SugarcaneBioethanolInputs) -> ScheduleOutput:
         "Pre-operational",
     )
     operating_year = operating_month // 12
-    other = inputs.other_assumptions
+    ramp_year_1 = parameter_series(
+        inputs, "other_assumptions", "startup_ramp_year_1", dates
+    )
+    ramp_year_2 = parameter_series(
+        inputs, "other_assumptions", "startup_ramp_year_2", dates
+    )
     ramp = np.where(
         active,
-        np.where(
-            operating_year == 0,
-            other.startup_ramp_year_1,
-            np.where(operating_year == 1, other.startup_ramp_year_2, 1.0),
-        ),
+        np.where(operating_year == 0, ramp_year_1, np.where(operating_year == 1, ramp_year_2, 1.0)),
         0.0,
     )
     monthly = pd.DataFrame(
         {
-            "CycleNumber": np.where(active, operating_month // planning.crop_cycle_months + 1, 0),
+            "CycleNumber": np.where(active, operating_month // crop_cycle + 1, 0),
             "CycleMonth": np.where(active, cycle_month, 0),
             "Phase": phases,
             "RampFactor": ramp,
-            "ReplantShare": np.where(active & (cycle_month == 1), planning.replant_share_per_cycle, 0.0),
+            "ReplantShare": np.where(active & (cycle_month == 1), replant_share, 0.0),
         },
         index=dates,
     )
@@ -179,25 +194,31 @@ def compute_farming_schedule(
 ) -> ScheduleOutput:
     dates = cycle_plan.monthly.index
     farm_share = _scenario_farm_share(inputs, scenario)
-    other = inputs.other_assumptions
-    routing = inputs.processing_routing
-    farming = inputs.farming
-    cost_factor = _inflation(other.cost_inflation_rate, np.arange(len(dates)))
-    total_cane = (
-        routing.annual_cane_capacity_tonnes
-        * other.plant_availability
-        * cycle_plan.monthly["RampFactor"].to_numpy()
-        / 12.0
+    cost_rates = parameter_series(
+        inputs, "other_assumptions", "cost_inflation_rate", dates
     )
+    cost_factor = escalation_factor(cost_rates)
+    capacity = parameter_series(
+        inputs, "processing_routing", "annual_cane_capacity_tonnes", dates
+    )
+    availability = parameter_series(
+        inputs, "other_assumptions", "plant_availability", dates
+    )
+    cane_yield = parameter_series(
+        inputs, "farming", "sugarcane_yield_tonnes_per_hectare", dates
+    )
+    harvest_recovery = parameter_series(inputs, "farming", "harvest_recovery", dates)
+    farm_opex = parameter_series(inputs, "farming", "farm_opex_per_tonne", dates)
+    annual_overhead = parameter_series(inputs, "farming", "farm_overhead_per_year", dates)
+    base_transfer_price = parameter_series(
+        inputs, "farming", "internal_transfer_price_per_tonne", dates
+    )
+    total_cane = capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
     farm_cane = total_cane * farm_share
-    harvested_area = farm_cane / (
-        farming.sugarcane_yield_tonnes_per_hectare * farming.harvest_recovery
-    )
-    farm_cost = farm_cane * farming.farm_opex_per_tonne * cost_factor
-    farm_overhead = (
-        farming.farm_overhead_per_year / 12.0 * cost_factor * (1.0 if farm_share > 0 else 0.0)
-    )
-    transfer_price = farming.internal_transfer_price_per_tonne * cost_factor
+    harvested_area = farm_cane / np.maximum(1e-9, cane_yield * harvest_recovery)
+    farm_cost = farm_cane * farm_opex * cost_factor
+    farm_overhead = annual_overhead / 12.0 * cost_factor * (1.0 if farm_share > 0 else 0.0)
+    transfer_price = base_transfer_price * cost_factor
     monthly = pd.DataFrame(
         {
             "FarmShare": farm_share,
@@ -222,26 +243,35 @@ def compute_sourcing_schedule(
     cycle_plan: ScheduleOutput,
 ) -> ScheduleOutput:
     dates = farming.monthly.index
-    sourcing = inputs.sourcing
-    other = inputs.other_assumptions
-    routing = inputs.processing_routing
-    total_cane = (
-        routing.annual_cane_capacity_tonnes
-        * other.plant_availability
-        * cycle_plan.monthly["RampFactor"].to_numpy()
-        / 12.0
+    capacity = parameter_series(
+        inputs, "processing_routing", "annual_cane_capacity_tonnes", dates
     )
+    availability = parameter_series(
+        inputs, "other_assumptions", "plant_availability", dates
+    )
+    total_cane = capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
     purchased_cane = np.maximum(0.0, total_cane - farming.monthly["FarmCaneTonnes"].to_numpy())
-    supplier_gross = purchased_cane / max(1e-9, 1.0 - sourcing.supplier_loss_rate)
-    cost_factor = _inflation(other.cost_inflation_rate, np.arange(len(dates)))
-    contracted_price = sourcing.cane_purchase_price_per_tonne * (1.0 - sourcing.contract_discount)
-    weighted_price = (
-        sourcing.contracted_purchase_share * contracted_price
-        + (1.0 - sourcing.contracted_purchase_share) * sourcing.cane_purchase_price_per_tonne
+    supplier_loss = parameter_series(inputs, "sourcing", "supplier_loss_rate", dates)
+    supplier_gross = purchased_cane / np.maximum(1e-9, 1.0 - supplier_loss)
+    cost_rates = parameter_series(
+        inputs, "other_assumptions", "cost_inflation_rate", dates
     )
+    cost_factor = escalation_factor(cost_rates)
+    spot_price = parameter_series(
+        inputs, "sourcing", "cane_purchase_price_per_tonne", dates
+    )
+    contract_share = parameter_series(
+        inputs, "sourcing", "contracted_purchase_share", dates
+    )
+    contract_discount = parameter_series(inputs, "sourcing", "contract_discount", dates)
+    logistics_rate = parameter_series(
+        inputs, "sourcing", "logistics_cost_per_tonne", dates
+    )
+    contracted_price = spot_price * (1.0 - contract_discount)
+    weighted_price = contract_share * contracted_price + (1.0 - contract_share) * spot_price
     purchase_price = weighted_price * cost_factor
     purchase_cost = supplier_gross * purchase_price
-    logistics = purchased_cane * sourcing.logistics_cost_per_tonne * cost_factor
+    logistics = purchased_cane * logistics_rate * cost_factor
     farm_transfer = farming.monthly["InternalCaneRevenue"].to_numpy()
     monthly = pd.DataFrame(
         {
@@ -265,35 +295,58 @@ def compute_processing_routing(
     inputs: SugarcaneBioethanolInputs,
     sourcing: ScheduleOutput,
 ) -> ScheduleOutput:
-    route = inputs.processing_routing
+    dates = sourcing.monthly.index
     cane = sourcing.monthly["TotalCaneTonnes"].to_numpy()
-    useful_cane = cane * (1.0 - inputs.other_assumptions.process_loss)
-    ethanol = useful_cane * route.ethanol_litres_per_tonne
-    sugar = useful_cane * route.sugar_tonnes_per_tonne
-    raw_bagasse = useful_cane * route.raw_bagasse_tonnes_per_tonne
-    electricity_bagasse = raw_bagasse * route.bagasse_to_electricity_share
-    feed_bagasse = raw_bagasse * route.bagasse_to_animal_feed_share
-    sale_bagasse = raw_bagasse * route.bagasse_to_sale_share
-    gross_power = electricity_bagasse * route.electricity_mwh_per_tonne_bagasse
-    internal_power = np.minimum(gross_power, cane * route.internal_electricity_mwh_per_tonne_cane)
+    process_loss = parameter_series(inputs, "other_assumptions", "process_loss", dates)
+    ethanol_yield = parameter_series(
+        inputs, "processing_routing", "ethanol_litres_per_tonne", dates
+    )
+    sugar_yield = parameter_series(
+        inputs, "processing_routing", "sugar_tonnes_per_tonne", dates
+    )
+    bagasse_yield = parameter_series(
+        inputs, "processing_routing", "raw_bagasse_tonnes_per_tonne", dates
+    )
+    power_share = parameter_series(
+        inputs, "processing_routing", "bagasse_to_electricity_share", dates
+    )
+    feed_share = parameter_series(
+        inputs, "processing_routing", "bagasse_to_animal_feed_share", dates
+    )
+    sale_share = parameter_series(
+        inputs, "processing_routing", "bagasse_to_sale_share", dates
+    )
+    electricity_yield = parameter_series(
+        inputs, "processing_routing", "electricity_mwh_per_tonne_bagasse", dates
+    )
+    internal_use = parameter_series(
+        inputs, "processing_routing", "internal_electricity_mwh_per_tonne_cane", dates
+    )
+    feed_conversion = parameter_series(
+        inputs, "processing_routing", "animal_feed_conversion_rate", dates
+    )
+    useful_cane = cane * (1.0 - process_loss)
+    ethanol = useful_cane * ethanol_yield
+    sugar = useful_cane * sugar_yield
+    raw_bagasse = useful_cane * bagasse_yield
+    electricity_bagasse = raw_bagasse * power_share
+    feed_bagasse = raw_bagasse * feed_share
+    sale_bagasse = raw_bagasse * sale_share
+    gross_power = electricity_bagasse * electricity_yield
+    internal_power = np.minimum(gross_power, cane * internal_use)
     exported_power = np.maximum(0.0, gross_power - internal_power)
-    animal_feed = feed_bagasse * route.animal_feed_conversion_rate
+    animal_feed = feed_bagasse * feed_conversion
     monthly = pd.DataFrame(
         {
-            "CaneReceivedTonnes": cane,
-            "UsefulCaneTonnes": useful_cane,
-            "BioethanolLitres": ethanol,
-            "SugarTonnes": sugar,
+            "CaneReceivedTonnes": cane, "UsefulCaneTonnes": useful_cane,
+            "BioethanolLitres": ethanol, "SugarTonnes": sugar,
             "RawBagasseTonnes": raw_bagasse,
             "BagasseToElectricityTonnes": electricity_bagasse,
             "BagasseToAnimalFeedTonnes": feed_bagasse,
-            "BagasseForSaleTonnes": sale_bagasse,
-            "GrossElectricityMWh": gross_power,
-            "InternalElectricityMWh": internal_power,
-            "ExportElectricityMWh": exported_power,
+            "BagasseForSaleTonnes": sale_bagasse, "GrossElectricityMWh": gross_power,
+            "InternalElectricityMWh": internal_power, "ExportElectricityMWh": exported_power,
             "AnimalFeedTonnes": animal_feed,
-        },
-        index=sourcing.monthly.index,
+        }, index=dates,
     )
     return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
 
@@ -302,59 +355,51 @@ def compute_commercialization(
     inputs: SugarcaneBioethanolInputs,
     processing: ScheduleOutput,
 ) -> ScheduleOutput:
-    commercial = inputs.commercialization
-    price_factor = _inflation(
-        inputs.other_assumptions.price_escalation_rate,
-        np.arange(len(processing.monthly)),
+    dates = processing.monthly.index
+    price_rates = parameter_series(
+        inputs, "other_assumptions", "price_escalation_rate", dates
     )
-    monthly = pd.DataFrame(index=processing.monthly.index)
-    monthly["BioethanolSalesLitres"] = (
-        processing.monthly["BioethanolLitres"] * commercial.ethanol_sales_capture
-    )
-    monthly["SugarSalesTonnes"] = processing.monthly["SugarTonnes"] * commercial.sugar_sales_capture
-    monthly["ElectricitySalesMWh"] = (
-        processing.monthly["ExportElectricityMWh"] * commercial.power_sales_capture
-    )
-    monthly["BagasseSalesTonnes"] = (
-        processing.monthly["BagasseForSaleTonnes"] * commercial.coproduct_sales_capture
-    )
-    monthly["AnimalFeedSalesTonnes"] = (
-        processing.monthly["AnimalFeedTonnes"] * commercial.coproduct_sales_capture
-    )
-    monthly["BioethanolRevenue"] = (
-        monthly["BioethanolSalesLitres"] * commercial.ethanol_price_per_litre * price_factor
-    )
-    monthly["SugarRevenue"] = monthly["SugarSalesTonnes"] * commercial.sugar_price_per_tonne * price_factor
-    monthly["ElectricityRevenue"] = (
-        monthly["ElectricitySalesMWh"] * commercial.electricity_tariff_per_mwh * price_factor
-    )
-    monthly["BagasseRevenue"] = monthly["BagasseSalesTonnes"] * commercial.bagasse_price_per_tonne * price_factor
-    monthly["AnimalFeedRevenue"] = (
-        monthly["AnimalFeedSalesTonnes"] * commercial.animal_feed_price_per_tonne * price_factor
-    )
+    price_factor = escalation_factor(price_rates)
+
+    def values(field: str) -> np.ndarray:
+        return parameter_series(inputs, "commercialization", field, dates)
+
+    ethanol_capture = values("ethanol_sales_capture")
+    sugar_capture = values("sugar_sales_capture")
+    power_capture = values("power_sales_capture")
+    coproduct_capture = values("coproduct_sales_capture")
+    ethanol_price = values("ethanol_price_per_litre") * price_factor
+    sugar_price = values("sugar_price_per_tonne") * price_factor
+    electricity_price = values("electricity_tariff_per_mwh") * price_factor
+    bagasse_price = values("bagasse_price_per_tonne") * price_factor
+    animal_feed_price = values("animal_feed_price_per_tonne") * price_factor
+
+    monthly = pd.DataFrame(index=dates)
+    monthly["BioethanolSalesLitres"] = processing.monthly["BioethanolLitres"] * ethanol_capture
+    monthly["SugarSalesTonnes"] = processing.monthly["SugarTonnes"] * sugar_capture
+    monthly["ElectricitySalesMWh"] = processing.monthly["ExportElectricityMWh"] * power_capture
+    monthly["BagasseSalesTonnes"] = processing.monthly["BagasseForSaleTonnes"] * coproduct_capture
+    monthly["AnimalFeedSalesTonnes"] = processing.monthly["AnimalFeedTonnes"] * coproduct_capture
+    monthly["BioethanolRevenue"] = monthly["BioethanolSalesLitres"] * ethanol_price
+    monthly["SugarRevenue"] = monthly["SugarSalesTonnes"] * sugar_price
+    monthly["ElectricityRevenue"] = monthly["ElectricitySalesMWh"] * electricity_price
+    monthly["BagasseRevenue"] = monthly["BagasseSalesTonnes"] * bagasse_price
+    monthly["AnimalFeedRevenue"] = monthly["AnimalFeedSalesTonnes"] * animal_feed_price
     monthly["ExternalRevenue"] = monthly[list(REVENUE_COLUMNS.values())].sum(axis=1)
     monthly["ElectricityBagasseTransferCost"] = (
-        processing.monthly["BagasseToElectricityTonnes"]
-        * commercial.bagasse_price_per_tonne
-        * price_factor
+        processing.monthly["BagasseToElectricityTonnes"] * bagasse_price
     )
     monthly["AnimalFeedBagasseTransferCost"] = (
-        processing.monthly["BagasseToAnimalFeedTonnes"]
-        * commercial.bagasse_price_per_tonne
-        * price_factor
+        processing.monthly["BagasseToAnimalFeedTonnes"] * bagasse_price
     )
     monthly["InternalBagasseTransferRevenue"] = (
-        monthly["ElectricityBagasseTransferCost"]
-        + monthly["AnimalFeedBagasseTransferCost"]
+        monthly["ElectricityBagasseTransferCost"] + monthly["AnimalFeedBagasseTransferCost"]
     )
     monthly["InternalElectricityTransferRevenue"] = (
-        processing.monthly["InternalElectricityMWh"]
-        * commercial.electricity_tariff_per_mwh
-        * price_factor
+        processing.monthly["InternalElectricityMWh"] * electricity_price
     )
     monthly["TotalInternalTransferRevenue"] = (
-        monthly["InternalBagasseTransferRevenue"]
-        + monthly["InternalElectricityTransferRevenue"]
+        monthly["InternalBagasseTransferRevenue"] + monthly["InternalElectricityTransferRevenue"]
     )
     return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
 
@@ -365,49 +410,45 @@ def compute_cost_schedule(
     sourcing: ScheduleOutput,
     processing: ScheduleOutput,
 ) -> ScheduleOutput:
-    cost = inputs.costs
-    factor = _inflation(inputs.other_assumptions.cost_inflation_rate, np.arange(len(processing.monthly)))
-    monthly = pd.DataFrame(index=processing.monthly.index)
+    dates = processing.monthly.index
+    cost_rates = parameter_series(
+        inputs, "other_assumptions", "cost_inflation_rate", dates
+    )
+    factor = escalation_factor(cost_rates)
+
+    def values(field: str) -> np.ndarray:
+        return parameter_series(inputs, "costs", field, dates) * factor
+
+    monthly = pd.DataFrame(index=dates)
     monthly["FarmingOperatingCost"] = farming.monthly["FarmOperatingCost"]
     monthly["PurchasedCaneCost"] = sourcing.monthly["PurchasedCaneCost"]
     monthly["InboundLogisticsCost"] = sourcing.monthly["InboundLogisticsCost"]
     monthly["ProcessingVariableCost"] = (
-        processing.monthly["CaneReceivedTonnes"] * cost.processing_variable_cost_per_tonne_cane * factor
+        processing.monthly["CaneReceivedTonnes"] * values("processing_variable_cost_per_tonne_cane")
     )
     monthly["BioethanolVariableCost"] = (
-        processing.monthly["BioethanolLitres"] * cost.ethanol_variable_cost_per_litre * factor
+        processing.monthly["BioethanolLitres"] * values("ethanol_variable_cost_per_litre")
     )
-    monthly["SugarVariableCost"] = processing.monthly["SugarTonnes"] * cost.sugar_variable_cost_per_tonne * factor
+    monthly["SugarVariableCost"] = processing.monthly["SugarTonnes"] * values("sugar_variable_cost_per_tonne")
     monthly["ElectricityVariableCost"] = (
-        processing.monthly["GrossElectricityMWh"] * cost.electricity_variable_cost_per_mwh * factor
+        processing.monthly["GrossElectricityMWh"] * values("electricity_variable_cost_per_mwh")
     )
     monthly["BagasseHandlingCost"] = (
-        processing.monthly["BagasseForSaleTonnes"] * cost.bagasse_handling_cost_per_tonne * factor
+        processing.monthly["BagasseForSaleTonnes"] * values("bagasse_handling_cost_per_tonne")
     )
     monthly["AnimalFeedVariableCost"] = (
-        processing.monthly["AnimalFeedTonnes"] * cost.animal_feed_variable_cost_per_tonne * factor
+        processing.monthly["AnimalFeedTonnes"] * values("animal_feed_variable_cost_per_tonne")
     )
-    monthly["FixedProcessingOpex"] = cost.fixed_processing_opex_per_year / 12.0 * factor
-    monthly["CommercialAndAdminCost"] = cost.commercial_and_admin_cost_per_year / 12.0 * factor
+    monthly["FixedProcessingOpex"] = values("fixed_processing_opex_per_year") / 12.0
+    monthly["CommercialAndAdminCost"] = values("commercial_and_admin_cost_per_year") / 12.0
     monthly["ProductSpecificVariableCost"] = monthly[
-        [
-            "BioethanolVariableCost",
-            "SugarVariableCost",
-            "ElectricityVariableCost",
-            "BagasseHandlingCost",
-            "AnimalFeedVariableCost",
-        ]
+        ["BioethanolVariableCost", "SugarVariableCost", "ElectricityVariableCost",
+         "BagasseHandlingCost", "AnimalFeedVariableCost"]
     ].sum(axis=1)
     monthly["EconomicOperatingCost"] = monthly[
-        [
-            "FarmingOperatingCost",
-            "PurchasedCaneCost",
-            "InboundLogisticsCost",
-            "ProcessingVariableCost",
-            "ProductSpecificVariableCost",
-            "FixedProcessingOpex",
-            "CommercialAndAdminCost",
-        ]
+        ["FarmingOperatingCost", "PurchasedCaneCost", "InboundLogisticsCost",
+         "ProcessingVariableCost", "ProductSpecificVariableCost",
+         "FixedProcessingOpex", "CommercialAndAdminCost"]
     ].sum(axis=1)
     return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
 
@@ -469,9 +510,11 @@ def compute_debt_schedule(
 ) -> DebtOutput:
     dates = capex.monthly.index
     financing = inputs.financing
-    draws = capex.monthly["TotalCapex"].to_numpy() * financing.debt_ratio
+    debt_ratios = parameter_series(inputs, "financing", "debt_ratio", dates)
+    annual_interest_rates = parameter_series(inputs, "financing", "interest_rate", dates)
+    draws = capex.monthly["TotalCapex"].to_numpy() * debt_ratios
     months = len(dates)
-    monthly_rate = financing.interest_rate / 12.0
+    monthly_rates = annual_interest_rates / 12.0
     grace = min(financing.grace_years * 12, months)
     maturity = min(financing.tenor_years * 12, months)
     opening = np.zeros(months)
@@ -483,6 +526,7 @@ def compute_debt_schedule(
     balance = 0.0
 
     for month in range(months):
+        monthly_rate = monthly_rates[month]
         opening[month] = balance
         interest[month] = (balance + 0.5 * draws[month]) * monthly_rate
         if month < grace and financing.capitalize_idc:
@@ -503,36 +547,24 @@ def compute_debt_schedule(
 
     monthly = pd.DataFrame(
         {
-            "OpeningBalance": opening,
-            "Draw": draws,
-            "Interest": interest,
-            "CapitalizedInterest": idc,
-            "CashInterest": cash_interest,
-            "Principal": principal,
-            "DebtService": cash_interest + principal,
+            "OpeningBalance": opening, "Draw": draws, "Interest": interest,
+            "CapitalizedInterest": idc, "CashInterest": cash_interest,
+            "Principal": principal, "DebtService": cash_interest + principal,
             "ClosingBalance": closing,
-        },
-        index=dates,
+        }, index=dates,
     )
     annual = _annual_sum(monthly.drop(columns=["OpeningBalance", "ClosingBalance"]))
     annual["OpeningBalance"] = monthly.groupby(monthly.index.year)["OpeningBalance"].first()
     annual["ClosingBalance"] = monthly.groupby(monthly.index.year)["ClosingBalance"].last()
     annual = annual[
-        [
-            "OpeningBalance",
-            "Draw",
-            "CapitalizedInterest",
-            "CashInterest",
-            "Principal",
-            "DebtService",
-            "ClosingBalance",
-        ]
+        ["OpeningBalance", "Draw", "CapitalizedInterest", "CashInterest",
+         "Principal", "DebtService", "ClosingBalance"]
     ]
     summary = pd.DataFrame(
         [
             {
-                "DebtRatio": financing.debt_ratio,
-                "InterestRate": financing.interest_rate,
+                "DebtRatio": float(np.average(debt_ratios, weights=np.maximum(capex.monthly["TotalCapex"], 1e-9))),
+                "InterestRate": float(np.mean(annual_interest_rates)),
                 "TenorYears": financing.tenor_years,
                 "GraceYears": financing.grace_years,
                 "InitialDraw": float(draws.sum()),
@@ -549,22 +581,21 @@ def compute_working_capital(
     commercial: ScheduleOutput,
     costs: ScheduleOutput,
 ) -> ScheduleOutput:
-    wc = inputs.working_capital
+    dates = commercial.monthly.index
+    receivable_days = parameter_series(inputs, "working_capital", "receivable_days", dates)
+    inventory_days = parameter_series(inputs, "working_capital", "inventory_days", dates)
+    payable_days = parameter_series(inputs, "working_capital", "payable_days", dates)
     days_per_month = 365.0 / 12.0
     revenue = commercial.monthly["ExternalRevenue"]
     cash_cost = costs.monthly["EconomicOperatingCost"]
     eligible_payables = costs.monthly[
-        [
-            "PurchasedCaneCost",
-            "InboundLogisticsCost",
-            "ProcessingVariableCost",
-            "ProductSpecificVariableCost",
-        ]
+        ["PurchasedCaneCost", "InboundLogisticsCost", "ProcessingVariableCost",
+         "ProductSpecificVariableCost"]
     ].sum(axis=1)
-    monthly = pd.DataFrame(index=commercial.monthly.index)
-    monthly["AccountsReceivable"] = revenue * wc.receivable_days / days_per_month
-    monthly["Inventory"] = cash_cost * wc.inventory_days / days_per_month
-    monthly["AccountsPayable"] = eligible_payables * wc.payable_days / days_per_month
+    monthly = pd.DataFrame(index=dates)
+    monthly["AccountsReceivable"] = revenue * receivable_days / days_per_month
+    monthly["Inventory"] = cash_cost * inventory_days / days_per_month
+    monthly["AccountsPayable"] = eligible_payables * payable_days / days_per_month
     monthly["NetWorkingCapital"] = (
         monthly["AccountsReceivable"] + monthly["Inventory"] - monthly["AccountsPayable"]
     )
@@ -664,7 +695,7 @@ def compute_financials(
     debt_draw = debt.monthly["Draw"].to_numpy()
     principal = debt.monthly["Principal"].to_numpy()
     debt_service = debt.monthly["DebtService"].to_numpy()
-    equity_contribution = capex_spend * (1.0 - inputs.financing.debt_ratio)
+    equity_contribution = np.maximum(0.0, capex_spend - debt_draw)
     cfads = ebitda - tax - delta_nwc
     project_fcf = ebitda - tax - delta_nwc - capex_spend
     equity_fcf = -equity_contribution + cfads - cash_interest - principal
@@ -887,6 +918,10 @@ def compute_financials(
     )
     active_dscr = dscr[np.isfinite(dscr)]
     minimum_dscr = float(np.min(active_dscr)) if len(active_dscr) else None
+    dscr_target = float(
+        np.max(parameter_series(inputs, "other_assumptions", "minimum_dscr_target", dates))
+    )
+
     checks = pd.DataFrame(
         [
             {
@@ -922,8 +957,8 @@ def compute_financials(
             {
                 "Check": "Minimum DSCR meets target",
                 "Actual": minimum_dscr,
-                "Tolerance": inputs.other_assumptions.minimum_dscr_target,
-                "Status": "OK" if minimum_dscr is None or minimum_dscr >= inputs.other_assumptions.minimum_dscr_target else "WARN",
+                "Tolerance": dscr_target,
+                "Status": "OK" if minimum_dscr is None or minimum_dscr >= dscr_target else "WARN",
             },
         ]
     )

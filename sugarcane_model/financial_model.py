@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from .driver_schedules import validate_driver_schedules
 from .inputs import SCENARIOS, SugarcaneBioethanolInputs, default_input_page
 from .schedules import (
     CapexOutput,
@@ -76,6 +77,10 @@ class SugarcaneBioethanolModel:
             raise ValueError("Bagasse routing shares must sum to 100%.")
         if not inputs.capex.items:
             raise ValueError("At least one CAPEX item is required.")
+        schedule_errors = validate_driver_schedules(inputs)
+        if schedule_errors:
+            raise ValueError(" ".join(schedule_errors))
+
 
     def clear_cache(self) -> None:
         self._scenario_cache.clear()
