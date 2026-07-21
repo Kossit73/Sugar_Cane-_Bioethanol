@@ -28,6 +28,7 @@ from sugarcane_model import (
 )
 from sugarcane_model.exporter import build_excel_report, build_pdf_report
 from sugarcane_model.schedules import COMPONENTS
+from sugarcane_schedule_editor import render_schedule_workspace
 
 
 def _money(value: Any) -> str:
@@ -284,11 +285,13 @@ class SugarcaneBioethanolPlugin:
             with st.expander("Other assumptions"):
                 other_values = _number_grid(st, "other_assumptions", payload["other_assumptions"])
             with st.expander("Capex"):
-                capex_editor = st.data_editor(
+                st.dataframe(
                     pd.DataFrame(payload["capex"]["items"]),
                     use_container_width=True,
-                    num_rows="dynamic",
-                    key="sugarcane_capex_editor",
+                    hide_index=True,
+                )
+                st.caption(
+                    "Use the Schedule Edit Workspace below to edit, add, remove, or propagate CAPEX rows."
                 )
             with st.expander("Cycle planning"):
                 cycle_values = _number_grid(st, "cycle_planning", payload["cycle_planning"])
@@ -327,9 +330,6 @@ class SugarcaneBioethanolPlugin:
                 {
                     "global_assumptions": global_values,
                     "other_assumptions": other_values,
-                    "capex": {
-                        "items": capex_editor.where(pd.notna(capex_editor), None).to_dict(orient="records")
-                    },
                     "cycle_planning": cycle_values,
                     "farming": farming_values,
                     "sourcing": sourcing_values,
@@ -344,11 +344,24 @@ class SugarcaneBioethanolPlugin:
                 model_inputs = input_from_payload(payload)
                 st.session_state[result_key] = self.compute(model_inputs)
                 st.session_state[inputs_key] = model_inputs
+                st.session_state["sugar_model_results_stale"] = False
             except Exception as exc:
                 st.error(f"Model inputs could not be calculated: {exc}")
 
         result = st.session_state.get(result_key)
         model_inputs = st.session_state.get(inputs_key)
+        workspace_inputs = st.session_state.get(inputs_key, defaults)
+        if isinstance(workspace_inputs, SugarcaneBioethanolInputs):
+            render_schedule_workspace(
+                st,
+                workspace_inputs,
+                number_specs=_NUMBER_SPECS,
+            )
+        if st.session_state.get("sugar_model_results_stale"):
+            st.warning(
+                "Schedule inputs changed. Select **Run Model** to recalculate all outputs and financial statements."
+            )
+
         if result is None or model_inputs is None:
             st.info("Review the grouped assumptions and select **Run Model** to calculate results.")
             return

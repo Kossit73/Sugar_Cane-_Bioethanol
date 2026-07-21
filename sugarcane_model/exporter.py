@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from .driver_schedules import SCHEDULE_DEFINITIONS
 from .inputs import SugarcaneBioethanolInputs, input_values
 
 
@@ -42,6 +43,18 @@ def build_excel_report(
 
         payload = input_values(inputs)
         for section, values in payload.items():
+            if section == "yearly_schedules":
+                for schedule_key, rows in values.items():
+                    label = SCHEDULE_DEFINITIONS.get(schedule_key, {}).get(
+                        "label", schedule_key.replace("_", " ").title()
+                    )
+                    pd.DataFrame(rows).to_excel(
+                        writer,
+                        sheet_name=_safe_sheet_name(f"{label} Drivers", used),
+                        index=False,
+                    )
+                continue
+
             if section == "capex":
                 frame = pd.DataFrame(values.get("items", []))
             else:
