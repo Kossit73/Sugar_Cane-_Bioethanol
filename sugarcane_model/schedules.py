@@ -47,6 +47,8 @@ class CapexOutput(ScheduleOutput):
 @dataclass
 class DebtOutput(ScheduleOutput):
     summary: pd.DataFrame
+    facility_monthly: pd.DataFrame
+    facility_annual: pd.DataFrame
 
 
 @dataclass
@@ -504,19 +506,21 @@ def compute_capex_schedule(
     )
 
 
-def compute_debt_schedule(
-    inputs: SugarcaneBioethanolInputs,
-    capex: CapexOutput,
-) -> DebtOutput:
-    dates = capex.monthly.index
-    financing = inputs.financing
-    debt_ratios = parameter_series(inputs, "financing", "debt_ratio", dates)
-    annual_interest_rates = parameter_series(inputs, "financing", "interest_rate", dates)
-    draws = capex.monthly["TotalCapex"].to_numpy() * debt_ratios
+def _build_facility_schedule(
+    dates: pd.DatetimeIndex,
+    draws: np.ndarray,
+    *,
+    annual_interest_rates: np.ndarray,
+    tenor_years: int,
+    grace_years: int,
+    amortization_type: str,
+    capitalize_idc: bool,
+) -> pd.DataFrame:
+    """Build one loan schedule; every facility uses this shared engine."""
     months = len(dates)
-    monthly_rates = annual_interest_rates / 12.0
-    grace = min(financing.grace_years * 12, months)
-    maturity = min(financing.tenor_years * 12, months)
+    monthly_rates = np.asarray(annual_interest_rates, dtype=float) / 12.0
+    grace = min(grace_years * 12, months)
+    maturity = min(tenor_years * 12, months)
     opening = np.zeros(months)
     interest = np.zeros(months)
     idc = np.zeros(months)
@@ -529,15 +533,17 @@ def compute_debt_schedule(
         monthly_rate = monthly_rates[month]
         opening[month] = balance
         interest[month] = (balance + 0.5 * draws[month]) * monthly_rate
-        if month < grace and financing.capitalize_idc:
+        if month < grace and capitalize_idc:
             idc[month] = interest[month]
         else:
             cash_interest[month] = interest[month]
         available = balance + draws[month] + idc[month]
         if month >= grace and month < maturity:
             remaining = max(1, maturity - month)
-            if financing.amortization_type == "annuity" and monthly_rate > 0:
-                payment = available * monthly_rate / (1.0 - (1.0 + monthly_rate) ** (-remaining))
+            if amortization_type == "annuity" and monthly_rate > 0:
+                payment = available * monthly_rate / (
+                    1.0 - (1.0 + monthly_rate) ** (-remaining)
+                )
                 scheduled = max(0.0, payment - cash_interest[month])
             else:
                 scheduled = available / remaining
@@ -545,35 +551,162 @@ def compute_debt_schedule(
         balance = max(0.0, available - principal[month])
         closing[month] = balance
 
-    monthly = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "OpeningBalance": opening, "Draw": draws, "Interest": interest,
-            "CapitalizedInterest": idc, "CashInterest": cash_interest,
-            "Principal": principal, "DebtService": cash_interest + principal,
+            "OpeningBalance": opening,
+            "Draw": draws,
+            "Interest": interest,
+            "CapitalizedInterest": idc,
+            "CashInterest": cash_interest,
+            "Principal": principal,
+            "DebtService": cash_interest + principal,
             "ClosingBalance": closing,
-        }, index=dates,
+        },
+        index=dates,
     )
+
+
+def _annualize_debt_schedule(monthly: pd.DataFrame) -> pd.DataFrame:
     annual = _annual_sum(monthly.drop(columns=["OpeningBalance", "ClosingBalance"]))
-    annual["OpeningBalance"] = monthly.groupby(monthly.index.year)["OpeningBalance"].first()
-    annual["ClosingBalance"] = monthly.groupby(monthly.index.year)["ClosingBalance"].last()
-    annual = annual[
-        ["OpeningBalance", "Draw", "CapitalizedInterest", "CashInterest",
-         "Principal", "DebtService", "ClosingBalance"]
-    ]
-    summary = pd.DataFrame(
+    annual["OpeningBalance"] = monthly.groupby(monthly.index.year)[
+        "OpeningBalance"
+    ].first()
+    annual["ClosingBalance"] = monthly.groupby(monthly.index.year)[
+        "ClosingBalance"
+    ].last()
+    return annual[
         [
-            {
-                "DebtRatio": float(np.average(debt_ratios, weights=np.maximum(capex.monthly["TotalCapex"], 1e-9))),
-                "InterestRate": float(np.mean(annual_interest_rates)),
-                "TenorYears": financing.tenor_years,
-                "GraceYears": financing.grace_years,
-                "InitialDraw": float(draws.sum()),
-                "CapitalizedInterest": float(idc.sum()),
-                "EndingBalance": float(closing[-1]),
-            }
+            "OpeningBalance",
+            "Draw",
+            "CapitalizedInterest",
+            "CashInterest",
+            "Principal",
+            "DebtService",
+            "ClosingBalance",
         ]
+    ]
+
+
+def compute_debt_schedule(
+    inputs: SugarcaneBioethanolInputs,
+    capex: CapexOutput,
+) -> DebtOutput:
+    dates = capex.monthly.index
+    financing = inputs.financing
+    debt_ratios = parameter_series(inputs, "financing", "debt_ratio", dates)
+    senior_interest_rates = parameter_series(
+        inputs, "financing", "interest_rate", dates
     )
-    return DebtOutput(monthly=monthly, annual=annual, summary=summary)
+    capex_spend = capex.monthly["TotalCapex"].to_numpy(dtype=float)
+    total_capex = float(capex_spend.sum())
+    if total_capex <= 0:
+        raise ValueError("Total CAPEX must be positive before debt can be scheduled.")
+
+    senior_draws = capex_spend * debt_ratios
+    fixed_commitment = sum(
+        facility.amount for facility in financing.additional_debt_facilities
+    )
+    total_commitment = float(senior_draws.sum()) + fixed_commitment
+    tolerance = max(1.0, total_capex * 1e-8)
+    if total_commitment > total_capex + tolerance:
+        raise ValueError(
+            "Combined senior and additional debt commitments "
+            f"(USD {total_commitment:,.0f}) exceed scenario CAPEX "
+            f"(USD {total_capex:,.0f})."
+        )
+
+    facility_specs: list[dict[str, Any]] = [
+        {
+            "name": "Senior Debt",
+            "facility_type": "Senior (% of CAPEX)",
+            "debt_ratio": float(
+                np.average(
+                    debt_ratios,
+                    weights=np.maximum(capex.monthly["TotalCapex"], 1e-9),
+                )
+            ),
+            "draws": senior_draws,
+            "interest_rates": senior_interest_rates,
+            "summary_interest_rate": float(np.mean(senior_interest_rates)),
+            "tenor_years": financing.tenor_years,
+            "grace_years": financing.grace_years,
+            "amortization_type": financing.amortization_type,
+            "capitalize_idc": financing.capitalize_idc,
+        }
+    ]
+    capex_profile = capex_spend / total_capex
+    for facility in financing.additional_debt_facilities:
+        facility_specs.append(
+            {
+                "name": facility.name.strip(),
+                "facility_type": "Additional (fixed amount)",
+                "debt_ratio": np.nan,
+                "draws": capex_profile * facility.amount,
+                "interest_rates": np.full(len(dates), facility.interest_rate),
+                "summary_interest_rate": facility.interest_rate,
+                "tenor_years": facility.tenor_years,
+                "grace_years": facility.grace_years,
+                "amortization_type": facility.amortization_type,
+                "capitalize_idc": facility.capitalize_idc,
+            }
+        )
+
+    schedules: list[pd.DataFrame] = []
+    monthly_details: list[pd.DataFrame] = []
+    annual_details: list[pd.DataFrame] = []
+    summary_rows: list[dict[str, Any]] = []
+    for spec in facility_specs:
+        schedule = _build_facility_schedule(
+            dates,
+            np.asarray(spec["draws"], dtype=float),
+            annual_interest_rates=np.asarray(
+                spec["interest_rates"], dtype=float
+            ),
+            tenor_years=int(spec["tenor_years"]),
+            grace_years=int(spec["grace_years"]),
+            amortization_type=str(spec["amortization_type"]),
+            capitalize_idc=bool(spec["capitalize_idc"]),
+        )
+        schedules.append(schedule)
+        monthly_detail = schedule.copy()
+        monthly_detail.insert(0, "Facility", spec["name"])
+        monthly_details.append(monthly_detail)
+        annual_detail = _annualize_debt_schedule(schedule)
+        annual_detail.insert(0, "Facility", spec["name"])
+        annual_details.append(annual_detail)
+        summary_rows.append(
+            {
+                "Facility": spec["name"],
+                "FacilityType": spec["facility_type"],
+                "DebtRatio": spec["debt_ratio"],
+                "InterestRate": spec["summary_interest_rate"],
+                "TenorYears": spec["tenor_years"],
+                "GraceYears": spec["grace_years"],
+                "Amortization": spec["amortization_type"],
+                "CapitalizeIDC": spec["capitalize_idc"],
+                "InitialDraw": float(schedule["Draw"].sum()),
+                "CapitalizedInterest": float(
+                    schedule["CapitalizedInterest"].sum()
+                ),
+                "EndingBalance": float(schedule["ClosingBalance"].iloc[-1]),
+            }
+        )
+
+    monthly = schedules[0].copy()
+    for schedule in schedules[1:]:
+        monthly = monthly.add(schedule, fill_value=0.0)
+    annual = _annualize_debt_schedule(monthly)
+    facility_monthly = pd.concat(monthly_details)
+    facility_monthly.index.name = "Date"
+    facility_annual = pd.concat(annual_details)
+    facility_annual.index.name = "Year"
+    return DebtOutput(
+        monthly=monthly,
+        annual=annual,
+        summary=pd.DataFrame(summary_rows),
+        facility_monthly=facility_monthly,
+        facility_annual=facility_annual,
+    )
 
 
 def compute_working_capital(
@@ -989,6 +1122,12 @@ def compute_financials(
         "min_dscr": minimum_dscr,
         "average_dscr": float(np.mean(active_dscr)) if len(active_dscr) else None,
         "ending_debt": float(debt_balance[-1]),
+        "senior_debt_draw": float(debt.summary.iloc[0]["InitialDraw"]),
+        "additional_debt_draw": float(
+            debt.summary.iloc[1:]["InitialDraw"].sum()
+        ),
+        "total_debt_draw": float(debt.summary["InitialDraw"].sum()),
+        "total_equity_contribution": float(equity_contribution.sum()),
         "terminal_value": terminal_value,
         "model_status": "CHECK" if (checks["Status"] == "FAIL").any() else "OK",
     }

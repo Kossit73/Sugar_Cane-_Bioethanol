@@ -158,6 +158,18 @@ class WorkingCapitalAssumptions(BaseModel):
     payable_days: float = Field(default=25.0, ge=0.0, le=365.0)
 
 
+class DebtFacilityAssumptions(BaseModel):
+    """Terms for one fixed-amount debt facility added to senior debt."""
+
+    name: str = Field(min_length=1, max_length=80)
+    amount: float = Field(gt=0.0)
+    interest_rate: float = Field(default=0.10, ge=0.0, le=1.0)
+    tenor_years: int = Field(default=8, ge=2, le=40)
+    grace_years: int = Field(default=1, ge=0, le=10)
+    amortization_type: AmortizationType = "straight"
+    capitalize_idc: bool = True
+
+
 class FinancingAssumptions(BaseModel):
     debt_ratio: float = Field(default=0.60, ge=0.0, le=0.95)
     interest_rate: float = Field(default=0.10, ge=0.0, le=1.0)
@@ -165,6 +177,9 @@ class FinancingAssumptions(BaseModel):
     grace_years: int = Field(default=1, ge=0, le=10)
     amortization_type: AmortizationType = "straight"
     capitalize_idc: bool = True
+    additional_debt_facilities: list[DebtFacilityAssumptions] = Field(
+        default_factory=list
+    )
 
 
 class SugarcaneBioethanolInputs(BaseModel):

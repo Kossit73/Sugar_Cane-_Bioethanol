@@ -86,6 +86,9 @@ def _table_bundle(build: dict[str, Any], comparison: pd.DataFrame) -> dict[str, 
         "CAPEX Items": capex.item_schedule,
         "CAPEX Monthly": capex.monthly,
         "CAPEX Annual": capex.annual,
+        "Debt Facilities Summary": build["debt"].summary,
+        "Debt Facilities Monthly": build["debt"].facility_monthly,
+        "Debt Facilities Annual": build["debt"].facility_annual,
         "Debt Monthly": build["debt"].monthly,
         "Debt Annual": build["debt"].annual,
         "Component Financials": financials.component_annual,
@@ -197,12 +200,22 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
         ("payable_days", "Payable days", 1.0, "%.1f", float),
     ],
     "financing": [
-        ("debt_ratio", "Debt ratio", 0.05, "%.2f", float),
-        ("interest_rate", "Interest rate", 0.01, "%.2f", float),
-        ("tenor_years", "Debt tenor (years)", 1, "%d", int),
-        ("grace_years", "Principal grace (years)", 1, "%d", int),
+        ("debt_ratio", "Senior debt ratio (0.60 = 60%)", 0.05, "%.2f", float),
+        ("interest_rate", "Senior interest rate (0.10 = 10%)", 0.01, "%.2f", float),
+        ("tenor_years", "Senior tenor (years)", 1, "%d", int),
+        ("grace_years", "Senior principal grace (years)", 1, "%d", int),
     ],
 }
+
+_ADDITIONAL_DEBT_COLUMNS = [
+    "name",
+    "amount",
+    "interest_rate",
+    "tenor_years",
+    "grace_years",
+    "amortization_type",
+    "capitalize_idc",
+]
 
 
 def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -225,7 +238,7 @@ def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
 class SugarcaneBioethanolPlugin:
     slug = "sugar-cane-bioethanol"
     name = "Sugar Cane Bioethanol Financial Model"
-    version = "2.0.0"
+    version = "2.1.0"
     description = (
         "Integrated farm-to-market Sugar Cane model with Cassava-style modular "
         "assumptions, operating schedules, component economics, and consolidated statements."
@@ -238,6 +251,7 @@ class SugarcaneBioethanolPlugin:
         "Five-product processing and production routing",
         "Six component financial views",
         "Consolidated three-statement model",
+        "Multiple fixed-amount debt facilities",
     ]
     minimum_tier = SubscriptionTier.PRO
     bundle = None
@@ -309,15 +323,77 @@ class SugarcaneBioethanolPlugin:
             with st.expander("Working capital"):
                 wc_values = _number_grid(st, "working_capital", payload["working_capital"])
             with st.expander("Financing"):
+                st.markdown("**Senior debt facility**")
                 financing_values = _number_grid(st, "financing", payload["financing"])
                 financing_values["amortization_type"] = st.selectbox(
-                    "Amortization",
+                    "Senior amortization",
                     ("straight", "annuity"),
                     index=("straight", "annuity").index(payload["financing"]["amortization_type"]),
                 )
                 financing_values["capitalize_idc"] = st.checkbox(
-                    "Capitalize construction interest",
+                    "Capitalize senior construction interest",
                     value=bool(payload["financing"]["capitalize_idc"]),
+                )
+                st.markdown("**Additional debt facilities**")
+                st.caption(
+                    "Add or remove fixed-amount loans. Each amount is drawn in "
+                    "proportion to CAPEX and replaces equity dollar-for-dollar."
+                )
+                additional_debt_editor = st.data_editor(
+                    pd.DataFrame(
+                        payload["financing"].get(
+                            "additional_debt_facilities", []
+                        ),
+                        columns=_ADDITIONAL_DEBT_COLUMNS,
+                    ),
+                    column_config={
+                        "name": st.column_config.TextColumn(
+                            "Facility name", required=True, max_chars=80
+                        ),
+                        "amount": st.column_config.NumberColumn(
+                            "Amount (USD)",
+                            required=True,
+                            default=2_400_000.0,
+                            min_value=1.0,
+                            step=100_000.0,
+                            format="%.0f",
+                        ),
+                        "interest_rate": st.column_config.NumberColumn(
+                            "Interest rate",
+                            help="Enter a decimal rate, for example 0.08 for 8%.",
+                            required=True,
+                            default=0.10,
+                            min_value=0.0,
+                            max_value=1.0,
+                            step=0.01,
+                            format="%.2f",
+                        ),
+                        "tenor_years": st.column_config.NumberColumn(
+                            "Tenor (years)", required=True, default=8,
+                            min_value=2, max_value=40, step=1, format="%d",
+                        ),
+                        "grace_years": st.column_config.NumberColumn(
+                            "Grace (years)", required=True, default=1,
+                            min_value=0, max_value=10, step=1, format="%d",
+                        ),
+                        "amortization_type": st.column_config.SelectboxColumn(
+                            "Amortization",
+                            required=True,
+                            default="straight",
+                            options=("straight", "annuity"),
+                        ),
+                        "capitalize_idc": st.column_config.CheckboxColumn(
+                            "Capitalize IDC", required=True, default=True
+                        ),
+                    },
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key="sugarcane_additional_debt_editor",
+                )
+                financing_values["additional_debt_facilities"] = (
+                    additional_debt_editor.where(
+                        pd.notna(additional_debt_editor), None
+                    ).to_dict(orient="records")
                 )
             submitted = st.form_submit_button(
                 "Run Model", type="primary", use_container_width=True
@@ -430,8 +506,42 @@ class SugarcaneBioethanolPlugin:
             )
         with debt_tab:
             debt = result._tables["Debt Annual"].reset_index()
+            coverage = st.columns(5)
+            coverage[0].metric(
+                "Total debt drawn",
+                _money(metrics.get("total_debt_draw")),
+            )
+            coverage[1].metric(
+                "Equity funding",
+                _money(metrics.get("total_equity_contribution")),
+            )
+            coverage[2].metric(
+                "Average DSCR",
+                "n/a" if metrics.get("average_dscr") is None else f"{metrics['average_dscr']:.2f}x",
+            )
+            coverage[3].metric(
+                "Minimum DSCR",
+                "n/a" if metrics.get("min_dscr") is None else f"{metrics['min_dscr']:.2f}x",
+            )
+            coverage[4].metric(
+                "Ending debt",
+                _money(metrics.get("ending_debt")),
+            )
+            st.subheader("Debt facilities")
+            st.dataframe(
+                result._tables["Debt Facilities Summary"],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.subheader("Aggregate annual debt schedule")
             st.line_chart(debt.set_index("Year")[["ClosingBalance", "DebtService"]])
             st.dataframe(debt, use_container_width=True, hide_index=True)
+            with st.expander("Annual schedule by facility"):
+                st.dataframe(
+                    result._tables["Debt Facilities Annual"].reset_index(),
+                    use_container_width=True,
+                    hide_index=True,
+                )
         with checks_tab:
             st.dataframe(pd.DataFrame(result.checks), use_container_width=True, hide_index=True)
 

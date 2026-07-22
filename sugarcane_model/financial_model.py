@@ -62,6 +62,21 @@ class SugarcaneBioethanolModel:
         financing = inputs.financing
         if financing.tenor_years <= financing.grace_years:
             raise ValueError("Debt tenor must be longer than the principal grace period.")
+        facility_names = {"senior debt"}
+        for facility in financing.additional_debt_facilities:
+            name = facility.name.strip()
+            if not name:
+                raise ValueError("Each additional debt facility must have a name.")
+            normalized_name = name.casefold()
+            if normalized_name in facility_names:
+                raise ValueError(
+                    f"Debt facility names must be unique; duplicate '{name}'."
+                )
+            facility_names.add(normalized_name)
+            if facility.tenor_years <= facility.grace_years:
+                raise ValueError(
+                    f"Debt tenor must exceed grace period for facility '{name}'."
+                )
         cycle = inputs.cycle_planning
         if cycle.establishment_months + cycle.harvest_window_months > cycle.crop_cycle_months:
             raise ValueError(
@@ -167,6 +182,8 @@ class SugarcaneBioethanolModel:
                     "ProjectIRR": metrics.get("project_irr"),
                     "EquityIRR": metrics.get("equity_irr"),
                     "MinimumDSCR": metrics.get("min_dscr"),
+                    "TotalDebt": metrics.get("total_debt_draw"),
+                    "EquityFunding": metrics.get("total_equity_contribution"),
                     "PaybackYears": metrics.get("payback_years"),
                     "ModelStatus": metrics.get("model_status"),
                 }

@@ -57,6 +57,15 @@ def build_excel_report(
 
             if section == "capex":
                 frame = pd.DataFrame(values.get("items", []))
+            elif section == "financing":
+                facilities = values.get("additional_debt_facilities", [])
+                frame = pd.DataFrame(
+                    [
+                        {"Assumption": key, "Value": value}
+                        for key, value in values.items()
+                        if key != "additional_debt_facilities"
+                    ]
+                )
             else:
                 frame = pd.DataFrame(
                     [{"Assumption": key, "Value": value} for key, value in values.items()]
@@ -66,6 +75,12 @@ def build_excel_report(
                 sheet_name=_safe_sheet_name(section.replace("_", " ").title(), used),
                 index=False,
             )
+            if section == "financing":
+                pd.DataFrame(facilities).to_excel(
+                    writer,
+                    sheet_name=_safe_sheet_name("Additional Debt Inputs", used),
+                    index=False,
+                )
 
         for name, frame in tables.items():
             export_frame = frame.copy()
