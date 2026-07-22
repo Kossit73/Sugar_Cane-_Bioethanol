@@ -69,6 +69,8 @@ def _table_bundle(build: dict[str, Any], comparison: pd.DataFrame) -> dict[str, 
     capex = build["capex"]
     return {
         "Scenario Comparison": comparison,
+        "Construction Monthly": build["construction"].monthly,
+        "Construction Annual": build["construction"].annual,
         "Cycle Planning Monthly": build["cycle_plan"].monthly,
         "Cycle Planning Annual": build["cycle_plan"].annual,
         "Farm Planning Monthly": build["farm_plan"].monthly,
@@ -93,6 +95,9 @@ def _table_bundle(build: dict[str, Any], comparison: pd.DataFrame) -> dict[str, 
         "Debt Facilities Annual": build["debt"].facility_annual,
         "Debt Monthly": build["debt"].monthly,
         "Debt Annual": build["debt"].annual,
+        "Covenant Schedule": financials.covenant_schedule,
+        "Liquidity Monthly": financials.liquidity_monthly,
+        "Liquidity Annual": financials.liquidity_annual,
         "Component Financials": financials.component_annual,
         "Component Reconciliation": financials.reconciliation,
         "Consolidated P&L": financials.income_annual,
@@ -141,6 +146,11 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
         ("price_escalation_rate", "Price escalation", 0.01, "%.2f", float),
         ("cost_inflation_rate", "Cost inflation", 0.01, "%.2f", float),
         ("minimum_dscr_target", "Minimum DSCR target", 0.05, "%.2f", float),
+    ],
+    "construction": [
+        ("construction_delay_months", "Construction delay (months)", 1, "%d", int),
+        ("commissioning_months", "Commissioning period (months)", 1, "%d", int),
+        ("contingency_rate", "Construction contingency rate", 0.01, "%.2f", float),
     ],
     "cycle_planning": [
         ("crop_cycle_months", "Crop cycle (months)", 1, "%d", int),
@@ -214,6 +224,19 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
         ("interest_rate", "Senior interest rate (0.10 = 10%)", 0.01, "%.2f", float),
         ("tenor_years", "Senior tenor (years)", 1, "%d", int),
         ("grace_years", "Senior principal grace (years)", 1, "%d", int),
+        ("minimum_llcr_target", "Minimum LLCR target", 0.05, "%.2f", float),
+        ("minimum_plcr_target", "Minimum PLCR target", 0.05, "%.2f", float),
+        ("debt_tail_months", "Required debt tail (months)", 1, "%d", int),
+        ("cash_sweep_percent", "Cash sweep percentage", 0.05, "%.2f", float),
+        ("dividend_lockup_dscr", "Dividend lock-up DSCR", 0.05, "%.2f", float),
+    ],
+    "liquidity": [
+        ("minimum_cash_balance", "Minimum unrestricted cash (USD)", 100_000.0, "%.0f", float),
+        ("dsra_months", "DSRA coverage (months)", 1, "%d", int),
+        ("maintenance_reserve_rate", "Maintenance reserve / CAPEX", 0.005, "%.3f", float),
+        ("working_capital_facility_limit", "Working-capital facility limit (USD)", 100_000.0, "%.0f", float),
+        ("working_capital_facility_interest_rate", "Working-capital facility rate", 0.01, "%.2f", float),
+        ("sponsor_support_limit", "Committed sponsor support (USD)", 100_000.0, "%.0f", float),
     ],
 }
 
@@ -248,7 +271,7 @@ def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
 class SugarcaneBioethanolPlugin:
     slug = "sugar-cane-bioethanol"
     name = "Sugar Cane Bioethanol Financial Model"
-    version = "2.2.0"
+    version = "2.3.0"
     description = (
         "Integrated farm-to-market Sugar Cane model with Cassava-style modular "
         "assumptions, operating schedules, component economics, and consolidated statements."
@@ -263,6 +286,9 @@ class SugarcaneBioethanolPlugin:
         "Six component financial views",
         "Consolidated three-statement model",
         "Multiple fixed-amount debt facilities",
+        "COD-gated construction and operations",
+        "DSCR sizing, LLCR/PLCR, and covenant schedule",
+        "DSRA, maintenance reserve, and liquidity waterfall",
     ]
     minimum_tier = SubscriptionTier.PRO
     bundle = None
@@ -309,6 +335,14 @@ class SugarcaneBioethanolPlugin:
                 )
             with st.expander("Other assumptions"):
                 other_values = _number_grid(st, "other_assumptions", payload["other_assumptions"])
+            with st.expander("Construction & COD"):
+                construction_values = _number_grid(
+                    st, "construction", payload["construction"]
+                )
+                construction_values["scheduled_cod"] = st.text_input(
+                    "Scheduled commercial operations date (YYYY-MM)",
+                    payload["construction"]["scheduled_cod"],
+                )
             with st.expander("Capex"):
                 st.dataframe(
                     pd.DataFrame(payload["capex"]["items"]),
@@ -343,6 +377,21 @@ class SugarcaneBioethanolPlugin:
             with st.expander("Financing"):
                 st.markdown("**Senior debt facility**")
                 financing_values = _number_grid(st, "financing", payload["financing"])
+                financing_values["debt_sizing_mode"] = st.selectbox(
+                    "Senior debt sizing",
+                    ("fixed_ratio", "dscr_sculpted"),
+                    index=("fixed_ratio", "dscr_sculpted").index(
+                        payload["financing"]["debt_sizing_mode"]
+                    ),
+                    help="Fixed ratio preserves the requested gearing. DSCR sculpted caps and shapes senior debt to the covenant target.",
+                )
+                financing_values["covenant_period"] = st.selectbox(
+                    "Covenant test period",
+                    ("monthly", "quarterly", "semiannual", "annual"),
+                    index=("monthly", "quarterly", "semiannual", "annual").index(
+                        payload["financing"]["covenant_period"]
+                    ),
+                )
                 financing_values["amortization_type"] = st.selectbox(
                     "Senior amortization",
                     ("straight", "annuity"),
@@ -413,6 +462,10 @@ class SugarcaneBioethanolPlugin:
                         pd.notna(additional_debt_editor), None
                     ).to_dict(orient="records")
                 )
+            with st.expander("Liquidity & reserves"):
+                liquidity_values = _number_grid(
+                    st, "liquidity", payload["liquidity"]
+                )
             submitted = st.form_submit_button(
                 "Run Model", type="primary", use_container_width=True
             )
@@ -424,6 +477,7 @@ class SugarcaneBioethanolPlugin:
                 {
                     "global_assumptions": global_values,
                     "other_assumptions": other_values,
+                    "construction": construction_values,
                     "cycle_planning": cycle_values,
                     "farm_planning": farm_plan_values,
                     "farming": farming_values,
@@ -433,6 +487,7 @@ class SugarcaneBioethanolPlugin:
                     "costs": cost_values,
                     "working_capital": wc_values,
                     "financing": financing_values,
+                    "liquidity": liquidity_values,
                 }
             )
             try:
@@ -462,15 +517,27 @@ class SugarcaneBioethanolPlugin:
             return
 
         metrics = result.metrics
-        columns = st.columns(5)
+        columns = st.columns(6)
         columns[0].metric("Project NPV", _money(metrics.get("project_npv")))
         columns[1].metric("Project IRR", _percent(metrics.get("project_irr")))
         columns[2].metric("Equity IRR", _percent(metrics.get("equity_irr")))
         columns[3].metric(
-            "Minimum DSCR",
+            f"Minimum {metrics.get('covenant_period', 'annual')} DSCR",
             "n/a" if metrics.get("min_dscr") is None else f"{metrics['min_dscr']:.2f}x",
         )
-        columns[4].metric("Model status", str(metrics.get("model_status", "CHECK")))
+        columns[4].metric(
+            "Minimum LLCR",
+            "n/a" if metrics.get("min_llcr") is None else f"{metrics['min_llcr']:.2f}x",
+        )
+        columns[5].metric(
+            "Bankability",
+            str(metrics.get("bankability_status", "FAIL")),
+        )
+        st.caption(
+            f"Effective COD: {metrics.get('effective_cod', 'n/a')} ? "
+            f"Calculation integrity: {metrics.get('calculation_status', 'CHECK')} ? "
+            f"Overall model status: {metrics.get('model_status', 'CHECK')}"
+        )
 
         overview, operations, components, consolidated, debt_tab, checks_tab = st.tabs(
             [
@@ -490,6 +557,12 @@ class SugarcaneBioethanolPlugin:
             pnl = pd.DataFrame(result.consolidated_pnl).set_index("Year")
             st.line_chart(pnl[["Revenue", "EBITDA"]])
         with operations:
+            st.subheader("Construction, commissioning, and COD")
+            st.dataframe(
+                result._tables["Construction Annual"].reset_index(),
+                use_container_width=True,
+                hide_index=True,
+            )
             st.subheader("Processing and production routing")
             st.dataframe(
                 pd.DataFrame(result.production_routing),
@@ -567,6 +640,24 @@ class SugarcaneBioethanolPlugin:
                     use_container_width=True,
                     hide_index=True,
                 )
+            st.subheader("Covenant schedule")
+            st.caption(
+                f"Coverage is tested {metrics.get('covenant_period', 'annual')} against "
+                f"DSCR {model_inputs.other_assumptions.minimum_dscr_target:.2f}x, "
+                f"LLCR {model_inputs.financing.minimum_llcr_target:.2f}x, and "
+                f"PLCR {model_inputs.financing.minimum_plcr_target:.2f}x."
+            )
+            st.dataframe(
+                result._tables["Covenant Schedule"],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.subheader("Liquidity and reserve waterfall")
+            st.dataframe(
+                result._tables["Liquidity Annual"].reset_index(),
+                use_container_width=True,
+                hide_index=True,
+            )
         with checks_tab:
             st.dataframe(pd.DataFrame(result.checks), use_container_width=True, hide_index=True)
 

@@ -166,11 +166,14 @@ def _fallback_pdf(metrics: dict[str, Any], user_email: str) -> bytes:
     output = BytesIO()
     rows = [
         ("Scenario", metrics.get("scenario", "n/a")),
+        ("Effective COD", metrics.get("effective_cod", "n/a")),
         ("Project NPV", f"USD {float(metrics.get('project_npv', 0.0)):,.0f}"),
         ("Project IRR", "n/a" if metrics.get("project_irr") is None else f"{metrics['project_irr']:.1%}"),
         ("Equity IRR", "n/a" if metrics.get("equity_irr") is None else f"{metrics['equity_irr']:.1%}"),
         ("Minimum DSCR", "n/a" if metrics.get("min_dscr") is None else f"{metrics['min_dscr']:.2f}x"),
+        ("Minimum LLCR", "n/a" if metrics.get("min_llcr") is None else f"{metrics['min_llcr']:.2f}x"),
         ("Total CAPEX", f"USD {float(metrics.get('total_capex', 0.0)):,.0f}"),
+        ("Bankability", metrics.get("bankability_status", "n/a")),
         ("Model status", metrics.get("model_status", "n/a")),
     ]
     with PdfPages(output) as pdf:
@@ -214,13 +217,16 @@ def build_pdf_report(
         "Project IRR": "n/a" if metrics.get("project_irr") is None else f"{metrics['project_irr']:.1%}",
         "Equity IRR": "n/a" if metrics.get("equity_irr") is None else f"{metrics['equity_irr']:.1%}",
         "Minimum DSCR": "n/a" if metrics.get("min_dscr") is None else f"{metrics['min_dscr']:.2f}x",
+        "Minimum LLCR": "n/a" if metrics.get("min_llcr") is None else f"{metrics['min_llcr']:.2f}x",
+        "Effective COD": metrics.get("effective_cod", "n/a"),
+        "Bankability": metrics.get("bankability_status", "n/a"),
     }
     sections = [
         pdf_style.heading("Executive summary"),
         pdf_style.body(
             "Integrated farm, sourcing, processing, commercialization, component-financial, and consolidated-financial model."
         ),
-        pdf_style.metric_grid(headline, columns=4),
+        pdf_style.metric_grid(headline, columns=3),
         PageBreak(),
         pdf_style.heading("Scenario comparison"),
         *pdf_style.dataframe_table(tables["Scenario Comparison"], max_rows=10),
@@ -231,8 +237,14 @@ def build_pdf_report(
         pdf_style.heading("Consolidated profit and loss"),
         *pdf_style.dataframe_table(tables["Consolidated P&L"], max_rows=20),
         PageBreak(),
+        pdf_style.heading("Debt covenant schedule"),
+        *pdf_style.dataframe_table(tables["Covenant Schedule"], max_rows=30),
+        PageBreak(),
+        pdf_style.heading("Liquidity and reserves"),
+        *pdf_style.dataframe_table(tables["Liquidity Annual"], max_rows=20),
+        PageBreak(),
         pdf_style.heading("Model checks"),
-        *pdf_style.dataframe_table(tables["Checks"], max_rows=20),
+        *pdf_style.dataframe_table(tables["Checks"], max_rows=40),
     ]
     return pdf_style.build_pdf(
         title="Sugar Cane Bioethanol Financial Model",

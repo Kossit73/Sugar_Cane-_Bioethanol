@@ -114,7 +114,7 @@ def test_driver_schedule_is_consumed_by_monthly_and_financial_schedules() -> Non
 
     result = SugarcaneBioethanolModel(inputs, "HYBRID").build("HYBRID")
     january_2027 = result["sourcing"].monthly.loc["2027-01-01", "TotalCaneTonnes"]
-    assert january_2027 == pytest.approx(150_000.0 * 0.90 / 12.0)
+    assert january_2027 == pytest.approx(150_000.0 * 0.90 * 0.90 / 12.0)
     assert result["processing"].monthly.loc["2027-01-01", "BioethanolLitres"] > (
         result["processing"].monthly.loc["2026-01-01", "BioethanolLitres"]
     )

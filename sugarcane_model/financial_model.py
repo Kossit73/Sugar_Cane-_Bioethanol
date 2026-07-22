@@ -22,12 +22,14 @@ from .schedules import (
     ScheduleOutput,
     compute_capex_schedule,
     compute_commercialization,
+    compute_construction_schedule,
     compute_cost_schedule,
     compute_cycle_plan,
     compute_debt_schedule,
     compute_farm_planning_schedule,
     compute_farming_schedule,
     compute_financials,
+    compute_sizing_cfads,
     compute_processing_routing,
     compute_sourcing_schedule,
     compute_working_capital,
@@ -64,6 +66,15 @@ class SugarcaneBioethanolModel:
         projection_end = pd.Period(f"{global_inputs.end_year}-12", freq="M")
         if planning_start < projection_start or planning_start > projection_end:
             raise ValueError("Planning start must fall within the projection horizon.")
+        try:
+            scheduled_cod = pd.Period(inputs.construction.scheduled_cod, freq="M")
+        except ValueError as exc:
+            raise ValueError("Scheduled COD must use YYYY-MM format.") from exc
+        effective_cod = scheduled_cod + inputs.construction.construction_delay_months
+        if effective_cod < projection_start or effective_cod > projection_end:
+            raise ValueError(
+                "Effective COD, including construction delay, must fall within the projection horizon."
+            )
         if global_inputs.terminal_growth_rate >= global_inputs.discount_rate:
             raise ValueError("Terminal growth must be lower than the discount rate.")
         financing = inputs.financing
@@ -120,15 +131,16 @@ class SugarcaneBioethanolModel:
         if cached and cached[0] == signature:
             return copy.deepcopy(cached[1])
 
+        construction: ScheduleOutput = compute_construction_schedule(self.input_page)
         cycle_plan: ScheduleOutput = compute_cycle_plan(self.input_page)
         farm_plan: ScheduleOutput = compute_farm_planning_schedule(
             self.input_page, cycle_plan
         )
         farming: ScheduleOutput = compute_farming_schedule(
-            self.input_page, scenario_name, cycle_plan, farm_plan
+            self.input_page, scenario_name, cycle_plan, construction, farm_plan
         )
         sourcing: ScheduleOutput = compute_sourcing_schedule(
-            self.input_page, scenario_name, farming, cycle_plan
+            self.input_page, scenario_name, farming, cycle_plan, construction
         )
         processing: ScheduleOutput = compute_processing_routing(
             self.input_page, sourcing
@@ -140,15 +152,21 @@ class SugarcaneBioethanolModel:
             self.input_page, farming, sourcing, processing
         )
         capex: CapexOutput = compute_capex_schedule(
-            self.input_page, scenario_name, sourcing
+            self.input_page, scenario_name, sourcing, construction
         )
-        debt: DebtOutput = compute_debt_schedule(self.input_page, capex)
         working_capital: ScheduleOutput = compute_working_capital(
             self.input_page, commercialization, costs
+        )
+        sizing_cfads = compute_sizing_cfads(
+            self.input_page, commercialization, costs, capex, working_capital
+        )
+        debt: DebtOutput = compute_debt_schedule(
+            self.input_page, capex, construction, sizing_cfads
         )
         financials: FinancialOutput = compute_financials(
             self.input_page,
             scenario_name,
+            construction,
             farming,
             farm_plan,
             sourcing,
@@ -164,6 +182,7 @@ class SugarcaneBioethanolModel:
             "scenario": scenario_name,
             "input_page_snapshot": copy.deepcopy(self.input_page),
             "cycle_plan": cycle_plan,
+            "construction": construction,
             "farm_plan": farm_plan,
             "farming": farming,
             "sourcing": sourcing,
@@ -194,6 +213,8 @@ class SugarcaneBioethanolModel:
             rows.append(
                 {
                     "Scenario": scenario,
+                    "EffectiveCOD": metrics.get("effective_cod"),
+                    "CovenantPeriod": metrics.get("covenant_period"),
                     "FarmShareTarget": metrics.get("farm_share_target"),
                     "ActualFarmShare": metrics.get("farm_share"),
                     "TotalCapex": metrics.get("total_capex"),
@@ -201,10 +222,13 @@ class SugarcaneBioethanolModel:
                     "ProjectIRR": metrics.get("project_irr"),
                     "EquityIRR": metrics.get("equity_irr"),
                     "MinimumDSCR": metrics.get("min_dscr"),
+                    "MinimumLLCR": metrics.get("min_llcr"),
+                    "MinimumPLCR": metrics.get("min_plcr"),
                     "TotalDebt": metrics.get("total_debt_draw"),
                     "EquityFunding": metrics.get("total_equity_contribution"),
                     "PaybackYears": metrics.get("payback_years"),
                     "ModelStatus": metrics.get("model_status"),
+                    "BankabilityStatus": metrics.get("bankability_status"),
                 }
             )
         return pd.DataFrame(rows)

@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 
 ScenarioName = Literal["FARM_ONLY", "BUY_ONLY", "HYBRID"]
 AmortizationType = Literal["straight", "annuity"]
+DebtSizingMode = Literal["fixed_ratio", "dscr_sculpted"]
+CovenantPeriod = Literal["monthly", "quarterly", "semiannual", "annual"]
 SCENARIOS: tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
 
 
@@ -34,6 +36,15 @@ class OtherAssumptions(BaseModel):
     price_escalation_rate: float = Field(default=0.02, ge=-0.50, le=1.0)
     cost_inflation_rate: float = Field(default=0.02, ge=-0.50, le=1.0)
     minimum_dscr_target: float = Field(default=1.20, ge=0.0, le=10.0)
+
+
+class ConstructionAssumptions(BaseModel):
+    """Construction, commissioning, and commercial-operations timing."""
+
+    scheduled_cod: str = "2026-01"
+    construction_delay_months: int = Field(default=0, ge=0, le=60)
+    commissioning_months: int = Field(default=2, ge=0, le=24)
+    contingency_rate: float = Field(default=0.10, ge=0.0, le=1.0)
 
 
 class CapexItem(BaseModel):
@@ -211,9 +222,29 @@ class FinancingAssumptions(BaseModel):
     grace_years: int = Field(default=1, ge=0, le=10)
     amortization_type: AmortizationType = "straight"
     capitalize_idc: bool = True
+    debt_sizing_mode: DebtSizingMode = "fixed_ratio"
+    covenant_period: CovenantPeriod = "annual"
+    minimum_llcr_target: float = Field(default=1.35, ge=0.0, le=10.0)
+    minimum_plcr_target: float = Field(default=1.50, ge=0.0, le=10.0)
+    debt_tail_months: int = Field(default=12, ge=0, le=120)
+    cash_sweep_percent: float = Field(default=0.0, ge=0.0, le=1.0)
+    dividend_lockup_dscr: float = Field(default=1.30, ge=0.0, le=10.0)
     additional_debt_facilities: list[DebtFacilityAssumptions] = Field(
         default_factory=list
     )
+
+
+class LiquidityAssumptions(BaseModel):
+    """Minimum liquidity, reserve accounts, and committed funding support."""
+
+    minimum_cash_balance: float = Field(default=500_000.0, ge=0.0)
+    dsra_months: int = Field(default=6, ge=0, le=24)
+    maintenance_reserve_rate: float = Field(default=0.01, ge=0.0, le=0.25)
+    working_capital_facility_limit: float = Field(default=2_000_000.0, ge=0.0)
+    working_capital_facility_interest_rate: float = Field(
+        default=0.12, ge=0.0, le=1.0
+    )
+    sponsor_support_limit: float = Field(default=0.0, ge=0.0)
 
 
 class SugarcaneBioethanolInputs(BaseModel):
@@ -221,6 +252,7 @@ class SugarcaneBioethanolInputs(BaseModel):
 
     global_assumptions: GlobalAssumptions = Field(default_factory=GlobalAssumptions)
     other_assumptions: OtherAssumptions = Field(default_factory=OtherAssumptions)
+    construction: ConstructionAssumptions = Field(default_factory=ConstructionAssumptions)
     capex: CapexAssumptions = Field(default_factory=CapexAssumptions)
     cycle_planning: CyclePlanningAssumptions = Field(default_factory=CyclePlanningAssumptions)
     farm_planning: FarmPlanningAssumptions = Field(default_factory=FarmPlanningAssumptions)
@@ -231,6 +263,7 @@ class SugarcaneBioethanolInputs(BaseModel):
     costs: CostAssumptions = Field(default_factory=CostAssumptions)
     working_capital: WorkingCapitalAssumptions = Field(default_factory=WorkingCapitalAssumptions)
     financing: FinancingAssumptions = Field(default_factory=FinancingAssumptions)
+    liquidity: LiquidityAssumptions = Field(default_factory=LiquidityAssumptions)
     yearly_schedules: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
 
     def grouped_sections(self) -> "OrderedDict[str, BaseModel]":
@@ -238,6 +271,7 @@ class SugarcaneBioethanolInputs(BaseModel):
             [
                 ("Global assumptions", self.global_assumptions),
                 ("Other assumptions", self.other_assumptions),
+                ("Construction & COD", self.construction),
                 ("Capex", self.capex),
                 ("Cycle planning", self.cycle_planning),
                 ("Farm planning", self.farm_planning),
@@ -248,6 +282,7 @@ class SugarcaneBioethanolInputs(BaseModel):
                 ("Costs", self.costs),
                 ("Working capital", self.working_capital),
                 ("Financing", self.financing),
+                ("Liquidity & reserves", self.liquidity),
             ]
         )
 
