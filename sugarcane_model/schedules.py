@@ -39,6 +39,15 @@ class ScheduleOutput:
 
 
 @dataclass
+class LabourOutput(ScheduleOutput):
+    item_schedule: pd.DataFrame
+    monthly_detail: pd.DataFrame
+    annual_detail: pd.DataFrame
+    allocation_monthly: pd.DataFrame
+    allocation_annual: pd.DataFrame
+
+
+@dataclass
 class CapexOutput(ScheduleOutput):
     item_schedule: pd.DataFrame
     total_capex: float
@@ -648,11 +657,297 @@ def compute_commercialization(
     return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
 
 
+def compute_labour_schedule(
+    inputs: SugarcaneBioethanolInputs,
+    farm_plan: ScheduleOutput,
+    farming: ScheduleOutput,
+    processing: ScheduleOutput,
+    commercial: ScheduleOutput,
+) -> LabourOutput:
+    """Expand consolidated labour roles and allocate each cost exactly once."""
+
+    dates = processing.monthly.index
+    revenue_shares = _product_revenue_shares(commercial)
+    productivity_series: dict[str, pd.Series] = {
+        "None": pd.Series(0.0, index=dates),
+        "Cultivated hectares": farm_plan.monthly["PlannedCultivatedHa"],
+        "Harvested hectares": farm_plan.monthly["HectaresHarvested"],
+        "Farm cane tonnes": farming.monthly["FarmCaneAvailableTonnes"],
+        "Cane processed tonnes": processing.monthly["CaneReceivedTonnes"],
+        "Bioethanol litres": processing.monthly["BioethanolLitres"],
+        "Sugar tonnes": processing.monthly["SugarTonnes"],
+        "Electricity MWh": processing.monthly["GrossElectricityMWh"],
+        "Bagasse tonnes": processing.monthly["RawBagasseTonnes"],
+        "Animal feed tonnes": processing.monthly["AnimalFeedTonnes"],
+    }
+    custom_share_fields = {
+        "Bioethanol": "bioethanol_share",
+        "Sugar": "sugar_share",
+        "Electricity Generation": "electricity_share",
+        "Bagasse": "bagasse_share",
+        "Animal Feed": "animal_feed_share",
+    }
+    cost_columns = [
+        "BaseSalary",
+        "OvertimeCost",
+        "BenefitsCost",
+        "StatutoryContributions",
+        "TrainingCost",
+        "PPECost",
+        "TransportCost",
+        "AccommodationCost",
+        "TotalLabourCost",
+    ]
+    detail_frames: list[pd.DataFrame] = []
+    allocation_rows: list[dict[str, Any]] = []
+    item_rows: list[dict[str, Any]] = []
+
+    for item in inputs.labour.items:
+        dumper = getattr(item, "model_dump", None)
+        item_values = dumper() if callable(dumper) else item.dict()
+        item_rows.append(item_values)
+        start = pd.Period(item.start_month, freq="M").to_timestamp()
+        end_value = (item.end_month or "").strip()
+        end = (
+            pd.Period(end_value, freq="M").to_timestamp()
+            if end_value
+            else dates[-1]
+        )
+        active = np.asarray((dates >= start) & (dates <= end))
+        positions = np.flatnonzero(active)
+        if not len(positions):
+            continue
+
+        months_since_start = np.maximum(
+            0,
+            (dates.year - start.year) * 12 + dates.month - start.month,
+        ).to_numpy(dtype=int)
+        escalation_factor = np.power(
+            1.0 + item.annual_salary_escalation,
+            months_since_start // 12,
+        )
+        headcount = np.where(active, item.headcount_fte, 0.0)
+        base_salary = (
+            headcount * item.monthly_wage_per_fte * escalation_factor
+        )
+        overtime = base_salary * item.overtime_rate
+        cash_pay = base_salary + overtime
+        benefits = cash_pay * item.benefits_rate
+        statutory = cash_pay * item.statutory_contribution_rate
+        training = headcount * item.training_cost_per_fte_year / 12.0
+        ppe = headcount * item.ppe_cost_per_fte_year / 12.0
+        transport = headcount * item.transport_cost_per_fte_month
+        accommodation = headcount * item.accommodation_cost_per_fte_month
+        total = (
+            cash_pay
+            + benefits
+            + statutory
+            + training
+            + ppe
+            + transport
+            + accommodation
+        )
+        productivity = productivity_series[item.productivity_driver].to_numpy(
+            dtype=float
+        )
+        detail_frames.append(
+            pd.DataFrame(
+                {
+                    "Date": dates[positions],
+                    "Year": dates[positions].year,
+                    "Month": dates[positions].month,
+                    "RoleID": item.role_id,
+                    "CostCentre": item.cost_centre,
+                    "Department": item.department,
+                    "Position": item.position,
+                    "WorkerType": item.worker_type,
+                    "SourceComponent": item.component,
+                    "AllocationDriver": item.allocation_driver,
+                    "ProductivityDriver": item.productivity_driver,
+                    "HeadcountFTE": headcount[positions],
+                    "NumberOfShifts": item.number_of_shifts,
+                    "FTEPerShift": headcount[positions] / item.number_of_shifts,
+                    "MonthlyWagePerFTE": (
+                        item.monthly_wage_per_fte
+                        * escalation_factor[positions]
+                    ),
+                    "SalaryEscalationFactor": escalation_factor[positions],
+                    "BaseSalary": base_salary[positions],
+                    "OvertimeCost": overtime[positions],
+                    "BenefitsCost": benefits[positions],
+                    "StatutoryContributions": statutory[positions],
+                    "TrainingCost": training[positions],
+                    "PPECost": ppe[positions],
+                    "TransportCost": transport[positions],
+                    "AccommodationCost": accommodation[positions],
+                    "TotalLabourCost": total[positions],
+                    "ProductivityVolume": productivity[positions],
+                    "ProductivityPerFTE": np.divide(
+                        productivity[positions],
+                        headcount[positions],
+                        out=np.zeros(len(positions), dtype=float),
+                        where=headcount[positions] > 0,
+                    ),
+                }
+            )
+        )
+
+        for position in positions:
+            date = dates[position]
+            if item.allocation_driver == "Direct":
+                weights = {item.component: 1.0}
+            elif item.allocation_driver == "Product revenue share":
+                weights = {
+                    component: float(revenue_shares.loc[date, component])
+                    for component in PRODUCT_COMPONENTS
+                }
+            elif item.allocation_driver == "Equal product share":
+                weights = {
+                    component: 1.0 / len(PRODUCT_COMPONENTS)
+                    for component in PRODUCT_COMPONENTS
+                }
+            else:
+                weights = {
+                    component: float(getattr(item, field))
+                    for component, field in custom_share_fields.items()
+                }
+            for component, share in weights.items():
+                allocation_rows.append(
+                    {
+                        "Date": date,
+                        "Year": date.year,
+                        "RoleID": item.role_id,
+                        "CostCentre": item.cost_centre,
+                        "Department": item.department,
+                        "Position": item.position,
+                        "AllocationDriver": item.allocation_driver,
+                        "Component": component,
+                        "AllocationShare": share,
+                        "AllocatedLabourCost": total[position] * share,
+                    }
+                )
+
+    item_schedule = pd.DataFrame(item_rows)
+    if detail_frames:
+        monthly_detail = pd.concat(detail_frames, ignore_index=True)
+    else:
+        monthly_detail = pd.DataFrame(
+            columns=[
+                "Date", "Year", "Month", "RoleID", "CostCentre", "Department",
+                "Position", "WorkerType", "SourceComponent", "AllocationDriver",
+                "ProductivityDriver", "HeadcountFTE", "NumberOfShifts",
+                "FTEPerShift", "MonthlyWagePerFTE", "SalaryEscalationFactor",
+                *cost_columns, "ProductivityVolume", "ProductivityPerFTE",
+            ]
+        )
+
+    monthly = pd.DataFrame(0.0, index=dates, columns=["HeadcountFTE", *cost_columns])
+    monthly.index.name = "Date"
+    monthly["ActiveRoles"] = 0
+    if not monthly_detail.empty:
+        grouped = monthly_detail.groupby("Date")
+        monthly.loc[:, ["HeadcountFTE", *cost_columns]] = (
+            grouped[["HeadcountFTE", *cost_columns]]
+            .sum()
+            .reindex(dates, fill_value=0.0)
+        )
+        monthly["ActiveRoles"] = (
+            grouped["RoleID"].nunique().reindex(dates, fill_value=0).astype(int)
+        )
+
+    annual = monthly[cost_columns].groupby(monthly.index.year).sum()
+    annual["AverageHeadcountFTE"] = monthly["HeadcountFTE"].groupby(
+        monthly.index.year
+    ).mean()
+    annual["PeakHeadcountFTE"] = monthly["HeadcountFTE"].groupby(
+        monthly.index.year
+    ).max()
+    annual["PeakActiveRoles"] = monthly["ActiveRoles"].groupby(
+        monthly.index.year
+    ).max()
+    annual.index.name = "Year"
+
+    if monthly_detail.empty:
+        annual_detail = pd.DataFrame()
+    else:
+        annual_detail = (
+            monthly_detail.groupby(
+                [
+                    "Year", "RoleID", "CostCentre", "Department", "Position",
+                    "WorkerType", "SourceComponent", "AllocationDriver",
+                    "ProductivityDriver",
+                ],
+                as_index=False,
+            )
+            .agg(
+                MonthsActive=("Date", "nunique"),
+                AverageHeadcountFTE=("HeadcountFTE", "mean"),
+                PeakHeadcountFTE=("HeadcountFTE", "max"),
+                NumberOfShifts=("NumberOfShifts", "max"),
+                BaseSalary=("BaseSalary", "sum"),
+                OvertimeCost=("OvertimeCost", "sum"),
+                BenefitsCost=("BenefitsCost", "sum"),
+                StatutoryContributions=("StatutoryContributions", "sum"),
+                TrainingCost=("TrainingCost", "sum"),
+                PPECost=("PPECost", "sum"),
+                TransportCost=("TransportCost", "sum"),
+                AccommodationCost=("AccommodationCost", "sum"),
+                TotalLabourCost=("TotalLabourCost", "sum"),
+                ProductivityVolume=("ProductivityVolume", "sum"),
+            )
+        )
+        annual_detail["ProductivityPerAverageFTE"] = np.divide(
+            annual_detail["ProductivityVolume"],
+            annual_detail["AverageHeadcountFTE"],
+            out=np.zeros(len(annual_detail), dtype=float),
+            where=annual_detail["AverageHeadcountFTE"] > 0,
+        )
+
+    allocation_monthly = pd.DataFrame(allocation_rows)
+    if allocation_monthly.empty:
+        allocation_monthly = pd.DataFrame(
+            columns=[
+                "Date", "Year", "RoleID", "CostCentre", "Department", "Position",
+                "AllocationDriver", "Component", "AllocationShare",
+                "AllocatedLabourCost",
+            ]
+        )
+        allocation_annual = pd.DataFrame(
+            columns=["Year", "Component", "AllocatedLabourCost", "ShareOfAnnualLabourCost"]
+        )
+    else:
+        allocation_annual = (
+            allocation_monthly.groupby(["Year", "Component"], as_index=False)[
+                "AllocatedLabourCost"
+            ].sum()
+        )
+        year_total = allocation_annual.groupby("Year")[
+            "AllocatedLabourCost"
+        ].transform("sum")
+        allocation_annual["ShareOfAnnualLabourCost"] = np.divide(
+            allocation_annual["AllocatedLabourCost"],
+            year_total,
+            out=np.zeros(len(allocation_annual), dtype=float),
+            where=year_total > 0,
+        )
+
+    return LabourOutput(
+        monthly=monthly,
+        annual=annual,
+        item_schedule=item_schedule,
+        monthly_detail=monthly_detail,
+        annual_detail=annual_detail,
+        allocation_monthly=allocation_monthly,
+        allocation_annual=allocation_annual,
+    )
+
+
 def compute_cost_schedule(
     inputs: SugarcaneBioethanolInputs,
     farming: ScheduleOutput,
     sourcing: ScheduleOutput,
     processing: ScheduleOutput,
+    labour: LabourOutput,
 ) -> ScheduleOutput:
     dates = processing.monthly.index
     cost_rates = parameter_series(
@@ -689,10 +984,11 @@ def compute_cost_schedule(
         ["BioethanolVariableCost", "SugarVariableCost", "ElectricityVariableCost",
          "BagasseHandlingCost", "AnimalFeedVariableCost"]
     ].sum(axis=1)
+    monthly["LabourCost"] = labour.monthly["TotalLabourCost"]
     monthly["EconomicOperatingCost"] = monthly[
         ["FarmingOperatingCost", "PurchasedCaneCost", "InboundLogisticsCost",
          "ProcessingVariableCost", "ProductSpecificVariableCost",
-         "FixedProcessingOpex", "CommercialAndAdminCost"]
+         "FixedProcessingOpex", "CommercialAndAdminCost", "LabourCost"]
     ].sum(axis=1)
     return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
 
@@ -1532,6 +1828,7 @@ def compute_financials(
     processing: ScheduleOutput,
     commercial: ScheduleOutput,
     costs: ScheduleOutput,
+    labour: LabourOutput,
     capex: CapexOutput,
     debt: DebtOutput,
     working_capital: ScheduleOutput,
@@ -1625,6 +1922,8 @@ def compute_financials(
     income_monthly = pd.DataFrame(
         {
             "Revenue": revenue,
+            "NonLabourOperatingCosts": operating_cost - labour.monthly["TotalLabourCost"].to_numpy(),
+            "LabourCosts": labour.monthly["TotalLabourCost"].to_numpy(),
             "OperatingCosts": operating_cost,
             "EBITDA": ebitda,
             "Depreciation": depreciation,
@@ -1750,6 +2049,21 @@ def compute_financials(
         ["ProcessingVariableCost", "FixedProcessingOpex", "CommercialAndAdminCost"]
     ].sum(axis=1)
 
+    if labour.allocation_monthly.empty:
+        labour_by_component = pd.DataFrame(
+            0.0, index=dates, columns=COMPONENTS
+        )
+    else:
+        labour_by_component = labour.allocation_monthly.pivot_table(
+            index="Date",
+            columns="Component",
+            values="AllocatedLabourCost",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        labour_by_component = labour_by_component.reindex(
+            index=dates, columns=COMPONENTS, fill_value=0.0
+        ).fillna(0.0)
     component_frames: list[pd.DataFrame] = []
     for component in COMPONENTS:
         frame = pd.DataFrame(index=dates)
@@ -1771,7 +2085,13 @@ def compute_financials(
 
             frame["SharedOpex"] = shared_opex * shares[component]
             frame["DeltaNWC"] = component_delta_nwc[component]
-        frame["EBITDA"] = frame["Revenue"] - frame["DirectCosts"] - frame["SharedOpex"]
+        frame["LabourCost"] = labour_by_component[component]
+        frame["EBITDA"] = (
+            frame["Revenue"]
+            - frame["DirectCosts"]
+            - frame["SharedOpex"]
+            - frame["LabourCost"]
+        )
         frame["Depreciation"] = component_dep[component]
         frame["EBIT"] = frame["EBITDA"] - frame["Depreciation"]
         frame["Interest"] = component_interest[component]
@@ -1808,7 +2128,10 @@ def compute_financials(
     )
 
     annual_component_totals = component_annual.groupby("Year", as_index=False)[
-        ["Revenue", "DirectCosts", "SharedOpex", "EBITDA", "Depreciation", "EBIT", "Interest", "Tax", "NetIncome"]
+        [
+            "Revenue", "DirectCosts", "SharedOpex", "LabourCost", "EBITDA",
+            "Depreciation", "EBIT", "Interest", "Tax", "NetIncome",
+        ]
     ].sum()
     farm_internal = farming.monthly["InternalCaneRevenue"].groupby(dates.year).sum()
     power_internal = commercial.monthly["InternalElectricityTransferRevenue"].groupby(dates.year).sum()
@@ -1848,6 +2171,13 @@ def compute_financials(
         processing.monthly["BagasseToElectricityTonnes"].to_numpy()
         + processing.monthly["BagasseToAnimalFeedTonnes"].to_numpy()
         + processing.monthly["BagasseForSaleTonnes"].to_numpy()
+    )
+    labour_allocation_error = float(
+        np.max(
+            np.abs(
+                labour.monthly["TotalLabourCost"] - labour_by_component.sum(axis=1)
+            )
+        )
     )
     total_capex = capex.total_capex
     tolerance = max(1.0, total_capex * 1e-8)
@@ -2041,6 +2371,13 @@ def compute_financials(
             },
             {
                 "Category": "Integrity",
+                "Check": "Labour cost allocations reconcile",
+                "Actual": labour_allocation_error,
+                "Tolerance": tolerance,
+                "Status": "OK" if labour_allocation_error <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Integrity",
                 "Check": "Debt roll-forward",
                 "Actual": float(np.max(np.abs(debt_error))),
                 "Tolerance": tolerance,
@@ -2222,6 +2559,10 @@ def compute_financials(
         "planned_irrigated_hectares": float(
             plan_monthly["PlannedIrrigatedHa"].max()
         ),
+        "total_labour_cost": float(labour.monthly["TotalLabourCost"].sum()),
+        "peak_headcount_fte": float(labour.monthly["HeadcountFTE"].max()),
+        "average_headcount_fte": float(labour.monthly["HeadcountFTE"].mean()),
+        "labour_role_count": len(inputs.labour.items),
         "total_capex": total_capex,
         "construction_contingency_requirement": contingency_requirement,
         "project_npv": _npv(project_returns, inputs.global_assumptions.discount_rate),
