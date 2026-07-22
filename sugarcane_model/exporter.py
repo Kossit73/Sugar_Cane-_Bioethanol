@@ -58,6 +58,8 @@ def build_excel_report(
 
             if section == "capex":
                 frame = pd.DataFrame(values.get("items", []))
+            elif section == "labour":
+                frame = pd.DataFrame(values.get("items", []))
             elif section == "financing":
                 facilities = values.get("additional_debt_facilities", [])
                 frame = pd.DataFrame(
@@ -173,6 +175,8 @@ def _fallback_pdf(metrics: dict[str, Any], user_email: str) -> bytes:
         ("Minimum DSCR", "n/a" if metrics.get("min_dscr") is None else f"{metrics['min_dscr']:.2f}x"),
         ("Minimum LLCR", "n/a" if metrics.get("min_llcr") is None else f"{metrics['min_llcr']:.2f}x"),
         ("Total CAPEX", f"USD {float(metrics.get('total_capex', 0.0)):,.0f}"),
+        ("Total labour cost", f"USD {float(metrics.get('total_labour_cost', 0.0)):,.0f}"),
+        ("Peak headcount / FTE", f"{float(metrics.get('peak_headcount_fte', 0.0)):,.1f}"),
         ("Bankability", metrics.get("bankability_status", "n/a")),
         ("Model status", metrics.get("model_status", "n/a")),
     ]
@@ -220,6 +224,8 @@ def build_pdf_report(
         "Minimum LLCR": "n/a" if metrics.get("min_llcr") is None else f"{metrics['min_llcr']:.2f}x",
         "Effective COD": metrics.get("effective_cod", "n/a"),
         "Bankability": metrics.get("bankability_status", "n/a"),
+        "Total labour cost": f"USD {float(metrics.get('total_labour_cost', 0.0)):,.0f}",
+        "Peak FTE": f"{float(metrics.get('peak_headcount_fte', 0.0)):,.1f}",
     }
     sections = [
         pdf_style.heading("Executive summary"),
@@ -233,6 +239,15 @@ def build_pdf_report(
         PageBreak(),
         pdf_style.heading("Component financial summary"),
         *pdf_style.dataframe_table(tables["Component Financials"], max_rows=42),
+        PageBreak(),
+        pdf_style.heading("Labour planning summary"),
+        *pdf_style.dataframe_table(tables["Labour Annual Summary"], max_rows=20),
+        PageBreak(),
+        pdf_style.heading("Labour by role"),
+        *pdf_style.dataframe_table(tables["Labour Annual Detail"], max_rows=50),
+        PageBreak(),
+        pdf_style.heading("Labour allocation by component"),
+        *pdf_style.dataframe_table(tables["Labour Allocation Annual"], max_rows=50),
         PageBreak(),
         pdf_style.heading("Consolidated profit and loss"),
         *pdf_style.dataframe_table(tables["Consolidated P&L"], max_rows=20),

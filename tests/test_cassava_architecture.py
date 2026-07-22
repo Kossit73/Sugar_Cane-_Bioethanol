@@ -34,6 +34,7 @@ def test_grouped_inputs_match_the_cassava_architecture() -> None:
         "Cycle planning",
         "Farm planning",
         "Farming",
+        "Labour planning",
         "Sourcing",
         "Processing & production routing",
         "Commercialization",

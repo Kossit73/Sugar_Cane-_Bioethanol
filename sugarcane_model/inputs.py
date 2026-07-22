@@ -13,6 +13,19 @@ ScenarioName = Literal["FARM_ONLY", "BUY_ONLY", "HYBRID"]
 AmortizationType = Literal["straight", "annuity"]
 DebtSizingMode = Literal["fixed_ratio", "dscr_sculpted"]
 CovenantPeriod = Literal["monthly", "quarterly", "semiannual", "annual"]
+WorkerType = Literal["Permanent", "Seasonal", "Contract"]
+LabourComponent = Literal[
+    "Farming", "Bioethanol", "Sugar", "Electricity Generation",
+    "Bagasse", "Animal Feed", "Shared Plant",
+]
+LabourAllocationDriver = Literal[
+    "Direct", "Product revenue share", "Equal product share", "Custom product share",
+]
+ProductivityDriver = Literal[
+    "None", "Cultivated hectares", "Harvested hectares", "Farm cane tonnes",
+    "Cane processed tonnes", "Bioethanol litres", "Sugar tonnes",
+    "Electricity MWh", "Bagasse tonnes", "Animal feed tonnes",
+]
 SCENARIOS: tuple[str, ...] = ("FARM_ONLY", "BUY_ONLY", "HYBRID")
 
 
@@ -145,6 +158,164 @@ def validate_farm_planning_values(values: dict[str, Any]) -> list[str]:
     return errors
 
 
+class LabourPlanItem(BaseModel):
+    """One role entered once and expanded into the monthly labour schedule."""
+
+    role_id: str = Field(min_length=1, max_length=40)
+    cost_centre: str = Field(min_length=1, max_length=80)
+    department: str = Field(min_length=1, max_length=80)
+    position: str = Field(min_length=1, max_length=100)
+    worker_type: WorkerType = "Permanent"
+    component: LabourComponent = "Shared Plant"
+    start_month: str = "2026-01"
+    end_month: str | None = None
+    headcount_fte: float = Field(default=1.0, ge=0.0)
+    number_of_shifts: int = Field(default=1, ge=1, le=4)
+    monthly_wage_per_fte: float = Field(default=1_000.0, ge=0.0)
+    overtime_rate: float = Field(default=0.0, ge=0.0, le=2.0)
+    benefits_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    statutory_contribution_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    training_cost_per_fte_year: float = Field(default=0.0, ge=0.0)
+    ppe_cost_per_fte_year: float = Field(default=0.0, ge=0.0)
+    transport_cost_per_fte_month: float = Field(default=0.0, ge=0.0)
+    accommodation_cost_per_fte_month: float = Field(default=0.0, ge=0.0)
+    annual_salary_escalation: float = Field(default=0.03, ge=-0.50, le=1.0)
+    allocation_driver: LabourAllocationDriver = "Product revenue share"
+    productivity_driver: ProductivityDriver = "None"
+    bioethanol_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    sugar_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    electricity_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    bagasse_share: float = Field(default=0.0, ge=0.0, le=1.0)
+    animal_feed_share: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+def _default_labour_items() -> list[LabourPlanItem]:
+    return [
+        LabourPlanItem(
+            role_id="FARM-MGR", cost_centre="Farming", department="Farm management",
+            position="Farm manager", component="Farming", start_month="2025-01",
+            headcount_fte=1.0, monthly_wage_per_fte=1750.0, benefits_rate=0.15,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=600.0,
+            ppe_cost_per_fte_year=300.0, transport_cost_per_fte_month=100.0,
+            annual_salary_escalation=0.04, allocation_driver="Direct",
+            productivity_driver="Cultivated hectares",
+        ),
+        LabourPlanItem(
+            role_id="FARM-AGRON", cost_centre="Farming", department="Agronomy",
+            position="Agronomist", component="Farming", start_month="2025-01",
+            headcount_fte=2.0, monthly_wage_per_fte=1250.0, benefits_rate=0.15,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=450.0,
+            ppe_cost_per_fte_year=250.0, transport_cost_per_fte_month=87.5,
+            annual_salary_escalation=0.04, allocation_driver="Direct",
+            productivity_driver="Harvested hectares",
+        ),
+        LabourPlanItem(
+            role_id="FARM-IRR", cost_centre="Farming", department="Irrigation",
+            position="Irrigation technician", component="Farming", start_month="2025-01",
+            headcount_fte=4.0, number_of_shifts=2, monthly_wage_per_fte=700.0,
+            overtime_rate=0.05, benefits_rate=0.12, statutory_contribution_rate=0.08,
+            training_cost_per_fte_year=300.0, ppe_cost_per_fte_year=250.0,
+            transport_cost_per_fte_month=75.0, annual_salary_escalation=0.04,
+            allocation_driver="Direct", productivity_driver="Cultivated hectares",
+        ),
+        LabourPlanItem(
+            role_id="FARM-FIELD", cost_centre="Farming", department="Field operations",
+            position="Field worker", component="Farming", start_month="2025-01",
+            headcount_fte=30.0, monthly_wage_per_fte=300.0, overtime_rate=0.08,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=100.0,
+            ppe_cost_per_fte_year=175.0, transport_cost_per_fte_month=50.0,
+            annual_salary_escalation=0.04, allocation_driver="Direct",
+            productivity_driver="Harvested hectares",
+        ),
+        LabourPlanItem(
+            role_id="CANE-LOG", cost_centre="Sourcing & Logistics",
+            department="Cane procurement", position="Procurement and logistics officer",
+            component="Shared Plant", start_month="2026-01", headcount_fte=4.0,
+            monthly_wage_per_fte=750.0, benefits_rate=0.12,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=250.0,
+            ppe_cost_per_fte_year=150.0, transport_cost_per_fte_month=75.0,
+            annual_salary_escalation=0.04, allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-MGR", cost_centre="Processing Plant",
+            department="Plant management", position="Plant manager",
+            component="Shared Plant", start_month="2026-01", headcount_fte=1.0,
+            monthly_wage_per_fte=2500.0, benefits_rate=0.18,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=750.0,
+            ppe_cost_per_fte_year=300.0, transport_cost_per_fte_month=125.0,
+            annual_salary_escalation=0.04, allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-OPS", cost_centre="Processing Plant", department="Operations",
+            position="Process operator", component="Shared Plant", start_month="2026-01",
+            headcount_fte=18.0, number_of_shifts=3, monthly_wage_per_fte=700.0,
+            overtime_rate=0.08, benefits_rate=0.12, statutory_contribution_rate=0.08,
+            training_cost_per_fte_year=250.0, ppe_cost_per_fte_year=225.0,
+            transport_cost_per_fte_month=62.5, annual_salary_escalation=0.04,
+            allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-MAINT", cost_centre="Maintenance & Engineering",
+            department="Maintenance", position="Maintenance engineer or technician",
+            component="Shared Plant", start_month="2026-01", headcount_fte=8.0,
+            number_of_shifts=2, monthly_wage_per_fte=900.0, overtime_rate=0.08,
+            benefits_rate=0.12, statutory_contribution_rate=0.08,
+            training_cost_per_fte_year=400.0, ppe_cost_per_fte_year=275.0,
+            transport_cost_per_fte_month=75.0, annual_salary_escalation=0.04,
+            allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-LAB", cost_centre="Laboratory & Quality",
+            department="Quality control", position="Laboratory or quality technician",
+            component="Shared Plant", start_month="2026-01", headcount_fte=4.0,
+            number_of_shifts=2, monthly_wage_per_fte=800.0, benefits_rate=0.12,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=350.0,
+            ppe_cost_per_fte_year=175.0, transport_cost_per_fte_month=62.5,
+            annual_salary_escalation=0.04, allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-HSE", cost_centre="HSE",
+            department="Health, safety and environment", position="HSE officer",
+            component="Shared Plant", start_month="2026-01", headcount_fte=2.0,
+            monthly_wage_per_fte=900.0, benefits_rate=0.12,
+            statutory_contribution_rate=0.08, training_cost_per_fte_year=450.0,
+            ppe_cost_per_fte_year=225.0, transport_cost_per_fte_month=75.0,
+            annual_salary_escalation=0.04, allocation_driver="Product revenue share",
+            productivity_driver="Cane processed tonnes",
+        ),
+        LabourPlanItem(
+            role_id="PLANT-SEC", cost_centre="Security", department="Security",
+            position="Security officer", worker_type="Contract", component="Shared Plant",
+            start_month="2026-01", headcount_fte=9.0, number_of_shifts=3,
+            monthly_wage_per_fte=350.0, overtime_rate=0.05,
+            statutory_contribution_rate=0.05, ppe_cost_per_fte_year=125.0,
+            transport_cost_per_fte_month=37.5, annual_salary_escalation=0.04,
+            allocation_driver="Equal product share", productivity_driver="None",
+        ),
+        LabourPlanItem(
+            role_id="ADMIN", cost_centre="Commercial & Administration",
+            department="Finance, HR and administration",
+            position="Administrative professional", component="Shared Plant",
+            start_month="2026-01", headcount_fte=6.0, monthly_wage_per_fte=800.0,
+            benefits_rate=0.15, statutory_contribution_rate=0.08,
+            training_cost_per_fte_year=300.0, transport_cost_per_fte_month=62.5,
+            annual_salary_escalation=0.04, allocation_driver="Product revenue share",
+            productivity_driver="None",
+        ),
+    ]
+
+
+class LabourAssumptions(BaseModel):
+    """Consolidated role plan; non-labour OPEX remains in Farming and Costs."""
+
+    items: list[LabourPlanItem] = Field(default_factory=_default_labour_items)
+
+
 class FarmingAssumptions(BaseModel):
     sugarcane_yield_tonnes_per_hectare: float = Field(default=70.0, gt=0.0)
     harvest_recovery: float = Field(default=0.98, gt=0.0, le=1.0)
@@ -257,6 +428,7 @@ class SugarcaneBioethanolInputs(BaseModel):
     cycle_planning: CyclePlanningAssumptions = Field(default_factory=CyclePlanningAssumptions)
     farm_planning: FarmPlanningAssumptions = Field(default_factory=FarmPlanningAssumptions)
     farming: FarmingAssumptions = Field(default_factory=FarmingAssumptions)
+    labour: LabourAssumptions = Field(default_factory=LabourAssumptions)
     sourcing: SourcingAssumptions = Field(default_factory=SourcingAssumptions)
     processing_routing: ProcessingRoutingAssumptions = Field(default_factory=ProcessingRoutingAssumptions)
     commercialization: CommercializationAssumptions = Field(default_factory=CommercializationAssumptions)
@@ -276,6 +448,7 @@ class SugarcaneBioethanolInputs(BaseModel):
                 ("Cycle planning", self.cycle_planning),
                 ("Farm planning", self.farm_planning),
                 ("Farming", self.farming),
+                ("Labour planning", self.labour),
                 ("Sourcing", self.sourcing),
                 ("Processing & production routing", self.processing_routing),
                 ("Commercialization", self.commercialization),

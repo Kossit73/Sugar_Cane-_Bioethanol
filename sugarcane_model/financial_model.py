@@ -19,6 +19,7 @@ from .schedules import (
     CapexOutput,
     DebtOutput,
     FinancialOutput,
+    LabourOutput,
     ScheduleOutput,
     compute_capex_schedule,
     compute_commercialization,
@@ -28,6 +29,7 @@ from .schedules import (
     compute_debt_schedule,
     compute_farm_planning_schedule,
     compute_farming_schedule,
+    compute_labour_schedule,
     compute_financials,
     compute_sizing_cfads,
     compute_processing_routing,
@@ -104,6 +106,55 @@ class SugarcaneBioethanolModel:
         if farm_plan_errors:
             raise ValueError(" ".join(farm_plan_errors))
 
+        role_ids: set[str] = set()
+        for item in inputs.labour.items:
+            role_id = item.role_id.strip()
+            normalized_role_id = role_id.casefold()
+            if normalized_role_id in role_ids:
+                raise ValueError(
+                    f"Labour role IDs must be unique; duplicate '{role_id}'."
+                )
+            role_ids.add(normalized_role_id)
+            try:
+                labour_start = pd.Period(item.start_month, freq="M")
+                end_value = (item.end_month or "").strip()
+                labour_end = (
+                    pd.Period(end_value, freq="M")
+                    if end_value
+                    else projection_end
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Labour role '{role_id}' must use YYYY-MM start/end months."
+                ) from exc
+            if labour_end < labour_start:
+                raise ValueError(
+                    f"Labour role '{role_id}' ends before it starts."
+                )
+            if labour_start > projection_end or labour_end < projection_start:
+                raise ValueError(
+                    f"Labour role '{role_id}' does not overlap the projection horizon."
+                )
+            if item.component == "Shared Plant" and item.allocation_driver == "Direct":
+                raise ValueError(
+                    f"Shared labour role '{role_id}' requires a product allocation driver."
+                )
+            if item.component != "Shared Plant" and item.allocation_driver != "Direct":
+                raise ValueError(
+                    f"Direct labour role '{role_id}' must use the Direct allocation driver."
+                )
+            if item.allocation_driver == "Custom product share":
+                custom_total = (
+                    item.bioethanol_share
+                    + item.sugar_share
+                    + item.electricity_share
+                    + item.bagasse_share
+                    + item.animal_feed_share
+                )
+                if abs(custom_total - 1.0) > 1e-9:
+                    raise ValueError(
+                        f"Custom labour allocation for '{role_id}' must sum to 100%."
+                    )
         routing = inputs.processing_routing
         bagasse_share = (
             routing.bagasse_to_electricity_share
@@ -148,8 +199,11 @@ class SugarcaneBioethanolModel:
         commercialization: ScheduleOutput = compute_commercialization(
             self.input_page, processing
         )
+        labour: LabourOutput = compute_labour_schedule(
+            self.input_page, farm_plan, farming, processing, commercialization
+        )
         costs: ScheduleOutput = compute_cost_schedule(
-            self.input_page, farming, sourcing, processing
+            self.input_page, farming, sourcing, processing, labour
         )
         capex: CapexOutput = compute_capex_schedule(
             self.input_page, scenario_name, sourcing, construction
@@ -173,6 +227,7 @@ class SugarcaneBioethanolModel:
             processing,
             commercialization,
             costs,
+            labour,
             capex,
             debt,
             working_capital,
@@ -188,6 +243,7 @@ class SugarcaneBioethanolModel:
             "sourcing": sourcing,
             "processing": processing,
             "commercialization": commercialization,
+            "labour": labour,
             "costs": costs,
             "capex": capex,
             "debt": debt,
@@ -218,6 +274,8 @@ class SugarcaneBioethanolModel:
                     "FarmShareTarget": metrics.get("farm_share_target"),
                     "ActualFarmShare": metrics.get("farm_share"),
                     "TotalCapex": metrics.get("total_capex"),
+                    "TotalLabourCost": metrics.get("total_labour_cost"),
+                    "PeakFTE": metrics.get("peak_headcount_fte"),
                     "ProjectNPV": metrics.get("project_npv"),
                     "ProjectIRR": metrics.get("project_irr"),
                     "EquityIRR": metrics.get("equity_irr"),

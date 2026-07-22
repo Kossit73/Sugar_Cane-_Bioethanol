@@ -77,6 +77,13 @@ def _table_bundle(build: dict[str, Any], comparison: pd.DataFrame) -> dict[str, 
         "Farm Planning Annual": build["farm_plan"].annual,
         "Farming Monthly": build["farming"].monthly,
         "Farming Annual": build["farming"].annual,
+        "Labour Plan Items": build["labour"].item_schedule,
+        "Labour Monthly Summary": build["labour"].monthly,
+        "Labour Annual Summary": build["labour"].annual,
+        "Labour Monthly Detail": build["labour"].monthly_detail,
+        "Labour Annual Detail": build["labour"].annual_detail,
+        "Labour Allocation Monthly": build["labour"].allocation_monthly,
+        "Labour Allocation Annual": build["labour"].allocation_annual,
         "Sourcing Monthly": build["sourcing"].monthly,
         "Sourcing Annual": build["sourcing"].annual,
         "Processing Routing Monthly": build["processing"].monthly,
@@ -170,8 +177,8 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
     "farming": [
         ("sugarcane_yield_tonnes_per_hectare", "Cane yield (t/ha)", 1.0, "%.1f", float),
         ("harvest_recovery", "Harvest recovery", 0.01, "%.2f", float),
-        ("farm_opex_per_tonne", "Farm OPEX (USD/t)", 1.0, "%.2f", float),
-        ("farm_overhead_per_year", "Farm overhead (USD/year)", 25_000.0, "%.0f", float),
+        ("farm_opex_per_tonne", "Farm non-labour OPEX (USD/t)", 1.0, "%.2f", float),
+        ("farm_overhead_per_year", "Farm non-labour overhead (USD/year)", 25_000.0, "%.0f", float),
         ("internal_transfer_price_per_tonne", "Internal cane transfer price (USD/t)", 1.0, "%.2f", float),
     ],
     "sourcing": [
@@ -211,8 +218,8 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
         ("electricity_variable_cost_per_mwh", "Electricity variable cost (USD/MWh)", 1.0, "%.2f", float),
         ("bagasse_handling_cost_per_tonne", "Bagasse handling cost (USD/t)", 0.5, "%.2f", float),
         ("animal_feed_variable_cost_per_tonne", "Animal feed variable cost (USD/t)", 2.0, "%.2f", float),
-        ("fixed_processing_opex_per_year", "Fixed processing OPEX (USD/year)", 100_000.0, "%.0f", float),
-        ("commercial_and_admin_cost_per_year", "Commercial & admin (USD/year)", 50_000.0, "%.0f", float),
+        ("fixed_processing_opex_per_year", "Fixed non-labour processing OPEX (USD/year)", 100_000.0, "%.0f", float),
+        ("commercial_and_admin_cost_per_year", "Non-labour commercial & admin (USD/year)", 50_000.0, "%.0f", float),
     ],
     "working_capital": [
         ("receivable_days", "Receivable days", 1.0, "%.1f", float),
@@ -250,6 +257,130 @@ _ADDITIONAL_DEBT_COLUMNS = [
     "capitalize_idc",
 ]
 
+_LABOUR_COLUMNS = [
+    "role_id",
+    "cost_centre",
+    "department",
+    "position",
+    "worker_type",
+    "component",
+    "start_month",
+    "end_month",
+    "headcount_fte",
+    "number_of_shifts",
+    "monthly_wage_per_fte",
+    "overtime_rate",
+    "benefits_rate",
+    "statutory_contribution_rate",
+    "training_cost_per_fte_year",
+    "ppe_cost_per_fte_year",
+    "transport_cost_per_fte_month",
+    "accommodation_cost_per_fte_month",
+    "annual_salary_escalation",
+    "allocation_driver",
+    "productivity_driver",
+    "bioethanol_share",
+    "sugar_share",
+    "electricity_share",
+    "bagasse_share",
+    "animal_feed_share",
+]
+
+
+def _render_labour_editor(st, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    frame = pd.DataFrame(payload["labour"].get("items", []), columns=_LABOUR_COLUMNS)
+    rate_help = "Enter a decimal rate; for example, 0.08 means 8%."
+    editor = st.data_editor(
+        frame,
+        column_config={
+            "role_id": st.column_config.TextColumn("Role ID", required=True),
+            "cost_centre": st.column_config.TextColumn("Cost centre", required=True),
+            "department": st.column_config.TextColumn("Department", required=True),
+            "position": st.column_config.TextColumn("Position", required=True),
+            "worker_type": st.column_config.SelectboxColumn(
+                "Worker type", required=True,
+                options=("Permanent", "Seasonal", "Contract"),
+            ),
+            "component": st.column_config.SelectboxColumn(
+                "Component", required=True,
+                options=(
+                    "Farming", "Bioethanol", "Sugar", "Electricity Generation",
+                    "Bagasse", "Animal Feed", "Shared Plant",
+                ),
+            ),
+            "start_month": st.column_config.TextColumn(
+                "Start month", required=True, help="YYYY-MM"
+            ),
+            "end_month": st.column_config.TextColumn(
+                "End month", help="Optional YYYY-MM; blank means the model end."
+            ),
+            "headcount_fte": st.column_config.NumberColumn(
+                "Headcount / FTE", required=True, min_value=0.0, step=1.0, format="%.2f"
+            ),
+            "number_of_shifts": st.column_config.NumberColumn(
+                "Shifts", required=True, min_value=1, max_value=4, step=1, format="%d"
+            ),
+            "monthly_wage_per_fte": st.column_config.NumberColumn(
+                "Monthly wage / FTE", required=True, min_value=0.0, step=100.0, format="%.2f"
+            ),
+            "overtime_rate": st.column_config.NumberColumn(
+                "Overtime rate", required=True, min_value=0.0, max_value=2.0,
+                step=0.01, format="%.2f", help=rate_help,
+            ),
+            "benefits_rate": st.column_config.NumberColumn(
+                "Benefits rate", required=True, min_value=0.0, max_value=1.0,
+                step=0.01, format="%.2f", help=rate_help,
+            ),
+            "statutory_contribution_rate": st.column_config.NumberColumn(
+                "Statutory rate", required=True, min_value=0.0, max_value=1.0,
+                step=0.01, format="%.2f", help=rate_help,
+            ),
+            "training_cost_per_fte_year": st.column_config.NumberColumn(
+                "Training / FTE / year", min_value=0.0, step=100.0, format="%.2f"
+            ),
+            "ppe_cost_per_fte_year": st.column_config.NumberColumn(
+                "PPE / FTE / year", min_value=0.0, step=100.0, format="%.2f"
+            ),
+            "transport_cost_per_fte_month": st.column_config.NumberColumn(
+                "Transport / FTE / month", min_value=0.0, step=25.0, format="%.2f"
+            ),
+            "accommodation_cost_per_fte_month": st.column_config.NumberColumn(
+                "Accommodation / FTE / month", min_value=0.0, step=25.0, format="%.2f"
+            ),
+            "annual_salary_escalation": st.column_config.NumberColumn(
+                "Annual salary escalation", required=True, min_value=-0.5, max_value=1.0,
+                step=0.01, format="%.2f", help=rate_help,
+            ),
+            "allocation_driver": st.column_config.SelectboxColumn(
+                "Allocation driver", required=True,
+                options=("Direct", "Product revenue share", "Equal product share", "Custom product share"),
+            ),
+            "productivity_driver": st.column_config.SelectboxColumn(
+                "Productivity driver", required=True,
+                options=(
+                    "None", "Cultivated hectares", "Harvested hectares", "Farm cane tonnes",
+                    "Cane processed tonnes", "Bioethanol litres", "Sugar tonnes",
+                    "Electricity MWh", "Bagasse tonnes", "Animal feed tonnes",
+                ),
+            ),
+            **{
+                key: st.column_config.NumberColumn(
+                    label, min_value=0.0, max_value=1.0, step=0.05,
+                    format="%.2f", help="Used only for Custom product share allocation."
+                )
+                for key, label in (
+                    ("bioethanol_share", "Bioethanol share"), ("sugar_share", "Sugar share"),
+                    ("electricity_share", "Power share"), ("bagasse_share", "Bagasse share"),
+                    ("animal_feed_share", "Animal feed share"),
+                )
+            },
+        },
+        use_container_width=True,
+        num_rows="dynamic",
+        key="sugarcane_labour_plan_editor",
+    )
+    return editor.where(pd.notna(editor), None).to_dict(orient="records")
+
 
 def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
     updated = dict(values)
@@ -271,7 +402,7 @@ def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
 class SugarcaneBioethanolPlugin:
     slug = "sugar-cane-bioethanol"
     name = "Sugar Cane Bioethanol Financial Model"
-    version = "2.3.0"
+    version = "2.4.0"
     description = (
         "Integrated farm-to-market Sugar Cane model with Cassava-style modular "
         "assumptions, operating schedules, component economics, and consolidated statements."
@@ -289,6 +420,7 @@ class SugarcaneBioethanolPlugin:
         "COD-gated construction and operations",
         "DSCR sizing, LLCR/PLCR, and covenant schedule",
         "DSRA, maintenance reserve, and liquidity waterfall",
+        "Consolidated role-based labour planning and allocation",
     ]
     minimum_tier = SubscriptionTier.PRO
     bundle = None
@@ -363,6 +495,14 @@ class SugarcaneBioethanolPlugin:
                 )
             with st.expander("Farming"):
                 farming_values = _number_grid(st, "farming", payload["farming"])
+            with st.expander("Labour planning"):
+                st.caption(
+                    "Enter every role once. Shared plant roles are allocated to products by the "
+                    "selected driver; farming, processing, and admin OPEX inputs exclude labour."
+                )
+                labour_items = _render_labour_editor(st, payload)
+                st.caption("Role IDs must be unique. Custom product shares must total 1.00.")
+
             with st.expander("Sourcing"):
                 sourcing_values = _number_grid(st, "sourcing", payload["sourcing"])
             with st.expander("Processing & production routing"):
@@ -481,6 +621,7 @@ class SugarcaneBioethanolPlugin:
                     "cycle_planning": cycle_values,
                     "farm_planning": farm_plan_values,
                     "farming": farming_values,
+                    "labour": {"items": labour_items},
                     "sourcing": sourcing_values,
                     "processing_routing": routing_values,
                     "commercialization": commercial_values,
@@ -578,6 +719,37 @@ class SugarcaneBioethanolPlugin:
             st.subheader("Annual farming and sourcing")
             st.dataframe(result._tables["Farming Annual"].reset_index(), use_container_width=True, hide_index=True)
             st.dataframe(result._tables["Sourcing Annual"].reset_index(), use_container_width=True, hide_index=True)
+            st.subheader("Consolidated labour planning")
+            labour_metrics = st.columns(4)
+            labour_metrics[0].metric(
+                "Lifecycle labour cost", _money(metrics.get("total_labour_cost"))
+            )
+            labour_metrics[1].metric(
+                "Average FTE", f"{metrics.get('average_headcount_fte', 0.0):,.1f}"
+            )
+            labour_metrics[2].metric(
+                "Peak FTE", f"{metrics.get('peak_headcount_fte', 0.0):,.1f}"
+            )
+            labour_metrics[3].metric(
+                "Planned roles", f"{metrics.get('labour_role_count', 0):,.0f}"
+            )
+            st.dataframe(
+                result._tables["Labour Annual Summary"].reset_index(),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.subheader("Annual labour by role")
+            st.dataframe(
+                result._tables["Labour Annual Detail"],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.subheader("Shared and direct labour allocation")
+            st.dataframe(
+                result._tables["Labour Allocation Annual"],
+                use_container_width=True,
+                hide_index=True,
+            )
         with components:
             selected = st.selectbox("Component", COMPONENTS)
             component_frame = pd.DataFrame(result.component_financials)
