@@ -76,10 +76,6 @@ def main() -> None:
 
     reports_ui.render_report_downloads = _render_report_downloads
     st.markdown("## Sugar Cane Bioethanol")
-    st.caption(
-        "Cassava-style modular architecture for farming, sourcing, multi-product "
-        "routing, component financials, and consolidated statements."
-    )
     MODEL.render(user=_current_user())
 
 

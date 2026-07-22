@@ -450,10 +450,6 @@ class SugarcaneBioethanolPlugin:
         payload = input_values(defaults)
 
         st.subheader(self.name)
-        st.caption(
-            "Cassava-style architecture: grouped assumptions → operating schedules → "
-            "component financials → consolidated statements."
-        )
         with st.form("sugarcane_refactored_inputs"):
             with st.expander("Global assumptions", expanded=True):
                 global_values = _number_grid(st, "global_assumptions", payload["global_assumptions"])
