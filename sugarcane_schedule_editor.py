@@ -13,7 +13,12 @@ from sugarcane_model.driver_schedules import (
     schedule_rows,
     validate_driver_schedules,
 )
-from sugarcane_model.inputs import CapexItem, input_from_payload, input_values
+from sugarcane_model.inputs import (
+    CapexItem,
+    input_from_payload,
+    input_values,
+    validate_farm_planning_values,
+)
 from sugarcane_model.schedule_workspace import (
     ROW_ID,
     add_capex_row,
@@ -38,6 +43,7 @@ _FLASH_KEY = "_sugarcane_schedule_workspace_flash"
 _DEFAULT_INCREMENT_FIELDS = {
     "other_assumptions": ["plant_availability"],
     "cycle_planning": ["replant_share_per_cycle"],
+    "farm_planning": list(SCHEDULE_DEFINITIONS["farm_planning"]["fields"]),
     "farming": ["sugarcane_yield_tonnes_per_hectare", "farm_opex_per_tonne", "farm_overhead_per_year", "internal_transfer_price_per_tonne"],
     "sourcing": ["cane_purchase_price_per_tonne", "logistics_cost_per_tonne"],
     "processing_routing": ["annual_cane_capacity_tonnes", "ethanol_litres_per_tonne", "sugar_tonnes_per_tonne", "raw_bagasse_tonnes_per_tonne", "electricity_mwh_per_tonne_bagasse"],
@@ -212,6 +218,10 @@ def _validate_row(inputs, schedule_key: str, candidate: dict[str, Any]) -> list[
     end = int(inputs.global_assumptions.end_year)
     if year < start or year > end:
         return [f"Year must be within the projection horizon ({start}-{end})."]
+    if schedule_key == "farm_planning":
+        farm_plan_errors = validate_farm_planning_values(clean)
+        if farm_plan_errors:
+            return farm_plan_errors
     if schedule_key == "processing_routing":
         routed = sum(
             float(clean[field])
@@ -293,6 +303,11 @@ def render_schedule_workspace(
             key="sugarcane_schedule_workspace_table",
         )
         schedule_key = schedule_by_label[str(schedule_label)]
+        if schedule_key == "farm_planning":
+            st.caption(
+                "Rain-fed hectares, fallow/reserve land, and replanted hectares are "
+                "calculated and shown in the Farm Planning output schedule."
+            )
         draft = _draft(st, inputs, schedule_key)
         revisions = _state_dict(st, _REVISION_KEY)
         revision = int(revisions.get(schedule_key, 0))

@@ -8,7 +8,13 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .driver_schedules import validate_driver_schedules
-from .inputs import SCENARIOS, SugarcaneBioethanolInputs, default_input_page
+from .inputs import (
+    SCENARIOS,
+    SugarcaneBioethanolInputs,
+    default_input_page,
+    input_values,
+    validate_farm_planning_values,
+)
 from .schedules import (
     CapexOutput,
     DebtOutput,
@@ -19,6 +25,7 @@ from .schedules import (
     compute_cost_schedule,
     compute_cycle_plan,
     compute_debt_schedule,
+    compute_farm_planning_schedule,
     compute_farming_schedule,
     compute_financials,
     compute_processing_routing,
@@ -82,6 +89,10 @@ class SugarcaneBioethanolModel:
             raise ValueError(
                 "Establishment and harvest windows cannot exceed the crop cycle."
             )
+        farm_plan_errors = validate_farm_planning_values(input_values(inputs.farm_planning))
+        if farm_plan_errors:
+            raise ValueError(" ".join(farm_plan_errors))
+
         routing = inputs.processing_routing
         bagasse_share = (
             routing.bagasse_to_electricity_share
@@ -110,8 +121,11 @@ class SugarcaneBioethanolModel:
             return copy.deepcopy(cached[1])
 
         cycle_plan: ScheduleOutput = compute_cycle_plan(self.input_page)
+        farm_plan: ScheduleOutput = compute_farm_planning_schedule(
+            self.input_page, cycle_plan
+        )
         farming: ScheduleOutput = compute_farming_schedule(
-            self.input_page, scenario_name, cycle_plan
+            self.input_page, scenario_name, cycle_plan, farm_plan
         )
         sourcing: ScheduleOutput = compute_sourcing_schedule(
             self.input_page, scenario_name, farming, cycle_plan
@@ -125,7 +139,9 @@ class SugarcaneBioethanolModel:
         costs: ScheduleOutput = compute_cost_schedule(
             self.input_page, farming, sourcing, processing
         )
-        capex: CapexOutput = compute_capex_schedule(self.input_page, scenario_name)
+        capex: CapexOutput = compute_capex_schedule(
+            self.input_page, scenario_name, sourcing
+        )
         debt: DebtOutput = compute_debt_schedule(self.input_page, capex)
         working_capital: ScheduleOutput = compute_working_capital(
             self.input_page, commercialization, costs
@@ -134,6 +150,7 @@ class SugarcaneBioethanolModel:
             self.input_page,
             scenario_name,
             farming,
+            farm_plan,
             sourcing,
             processing,
             commercialization,
@@ -147,6 +164,7 @@ class SugarcaneBioethanolModel:
             "scenario": scenario_name,
             "input_page_snapshot": copy.deepcopy(self.input_page),
             "cycle_plan": cycle_plan,
+            "farm_plan": farm_plan,
             "farming": farming,
             "sourcing": sourcing,
             "processing": processing,
@@ -176,7 +194,8 @@ class SugarcaneBioethanolModel:
             rows.append(
                 {
                     "Scenario": scenario,
-                    "FarmShare": metrics.get("farm_share"),
+                    "FarmShareTarget": metrics.get("farm_share_target"),
+                    "ActualFarmShare": metrics.get("farm_share"),
                     "TotalCapex": metrics.get("total_capex"),
                     "ProjectNPV": metrics.get("project_npv"),
                     "ProjectIRR": metrics.get("project_irr"),

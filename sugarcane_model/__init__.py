@@ -5,6 +5,7 @@ from .inputs import (
     SCENARIOS,
     DebtFacilityAssumptions,
     SugarcaneBioethanolInputs,
+    FarmPlanningAssumptions,
     default_input_page,
     input_from_payload,
     input_values,
@@ -13,6 +14,7 @@ from .inputs import (
 __all__ = [
     "SCENARIOS",
     "DebtFacilityAssumptions",
+    "FarmPlanningAssumptions",
     "SugarcaneBioethanolInputs",
     "SugarcaneBioethanolModel",
     "default_input_page",

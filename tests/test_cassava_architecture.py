@@ -31,6 +31,7 @@ def test_grouped_inputs_match_the_cassava_architecture() -> None:
         "Other assumptions",
         "Capex",
         "Cycle planning",
+        "Farm planning",
         "Farming",
         "Sourcing",
         "Processing & production routing",
@@ -49,9 +50,12 @@ def test_farm_buy_and_hybrid_scenarios_route_cane_and_capex() -> None:
     assert hybrid["sourcing"].annual["FarmCaneTonnes"].sum() > 0
     assert hybrid["sourcing"].annual["PurchasedCaneTonnes"].sum() > 0
     assert buy["sourcing"].annual["FarmCaneTonnes"].sum() == 0
-    assert farm["metrics"]["farm_share"] == 1.0
-    assert hybrid["metrics"]["farm_share"] == 0.5
-    assert buy["metrics"]["farm_share"] == 0.0
+    assert farm["metrics"]["farm_share"] == pytest.approx(1.0)
+    assert hybrid["metrics"]["farm_share"] == pytest.approx(0.5)
+    assert buy["metrics"]["farm_share"] == pytest.approx(0.0)
+    assert farm["metrics"]["farm_share_target"] == 1.0
+    assert hybrid["metrics"]["farm_share_target"] == 0.5
+    assert buy["metrics"]["farm_share_target"] == 0.0
     assert farm["metrics"]["total_capex"] == pytest.approx(37_500_000.0)
     assert hybrid["metrics"]["total_capex"] == pytest.approx(35_000_000.0)
     assert buy["metrics"]["total_capex"] == pytest.approx(32_500_000.0)
