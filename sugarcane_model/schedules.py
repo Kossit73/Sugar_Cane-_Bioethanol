@@ -49,6 +49,9 @@ class DebtOutput(ScheduleOutput):
     summary: pd.DataFrame
     facility_monthly: pd.DataFrame
     facility_annual: pd.DataFrame
+    contractual_maturity: pd.Timestamp
+    repayment_start: pd.Timestamp
+    model_horizon_covers_tail: bool
 
 
 @dataclass
@@ -62,6 +65,9 @@ class FinancialOutput:
     component_monthly: pd.DataFrame
     component_annual: pd.DataFrame
     reconciliation: pd.DataFrame
+    covenant_schedule: pd.DataFrame
+    liquidity_monthly: pd.DataFrame
+    liquidity_annual: pd.DataFrame
     checks: pd.DataFrame
     metrics: dict[str, Any]
 
@@ -89,11 +95,16 @@ def _scenario_farm_share_target(inputs: SugarcaneBioethanolInputs, scenario: str
     return float(inputs.global_assumptions.hybrid_farm_share)
 
 
-def _depreciation(spend: np.ndarray, life_months: int) -> np.ndarray:
+def _depreciation(
+    spend: np.ndarray,
+    life_months: int,
+    *,
+    in_service_index: int = 0,
+) -> np.ndarray:
     result = np.zeros(len(spend), dtype=float)
     life = max(1, int(life_months))
     for month, amount in enumerate(spend):
-        first = month + 1
+        first = max(month + 1, in_service_index)
         last = min(len(spend), first + life)
         if amount > 0 and first < last:
             result[first:last] += amount / life
@@ -120,6 +131,86 @@ def build_timeline(inputs: SugarcaneBioethanolInputs) -> pd.DatetimeIndex:
         f"{global_inputs.end_year}-12-01",
         freq="MS",
     )
+
+
+def effective_cod_date(inputs: SugarcaneBioethanolInputs) -> pd.Timestamp:
+    """Return the delayed commercial-operations date as a month-start timestamp."""
+
+    scheduled = pd.Period(inputs.construction.scheduled_cod, freq="M")
+    return (scheduled + inputs.construction.construction_delay_months).to_timestamp()
+
+
+def compute_construction_schedule(
+    inputs: SugarcaneBioethanolInputs,
+) -> ScheduleOutput:
+    """Build the single source of truth for construction, COD, and operating ramp."""
+
+    dates = build_timeline(inputs)
+    scheduled_cod = pd.Period(
+        inputs.construction.scheduled_cod, freq="M"
+    ).to_timestamp()
+    effective_cod = effective_cod_date(inputs)
+    planning_start = pd.Period(
+        inputs.global_assumptions.planning_start, freq="M"
+    ).to_timestamp()
+    operating_start = max(effective_cod, planning_start)
+    commissioning_start = (
+        pd.Period(effective_cod, freq="M")
+        - inputs.construction.commissioning_months
+    ).to_timestamp()
+    operational = np.asarray(dates >= operating_start)
+    months_from_cod = (
+        (dates.year - operating_start.year) * 12
+        + dates.month
+        - operating_start.month
+    ).to_numpy(dtype=int)
+    operating_year = np.maximum(months_from_cod, 0) // 12
+    ramp_year_1 = parameter_series(
+        inputs, "other_assumptions", "startup_ramp_year_1", dates
+    )
+    ramp_year_2 = parameter_series(
+        inputs, "other_assumptions", "startup_ramp_year_2", dates
+    )
+    ramp = np.where(
+        operational,
+        np.where(
+            operating_year == 0,
+            ramp_year_1,
+            np.where(operating_year == 1, ramp_year_2, 1.0),
+        ),
+        0.0,
+    )
+    phase = np.where(
+        operational,
+        "Operating",
+        np.where(dates >= commissioning_start, "Commissioning", "Construction"),
+    )
+    monthly = pd.DataFrame(
+        {
+            "ScheduledCOD": scheduled_cod,
+            "EffectiveCOD": effective_cod,
+            "OperatingStart": operating_start,
+            "ConstructionDelayMonths": inputs.construction.construction_delay_months,
+            "CommissioningMonths": inputs.construction.commissioning_months,
+            "Phase": phase,
+            "OperationalFlag": operational.astype(int),
+            "OperatingMonth": np.where(operational, months_from_cod + 1, 0),
+            "RampFactor": ramp,
+        },
+        index=dates,
+    )
+    annual = monthly.groupby(dates.year).agg(
+        ScheduledCOD=("ScheduledCOD", "last"),
+        EffectiveCOD=("EffectiveCOD", "last"),
+        OperatingStart=("OperatingStart", "last"),
+        ConstructionDelayMonths=("ConstructionDelayMonths", "last"),
+        CommissioningMonths=("CommissioningMonths", "last"),
+        OperatingMonths=("OperationalFlag", "sum"),
+        AverageRamp=("RampFactor", "mean"),
+        ClosingPhase=("Phase", "last"),
+    )
+    annual.index.name = "Year"
+    return ScheduleOutput(monthly=monthly, annual=annual)
 
 
 def compute_cycle_plan(inputs: SugarcaneBioethanolInputs) -> ScheduleOutput:
@@ -158,31 +249,17 @@ def compute_cycle_plan(inputs: SugarcaneBioethanolInputs) -> ScheduleOutput:
         ),
         "Pre-operational",
     )
-    operating_year = operating_month // 12
-    ramp_year_1 = parameter_series(
-        inputs, "other_assumptions", "startup_ramp_year_1", dates
-    )
-    ramp_year_2 = parameter_series(
-        inputs, "other_assumptions", "startup_ramp_year_2", dates
-    )
-    ramp = np.where(
-        active,
-        np.where(operating_year == 0, ramp_year_1, np.where(operating_year == 1, ramp_year_2, 1.0)),
-        0.0,
-    )
     monthly = pd.DataFrame(
         {
             "CycleNumber": np.where(active, operating_month // crop_cycle + 1, 0),
             "CycleMonth": np.where(active, cycle_month, 0),
             "Phase": phases,
-            "RampFactor": ramp,
             "ReplantShare": np.where(active & (cycle_month == 1), replant_share, 0.0),
         },
         index=dates,
     )
     annual = monthly.groupby(monthly.index.year).agg(
         Cycles=("CycleNumber", "max"),
-        AverageRamp=("RampFactor", "mean"),
         ReplantEvents=("ReplantShare", lambda values: int((values > 0).sum())),
     )
     annual.index.name = "Year"
@@ -281,6 +358,7 @@ def compute_farming_schedule(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
     cycle_plan: ScheduleOutput,
+    construction: ScheduleOutput,
     farm_plan: ScheduleOutput,
 ) -> ScheduleOutput:
     dates = cycle_plan.monthly.index
@@ -301,7 +379,7 @@ def compute_farming_schedule(
         inputs, "farming", "internal_transfer_price_per_tonne", dates
     )
     processing_target = (
-        capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
+        capacity * availability * construction.monthly["RampFactor"].to_numpy() / 12.0
     )
     farm_available = farm_plan.monthly["FarmCaneAvailableTonnes"].to_numpy()
     farm_operating = (
@@ -371,6 +449,7 @@ def compute_sourcing_schedule(
     scenario: str,
     farming: ScheduleOutput,
     cycle_plan: ScheduleOutput,
+    construction: ScheduleOutput,
 ) -> ScheduleOutput:
     dates = farming.monthly.index
     capacity = parameter_series(
@@ -380,7 +459,7 @@ def compute_sourcing_schedule(
         inputs, "other_assumptions", "plant_availability", dates
     )
     processing_target = (
-        capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
+        capacity * availability * construction.monthly["RampFactor"].to_numpy() / 12.0
     )
     farm_cane_processed = farming.monthly["FarmCaneProcessedTonnes"].to_numpy()
     if scenario.upper() == "FARM_ONLY":
@@ -622,8 +701,11 @@ def compute_capex_schedule(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
     sourcing: ScheduleOutput,
+    construction: ScheduleOutput,
 ) -> CapexOutput:
-    dates = build_timeline(inputs)
+    dates = construction.monthly.index
+    effective_cod = effective_cod_date(inputs)
+    cod_index = int(np.searchsorted(dates.values, effective_cod.to_datetime64()))
     total_processed_cane = float(sourcing.monthly["TotalCaneTonnes"].sum())
     farm_capex_share = (
         float(sourcing.monthly["FarmCaneProcessedTonnes"].sum())
@@ -651,7 +733,9 @@ def compute_capex_schedule(
         if spend_months > 0:
             spend[start_index : start_index + spend_months] = amount / spend_months
         capex_by_component[item.component] += spend
-        depreciation_by_component[item.component] += _depreciation(spend, item.life_years * 12)
+        depreciation_by_component[item.component] += _depreciation(
+            spend, item.life_years * 12, in_service_index=cod_index
+        )
         rows.append(
             {
                 "Item": item.item,
@@ -661,6 +745,7 @@ def compute_capex_schedule(
                 "SpendMonths": item.spend_months,
                 "LifeYears": item.life_years,
                 "IsFarmCapex": item.is_farm_capex,
+                "InServiceMonth": max(effective_cod, start + pd.offsets.MonthBegin(item.spend_months)),
             }
         )
 
@@ -678,40 +763,107 @@ def compute_capex_schedule(
     )
 
 
+def _month_distance(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    return (end.year - start.year) * 12 + end.month - start.month
+
+
+def _contractual_debt_dates(
+    cod: pd.Timestamp,
+    *,
+    tenor_years: int,
+    grace_years: int,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    cod_period = pd.Period(cod, freq="M")
+    repayment_start = (cod_period + grace_years * 12).to_timestamp()
+    maturity = (cod_period + tenor_years * 12 - 1).to_timestamp()
+    return repayment_start, maturity
+
+
+def _covenant_period_keys(
+    dates: pd.DatetimeIndex,
+    period: str,
+) -> np.ndarray:
+    if period == "monthly":
+        return np.asarray([date.strftime("%Y-%m") for date in dates], dtype=object)
+    if period == "quarterly":
+        return np.asarray(
+            [f"{date.year}-Q{((date.month - 1) // 3) + 1}" for date in dates],
+            dtype=object,
+        )
+    if period == "semiannual":
+        return np.asarray(
+            [f"{date.year}-H{1 if date.month <= 6 else 2}" for date in dates],
+            dtype=object,
+        )
+    return np.asarray([str(date.year) for date in dates], dtype=object)
+
+
+def _period_end_mask(keys: np.ndarray) -> np.ndarray:
+    return np.asarray(
+        [index == len(keys) - 1 or keys[index + 1] != key for index, key in enumerate(keys)],
+        dtype=bool,
+    )
+
+
 def _build_facility_schedule(
     dates: pd.DatetimeIndex,
     draws: np.ndarray,
     *,
+    cod: pd.Timestamp,
     annual_interest_rates: np.ndarray,
     tenor_years: int,
     grace_years: int,
     amortization_type: str,
     capitalize_idc: bool,
+    covenant_keys: np.ndarray | None = None,
+    debt_service_capacity: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Build one loan schedule; every facility uses this shared engine."""
+    """Build one COD-anchored loan without compressing tenor to the model horizon."""
+
     months = len(dates)
     monthly_rates = np.asarray(annual_interest_rates, dtype=float) / 12.0
-    grace = min(grace_years * 12, months)
-    maturity = min(tenor_years * 12, months)
+    repayment_start, maturity = _contractual_debt_dates(
+        cod, tenor_years=tenor_years, grace_years=grace_years
+    )
     opening = np.zeros(months)
     interest = np.zeros(months)
     idc = np.zeros(months)
     cash_interest = np.zeros(months)
     principal = np.zeros(months)
     closing = np.zeros(months)
+    capacity = (
+        np.asarray(debt_service_capacity, dtype=float)
+        if debt_service_capacity is not None
+        else None
+    )
+    keys = (
+        np.asarray(covenant_keys, dtype=object)
+        if covenant_keys is not None
+        else np.asarray([date.strftime("%Y-%m") for date in dates], dtype=object)
+    )
+    period_end = _period_end_mask(keys)
+    period_interest = 0.0
     balance = 0.0
 
-    for month in range(months):
+    for month, date in enumerate(dates):
+        if month > 0 and keys[month] != keys[month - 1]:
+            period_interest = 0.0
         monthly_rate = monthly_rates[month]
         opening[month] = balance
         interest[month] = (balance + 0.5 * draws[month]) * monthly_rate
-        if month < grace and capitalize_idc:
+        if date < cod and capitalize_idc:
             idc[month] = interest[month]
         else:
             cash_interest[month] = interest[month]
+            period_interest += cash_interest[month]
         available = balance + draws[month] + idc[month]
-        if month >= grace and month < maturity:
-            remaining = max(1, maturity - month)
+
+        within_repayment = repayment_start <= date <= maturity
+        if within_repayment and capacity is not None and period_end[month]:
+            scheduled = max(0.0, capacity[month] - period_interest)
+            principal[month] = min(available, scheduled)
+        elif within_repayment and capacity is None:
+            remaining = max(1, _month_distance(date, maturity) + 1)
             if amortization_type == "annuity" and monthly_rate > 0:
                 payment = available * monthly_rate / (
                     1.0 - (1.0 + monthly_rate) ** (-remaining)
@@ -720,6 +872,7 @@ def _build_facility_schedule(
             else:
                 scheduled = available / remaining
             principal[month] = min(available, scheduled)
+
         balance = max(0.0, available - principal[month])
         closing[month] = balance
 
@@ -759,87 +912,214 @@ def _annualize_debt_schedule(monthly: pd.DataFrame) -> pd.DataFrame:
     ]
 
 
+def compute_sizing_cfads(
+    inputs: SugarcaneBioethanolInputs,
+    commercial: ScheduleOutput,
+    costs: ScheduleOutput,
+    capex: CapexOutput,
+    working_capital: ScheduleOutput,
+) -> pd.Series:
+    """Conservative pre-financing CFADS used only for debt sizing."""
+
+    dates = commercial.monthly.index
+    revenue = commercial.monthly[list(REVENUE_COLUMNS.values())].sum(axis=1).to_numpy()
+    ebitda = revenue - costs.monthly["EconomicOperatingCost"].to_numpy()
+    depreciation = capex.monthly["TotalDepreciation"].to_numpy()
+    tax = _tax_with_nol(
+        ebitda - depreciation,
+        inputs.global_assumptions.corporate_tax_rate,
+    )
+    nwc = working_capital.monthly["NetWorkingCapital"].to_numpy()
+    delta_nwc = np.diff(nwc, prepend=0.0)
+    return pd.Series(ebitda - tax - delta_nwc, index=dates, name="SizingCFADS")
+
+
+def _sculpting_capacity(
+    dates: pd.DatetimeIndex,
+    sizing_cfads: pd.Series,
+    other_debt_service: pd.Series,
+    *,
+    covenant_period: str,
+    dscr_target: float,
+    cash_sweep_percent: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    keys = _covenant_period_keys(dates, covenant_period)
+    period_end = _period_end_mask(keys)
+    capacity = np.zeros(len(dates))
+    cfads_values = sizing_cfads.reindex(dates, fill_value=0.0).to_numpy(dtype=float)
+    other_values = other_debt_service.reindex(dates, fill_value=0.0).to_numpy(dtype=float)
+    for key in dict.fromkeys(keys):
+        mask = keys == key
+        last = int(np.flatnonzero(mask)[-1])
+        period_cfads = max(0.0, float(cfads_values[mask].sum()))
+        other_service = max(0.0, float(other_values[mask].sum()))
+        target_capacity = max(0.0, period_cfads / max(dscr_target, 1e-9) - other_service)
+        excess_after_target = max(0.0, period_cfads - other_service - target_capacity)
+        capacity[last] = target_capacity + cash_sweep_percent * excess_after_target
+    capacity[~period_end] = 0.0
+    return keys, capacity
+
+
 def compute_debt_schedule(
     inputs: SugarcaneBioethanolInputs,
     capex: CapexOutput,
+    construction: ScheduleOutput,
+    sizing_cfads: pd.Series,
 ) -> DebtOutput:
     dates = capex.monthly.index
     financing = inputs.financing
+    cod = effective_cod_date(inputs)
     debt_ratios = parameter_series(inputs, "financing", "debt_ratio", dates)
-    senior_interest_rates = parameter_series(
-        inputs, "financing", "interest_rate", dates
-    )
+    senior_interest_rates = parameter_series(inputs, "financing", "interest_rate", dates)
     capex_spend = capex.monthly["TotalCapex"].to_numpy(dtype=float)
     total_capex = float(capex_spend.sum())
     if total_capex <= 0:
         raise ValueError("Total CAPEX must be positive before debt can be scheduled.")
 
-    senior_draws = capex_spend * debt_ratios
-    fixed_commitment = sum(
-        facility.amount for facility in financing.additional_debt_facilities
-    )
-    total_commitment = float(senior_draws.sum()) + fixed_commitment
+    capex_profile = capex_spend / total_capex
+    fixed_commitment = sum(facility.amount for facility in financing.additional_debt_facilities)
     tolerance = max(1.0, total_capex * 1e-8)
-    if total_commitment > total_capex + tolerance:
+    if fixed_commitment > total_capex + tolerance:
         raise ValueError(
-            "Combined senior and additional debt commitments "
-            f"(USD {total_commitment:,.0f}) exceed scenario CAPEX "
+            "Additional debt commitments "
+            f"(USD {fixed_commitment:,.0f}) exceed scenario CAPEX "
             f"(USD {total_capex:,.0f})."
         )
 
-    facility_specs: list[dict[str, Any]] = [
-        {
-            "name": "Senior Debt",
-            "facility_type": "Senior (% of CAPEX)",
-            "debt_ratio": float(
-                np.average(
-                    debt_ratios,
-                    weights=np.maximum(capex.monthly["TotalCapex"], 1e-9),
-                )
-            ),
-            "draws": senior_draws,
-            "interest_rates": senior_interest_rates,
-            "summary_interest_rate": float(np.mean(senior_interest_rates)),
-            "tenor_years": financing.tenor_years,
-            "grace_years": financing.grace_years,
-            "amortization_type": financing.amortization_type,
-            "capitalize_idc": financing.capitalize_idc,
-        }
-    ]
-    capex_profile = capex_spend / total_capex
+    additional_specs: list[dict[str, Any]] = []
+    additional_schedules: list[pd.DataFrame] = []
     for facility in financing.additional_debt_facilities:
-        facility_specs.append(
-            {
-                "name": facility.name.strip(),
-                "facility_type": "Additional (fixed amount)",
-                "debt_ratio": np.nan,
-                "draws": capex_profile * facility.amount,
-                "interest_rates": np.full(len(dates), facility.interest_rate),
-                "summary_interest_rate": facility.interest_rate,
-                "tenor_years": facility.tenor_years,
-                "grace_years": facility.grace_years,
-                "amortization_type": facility.amortization_type,
-                "capitalize_idc": facility.capitalize_idc,
-            }
+        spec = {
+            "name": facility.name.strip(),
+            "facility_type": "Additional (fixed amount)",
+            "debt_ratio": np.nan,
+            "draws": capex_profile * facility.amount,
+            "interest_rates": np.full(len(dates), facility.interest_rate),
+            "summary_interest_rate": facility.interest_rate,
+            "tenor_years": facility.tenor_years,
+            "grace_years": facility.grace_years,
+            "amortization_type": facility.amortization_type,
+            "capitalize_idc": facility.capitalize_idc,
+            "sizing_mode": "fixed_amount",
+        }
+        additional_specs.append(spec)
+        additional_schedules.append(
+            _build_facility_schedule(
+                dates,
+                np.asarray(spec["draws"], dtype=float),
+                cod=cod,
+                annual_interest_rates=np.asarray(spec["interest_rates"], dtype=float),
+                tenor_years=int(spec["tenor_years"]),
+                grace_years=int(spec["grace_years"]),
+                amortization_type=str(spec["amortization_type"]),
+                capitalize_idc=bool(spec["capitalize_idc"]),
+            )
         )
 
-    schedules: list[pd.DataFrame] = []
+    other_service = pd.Series(0.0, index=dates)
+    for schedule in additional_schedules:
+        other_service = other_service.add(schedule["DebtService"], fill_value=0.0)
+
+    maximum_senior_commitment = min(
+        float(np.sum(capex_spend * debt_ratios)),
+        max(0.0, total_capex - fixed_commitment),
+    )
+    senior_sizing_mode = financing.debt_sizing_mode
+    if senior_sizing_mode == "dscr_sculpted":
+        dscr_target = float(
+            np.max(parameter_series(inputs, "other_assumptions", "minimum_dscr_target", dates))
+        )
+        covenant_keys, service_capacity = _sculpting_capacity(
+            dates,
+            sizing_cfads,
+            other_service,
+            covenant_period=financing.covenant_period,
+            dscr_target=dscr_target,
+            cash_sweep_percent=financing.cash_sweep_percent,
+        )
+
+        def candidate_schedule(commitment: float) -> pd.DataFrame:
+            return _build_facility_schedule(
+                dates,
+                capex_profile * commitment,
+                cod=cod,
+                annual_interest_rates=senior_interest_rates,
+                tenor_years=financing.tenor_years,
+                grace_years=financing.grace_years,
+                amortization_type="straight",
+                capitalize_idc=financing.capitalize_idc,
+                covenant_keys=covenant_keys,
+                debt_service_capacity=service_capacity,
+            )
+
+        maximum_schedule = candidate_schedule(maximum_senior_commitment)
+        if maximum_schedule["ClosingBalance"].iloc[-1] <= tolerance:
+            senior_commitment = maximum_senior_commitment
+            senior_schedule = maximum_schedule
+        else:
+            low = 0.0
+            high = maximum_senior_commitment
+            senior_schedule = candidate_schedule(0.0)
+            for _ in range(60):
+                midpoint = (low + high) / 2.0
+                candidate = candidate_schedule(midpoint)
+                if candidate["ClosingBalance"].iloc[-1] <= tolerance:
+                    low = midpoint
+                    senior_schedule = candidate
+                else:
+                    high = midpoint
+            senior_commitment = low
+    else:
+        senior_draws = capex_spend * debt_ratios
+        senior_commitment = float(senior_draws.sum())
+        if senior_commitment + fixed_commitment > total_capex + tolerance:
+            raise ValueError(
+                "Combined senior and additional debt commitments "
+                f"(USD {senior_commitment + fixed_commitment:,.0f}) exceed "
+                f"scenario CAPEX (USD {total_capex:,.0f})."
+            )
+        senior_schedule = _build_facility_schedule(
+            dates,
+            senior_draws,
+            cod=cod,
+            annual_interest_rates=senior_interest_rates,
+            tenor_years=financing.tenor_years,
+            grace_years=financing.grace_years,
+            amortization_type=financing.amortization_type,
+            capitalize_idc=financing.capitalize_idc,
+        )
+
+    senior_spec = {
+        "name": "Senior Debt",
+        "facility_type": "Senior (% of CAPEX)",
+        "debt_ratio": senior_commitment / total_capex,
+        "draws": senior_schedule["Draw"].to_numpy(),
+        "interest_rates": senior_interest_rates,
+        "summary_interest_rate": float(np.mean(senior_interest_rates)),
+        "tenor_years": financing.tenor_years,
+        "grace_years": financing.grace_years,
+        "amortization_type": (
+            "sculpted" if senior_sizing_mode == "dscr_sculpted" else financing.amortization_type
+        ),
+        "capitalize_idc": financing.capitalize_idc,
+        "sizing_mode": senior_sizing_mode,
+    }
+    facility_specs = [senior_spec, *additional_specs]
+    schedules = [senior_schedule, *additional_schedules]
+
     monthly_details: list[pd.DataFrame] = []
     annual_details: list[pd.DataFrame] = []
     summary_rows: list[dict[str, Any]] = []
-    for spec in facility_specs:
-        schedule = _build_facility_schedule(
-            dates,
-            np.asarray(spec["draws"], dtype=float),
-            annual_interest_rates=np.asarray(
-                spec["interest_rates"], dtype=float
-            ),
+    repayment_dates: list[pd.Timestamp] = []
+    maturity_dates: list[pd.Timestamp] = []
+    for spec, schedule in zip(facility_specs, schedules):
+        repayment_start, maturity = _contractual_debt_dates(
+            cod,
             tenor_years=int(spec["tenor_years"]),
             grace_years=int(spec["grace_years"]),
-            amortization_type=str(spec["amortization_type"]),
-            capitalize_idc=bool(spec["capitalize_idc"]),
         )
-        schedules.append(schedule)
+        repayment_dates.append(repayment_start)
+        maturity_dates.append(maturity)
         monthly_detail = schedule.copy()
         monthly_detail.insert(0, "Facility", spec["name"])
         monthly_details.append(monthly_detail)
@@ -850,16 +1130,17 @@ def compute_debt_schedule(
             {
                 "Facility": spec["name"],
                 "FacilityType": spec["facility_type"],
+                "SizingMode": spec["sizing_mode"],
                 "DebtRatio": spec["debt_ratio"],
                 "InterestRate": spec["summary_interest_rate"],
                 "TenorYears": spec["tenor_years"],
                 "GraceYears": spec["grace_years"],
+                "RepaymentStart": repayment_start,
+                "ContractualMaturity": maturity,
                 "Amortization": spec["amortization_type"],
                 "CapitalizeIDC": spec["capitalize_idc"],
                 "InitialDraw": float(schedule["Draw"].sum()),
-                "CapitalizedInterest": float(
-                    schedule["CapitalizedInterest"].sum()
-                ),
+                "CapitalizedInterest": float(schedule["CapitalizedInterest"].sum()),
                 "EndingBalance": float(schedule["ClosingBalance"].iloc[-1]),
             }
         )
@@ -872,14 +1153,21 @@ def compute_debt_schedule(
     facility_monthly.index.name = "Date"
     facility_annual = pd.concat(annual_details)
     facility_annual.index.name = "Year"
+    contractual_maturity = max(maturity_dates)
+    repayment_start = min(repayment_dates)
+    required_tail_end = (
+        pd.Period(contractual_maturity, freq="M") + financing.debt_tail_months
+    ).to_timestamp()
     return DebtOutput(
         monthly=monthly,
         annual=annual,
         summary=pd.DataFrame(summary_rows),
         facility_monthly=facility_monthly,
         facility_annual=facility_annual,
+        contractual_maturity=contractual_maturity,
+        repayment_start=repayment_start,
+        model_horizon_covers_tail=bool(dates[-1] >= required_tail_end),
     )
-
 
 def compute_working_capital(
     inputs: SugarcaneBioethanolInputs,
@@ -964,9 +1252,280 @@ def _payback(cashflows: np.ndarray) -> float | None:
     return float((recovered[0] + 1) / 12.0)
 
 
+def _forward_sum(values: np.ndarray, months: int) -> np.ndarray:
+    if months <= 0:
+        return np.zeros(len(values))
+    return np.asarray(
+        [float(values[index : index + months].sum()) for index in range(len(values))]
+    )
+
+
+def _build_liquidity_schedule(
+    inputs: SugarcaneBioethanolInputs,
+    dates: pd.DatetimeIndex,
+    *,
+    cfads: np.ndarray,
+    capex_spend: np.ndarray,
+    debt_draw: np.ndarray,
+    term_cash_interest: np.ndarray,
+    term_principal: np.ndarray,
+    total_capex: float,
+) -> pd.DataFrame:
+    """Apply the reserve and liquidity waterfall month by month."""
+
+    liquidity = inputs.liquidity
+    cod = effective_cod_date(inputs)
+    operational = np.asarray(dates >= cod)
+    minimum_cash_target = operational.astype(float) * liquidity.minimum_cash_balance
+    term_debt_service = term_cash_interest + term_principal
+    dsra_target = _forward_sum(term_debt_service, liquidity.dsra_months)
+    dsra_target = np.where(operational, dsra_target, 0.0)
+    maintenance_target = np.where(
+        operational,
+        total_capex * liquidity.maintenance_reserve_rate,
+        0.0,
+    )
+    base_equity = np.maximum(0.0, capex_spend - debt_draw)
+
+    columns = {
+        name: np.zeros(len(dates))
+        for name in (
+            "OpeningCash",
+            "MinimumCashTarget",
+            "BaseEquityContribution",
+            "InitialLiquidityFunding",
+            "PreCODFunding",
+            "SponsorSupport",
+            "EquityContribution",
+            "DSRATarget",
+            "DSRAContribution",
+            "DSRARelease",
+            "DSRABalance",
+            "MaintenanceReserveTarget",
+            "MaintenanceReserveContribution",
+            "MaintenanceReserveRelease",
+            "MaintenanceReserveBalance",
+            "RestrictedCash",
+            "WorkingCapitalFacilityOpening",
+            "WorkingCapitalFacilityDraw",
+            "WorkingCapitalFacilityRepayment",
+            "WorkingCapitalFacilityInterest",
+            "WorkingCapitalFacilityClosing",
+            "FundingShortfall",
+            "EndingCash",
+            "TermDebtService",
+            "TotalDebtService",
+        )
+    }
+    cash_balance = 0.0
+    dsra_balance = 0.0
+    maintenance_balance = 0.0
+    facility_balance = 0.0
+    sponsor_used = 0.0
+    cod_index = int(np.searchsorted(dates.values, cod.to_datetime64()))
+
+    for month in range(len(dates)):
+        columns["OpeningCash"][month] = cash_balance
+        columns["MinimumCashTarget"][month] = minimum_cash_target[month]
+        columns["BaseEquityContribution"][month] = base_equity[month]
+        columns["DSRATarget"][month] = dsra_target[month]
+        columns["MaintenanceReserveTarget"][month] = maintenance_target[month]
+        columns["WorkingCapitalFacilityOpening"][month] = facility_balance
+        facility_interest = (
+            facility_balance
+            * liquidity.working_capital_facility_interest_rate
+            / 12.0
+        )
+        columns["WorkingCapitalFacilityInterest"][month] = facility_interest
+        columns["TermDebtService"][month] = term_debt_service[month]
+
+        initial_funding = 0.0
+        if month == cod_index:
+            initial_funding = (
+                minimum_cash_target[month]
+                + dsra_target[month]
+                + maintenance_target[month]
+            )
+        columns["InitialLiquidityFunding"][month] = initial_funding
+        cash_available = (
+            cash_balance
+            + cfads[month]
+            - capex_spend[month]
+            + debt_draw[month]
+            + base_equity[month]
+            + initial_funding
+            - term_debt_service[month]
+            - facility_interest
+        )
+
+        pre_cod_funding = 0.0
+        if not operational[month] and cash_available < 0.0:
+            pre_cod_funding = -cash_available
+            cash_available = 0.0
+        columns["PreCODFunding"][month] = pre_cod_funding
+
+        required_cash = minimum_cash_target[month]
+        if cash_available < required_cash and dsra_balance > 0.0:
+            release = min(required_cash - cash_available, dsra_balance)
+            dsra_balance -= release
+            cash_available += release
+            columns["DSRARelease"][month] = release
+
+        if dsra_balance > dsra_target[month]:
+            release = dsra_balance - dsra_target[month]
+            dsra_balance -= release
+            cash_available += release
+            columns["DSRARelease"][month] += release
+        dsra_gap = max(0.0, dsra_target[month] - dsra_balance)
+        dsra_contribution = min(dsra_gap, max(0.0, cash_available - required_cash))
+        dsra_balance += dsra_contribution
+        cash_available -= dsra_contribution
+        columns["DSRAContribution"][month] = dsra_contribution
+
+        if maintenance_balance > maintenance_target[month]:
+            release = maintenance_balance - maintenance_target[month]
+            maintenance_balance -= release
+            cash_available += release
+            columns["MaintenanceReserveRelease"][month] = release
+        maintenance_gap = max(0.0, maintenance_target[month] - maintenance_balance)
+        maintenance_contribution = min(
+            maintenance_gap,
+            max(0.0, cash_available - required_cash),
+        )
+        maintenance_balance += maintenance_contribution
+        cash_available -= maintenance_contribution
+        columns["MaintenanceReserveContribution"][month] = maintenance_contribution
+
+        if operational[month] and cash_available < required_cash:
+            facility_draw = min(
+                required_cash - cash_available,
+                max(0.0, liquidity.working_capital_facility_limit - facility_balance),
+            )
+            facility_balance += facility_draw
+            cash_available += facility_draw
+            columns["WorkingCapitalFacilityDraw"][month] = facility_draw
+
+        if cash_available > required_cash and facility_balance > 0.0:
+            facility_repayment = min(
+                cash_available - required_cash,
+                facility_balance,
+            )
+            facility_balance -= facility_repayment
+            cash_available -= facility_repayment
+            columns["WorkingCapitalFacilityRepayment"][month] = facility_repayment
+
+        if cash_available < required_cash:
+            sponsor_draw = min(
+                required_cash - cash_available,
+                max(0.0, liquidity.sponsor_support_limit - sponsor_used),
+            )
+            sponsor_used += sponsor_draw
+            cash_available += sponsor_draw
+            columns["SponsorSupport"][month] = sponsor_draw
+
+        columns["FundingShortfall"][month] = max(
+            0.0, required_cash - cash_available
+        )
+        columns["EquityContribution"][month] = (
+            base_equity[month]
+            + initial_funding
+            + pre_cod_funding
+            + columns["SponsorSupport"][month]
+        )
+        columns["DSRABalance"][month] = dsra_balance
+        columns["MaintenanceReserveBalance"][month] = maintenance_balance
+        columns["RestrictedCash"][month] = dsra_balance + maintenance_balance
+        columns["WorkingCapitalFacilityClosing"][month] = facility_balance
+        columns["TotalDebtService"][month] = (
+            term_debt_service[month]
+            + facility_interest
+            + columns["WorkingCapitalFacilityRepayment"][month]
+        )
+        columns["EndingCash"][month] = cash_available
+        cash_balance = cash_available
+
+    return pd.DataFrame(columns, index=dates)
+
+
+def _annualize_liquidity(monthly: pd.DataFrame) -> pd.DataFrame:
+    stock_columns = [
+        "MinimumCashTarget",
+        "DSRATarget",
+        "DSRABalance",
+        "MaintenanceReserveTarget",
+        "MaintenanceReserveBalance",
+        "RestrictedCash",
+        "WorkingCapitalFacilityClosing",
+        "FundingShortfall",
+        "EndingCash",
+    ]
+    flow_columns = [column for column in monthly.columns if column not in stock_columns]
+    annual = monthly[flow_columns].groupby(monthly.index.year).sum()
+    annual[stock_columns] = monthly[stock_columns].groupby(monthly.index.year).last()
+    annual.index.name = "Year"
+    return annual
+
+
+def _build_covenant_schedule(
+    inputs: SugarcaneBioethanolInputs,
+    dates: pd.DatetimeIndex,
+    *,
+    cfads: np.ndarray,
+    debt_service: np.ndarray,
+    opening_debt: np.ndarray,
+    closing_debt: np.ndarray,
+    contractual_maturity: pd.Timestamp,
+) -> pd.DataFrame:
+    keys = _covenant_period_keys(dates, inputs.financing.covenant_period)
+    discount_rate = max(0.0, inputs.financing.interest_rate) / 12.0
+    rows: list[dict[str, Any]] = []
+    for key in dict.fromkeys(keys):
+        mask = keys == key
+        positions = np.flatnonzero(mask)
+        first = int(positions[0])
+        last = int(positions[-1])
+        period_cfads = float(cfads[mask].sum())
+        period_service = float(debt_service[mask].sum())
+        dscr = period_cfads / period_service if period_service > 1e-9 else np.nan
+        debt_opening = float(opening_debt[first])
+        debt_closing = float(closing_debt[last])
+        loan_life_end = min(
+            int(np.searchsorted(dates.values, contractual_maturity.to_datetime64(), side="right")),
+            len(dates),
+        )
+        loan_cfads = cfads[first:loan_life_end]
+        project_cfads = cfads[first:]
+        llcr = (
+            float(npf.npv(discount_rate, loan_cfads)) / debt_opening
+            if debt_opening > 1e-9 and len(loan_cfads)
+            else np.nan
+        )
+        plcr = (
+            float(npf.npv(discount_rate, project_cfads)) / debt_opening
+            if debt_opening > 1e-9 and len(project_cfads)
+            else np.nan
+        )
+        rows.append(
+            {
+                "CovenantPeriod": key,
+                "StartDate": dates[first],
+                "EndDate": dates[last],
+                "CFADS": period_cfads,
+                "DebtService": period_service,
+                "DSCR": dscr,
+                "OpeningDebt": debt_opening,
+                "ClosingDebt": debt_closing,
+                "LLCR": llcr,
+                "PLCR": plcr,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_financials(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
+    construction: ScheduleOutput,
     farming: ScheduleOutput,
     farm_plan: ScheduleOutput,
     sourcing: ScheduleOutput,
@@ -987,29 +1546,80 @@ def compute_financials(
             )
         )
     )
-    idc_depreciation = _depreciation(idc, weighted_life * 12)
+    cod_index = int(
+        np.searchsorted(dates.values, effective_cod_date(inputs).to_datetime64())
+    )
+    idc_depreciation = _depreciation(
+        idc, weighted_life * 12, in_service_index=cod_index
+    )
     depreciation = capex.monthly["TotalDepreciation"].to_numpy() + idc_depreciation
     revenue = commercial.monthly["ExternalRevenue"].to_numpy()
     operating_cost = costs.monthly["EconomicOperatingCost"].to_numpy()
     ebitda = revenue - operating_cost
     ebit = ebitda - depreciation
-    cash_interest = debt.monthly["CashInterest"].to_numpy()
-    tax = _tax_with_nol(ebit - cash_interest, inputs.global_assumptions.corporate_tax_rate)
-    net_income = ebit - cash_interest - tax
+    term_cash_interest = debt.monthly["CashInterest"].to_numpy()
     delta_nwc = working_capital.monthly["DeltaNWC"].to_numpy()
     capex_spend = capex.monthly["TotalCapex"].to_numpy()
     debt_draw = debt.monthly["Draw"].to_numpy()
     principal = debt.monthly["Principal"].to_numpy()
-    debt_service = debt.monthly["DebtService"].to_numpy()
-    equity_contribution = np.maximum(0.0, capex_spend - debt_draw)
+
+    liquidity_monthly: pd.DataFrame | None = None
+    facility_interest = np.zeros(len(dates))
+    for _ in range(4):
+        tax = _tax_with_nol(
+            ebit - term_cash_interest - facility_interest,
+            inputs.global_assumptions.corporate_tax_rate,
+        )
+        cfads = ebitda - tax - delta_nwc
+        liquidity_monthly = _build_liquidity_schedule(
+            inputs,
+            dates,
+            cfads=cfads,
+            capex_spend=capex_spend,
+            debt_draw=debt_draw,
+            term_cash_interest=term_cash_interest,
+            term_principal=principal,
+            total_capex=capex.total_capex,
+        )
+        updated_interest = liquidity_monthly[
+            "WorkingCapitalFacilityInterest"
+        ].to_numpy()
+        if np.allclose(updated_interest, facility_interest, atol=0.01):
+            facility_interest = updated_interest
+            break
+        facility_interest = updated_interest
+    assert liquidity_monthly is not None
+
+    total_cash_interest = term_cash_interest + facility_interest
+    tax = _tax_with_nol(
+        ebit - total_cash_interest,
+        inputs.global_assumptions.corporate_tax_rate,
+    )
+    net_income = ebit - total_cash_interest - tax
     cfads = ebitda - tax - delta_nwc
+    liquidity_monthly = _build_liquidity_schedule(
+        inputs,
+        dates,
+        cfads=cfads,
+        capex_spend=capex_spend,
+        debt_draw=debt_draw,
+        term_cash_interest=term_cash_interest,
+        term_principal=principal,
+        total_capex=capex.total_capex,
+    )
+    facility_interest = liquidity_monthly[
+        "WorkingCapitalFacilityInterest"
+    ].to_numpy()
+    total_cash_interest = term_cash_interest + facility_interest
+    total_debt_service = liquidity_monthly["TotalDebtService"].to_numpy()
+    equity_contribution = liquidity_monthly["EquityContribution"].to_numpy()
     project_fcf = ebitda - tax - delta_nwc - capex_spend
-    equity_fcf = -equity_contribution + cfads - cash_interest - principal
-    dscr = np.divide(
+    equity_fcf = -equity_contribution
+    monthly_dscr = np.divide(
         cfads,
-        debt_service,
+        total_debt_service,
         out=np.full(len(dates), np.nan),
-        where=debt_service > 1e-9,
+        where=total_debt_service > 1e-9,
     )
 
     income_monthly = pd.DataFrame(
@@ -1019,7 +1629,9 @@ def compute_financials(
             "EBITDA": ebitda,
             "Depreciation": depreciation,
             "EBIT": ebit,
-            "Interest": cash_interest,
+            "TermDebtInterest": term_cash_interest,
+            "LiquidityFacilityInterest": facility_interest,
+            "Interest": total_cash_interest,
             "Tax": tax,
             "NetIncome": net_income,
         },
@@ -1034,28 +1646,28 @@ def compute_financials(
             "Capex": capex_spend,
             "DebtDraw": debt_draw,
             "CapitalizedInterest": idc,
-            "CashInterest": cash_interest,
+            "CashInterest": total_cash_interest,
             "Principal": principal,
-            "DebtService": debt_service,
+            "DebtService": total_debt_service,
             "EquityContribution": equity_contribution,
             "ProjectFCF": project_fcf,
             "EquityFCF": equity_fcf,
-            "DSCR": dscr,
+            "DSCR": monthly_dscr,
+            "EndingCash": liquidity_monthly["EndingCash"].to_numpy(),
+            "RestrictedCash": liquidity_monthly["RestrictedCash"].to_numpy(),
+            "FundingShortfall": liquidity_monthly["FundingShortfall"].to_numpy(),
+            "WorkingCapitalFacilityDraw": liquidity_monthly[
+                "WorkingCapitalFacilityDraw"
+            ].to_numpy(),
+            "WorkingCapitalFacilityRepayment": liquidity_monthly[
+                "WorkingCapitalFacilityRepayment"
+            ].to_numpy(),
         },
         index=dates,
     )
 
-    cash_change = (
-        ebitda
-        - tax
-        - delta_nwc
-        - capex_spend
-        + debt_draw
-        + equity_contribution
-        - cash_interest
-        - principal
-    )
-    cash = np.cumsum(cash_change)
+    cash = liquidity_monthly["EndingCash"].to_numpy()
+    restricted_cash = liquidity_monthly["RestrictedCash"].to_numpy()
     gross_ppe = np.cumsum(capex_spend + idc)
     accumulated_depreciation = np.cumsum(depreciation)
     net_ppe = gross_ppe - accumulated_depreciation
@@ -1064,14 +1676,19 @@ def compute_financials(
     ar = working_capital.monthly["AccountsReceivable"].to_numpy()
     inventory = working_capital.monthly["Inventory"].to_numpy()
     ap = working_capital.monthly["AccountsPayable"].to_numpy()
-    debt_balance = debt.monthly["ClosingBalance"].to_numpy()
-    assets = cash + ar + inventory + net_ppe
+    term_debt_balance = debt.monthly["ClosingBalance"].to_numpy()
+    liquidity_debt_balance = liquidity_monthly[
+        "WorkingCapitalFacilityClosing"
+    ].to_numpy()
+    debt_balance = term_debt_balance + liquidity_debt_balance
+    assets = cash + restricted_cash + ar + inventory + net_ppe
     liabilities = ap + debt_balance
     equity = paid_in_capital + retained_earnings
     balance_check = assets - liabilities - equity
     balance_monthly = pd.DataFrame(
         {
             "Cash": cash,
+            "RestrictedCash": restricted_cash,
             "AccountsReceivable": ar,
             "Inventory": inventory,
             "GrossPPE": gross_ppe,
@@ -1079,6 +1696,8 @@ def compute_financials(
             "NetPPE": net_ppe,
             "TotalAssets": assets,
             "AccountsPayable": ap,
+            "TermDebt": term_debt_balance,
+            "WorkingCapitalFacility": liquidity_debt_balance,
             "Debt": debt_balance,
             "TotalLiabilities": liabilities,
             "PaidInCapital": paid_in_capital,
@@ -1088,6 +1707,19 @@ def compute_financials(
         },
         index=dates,
     )
+    covenant_schedule = _build_covenant_schedule(
+        inputs,
+        dates,
+        cfads=cfads,
+        debt_service=total_debt_service,
+        opening_debt=(
+            debt.monthly["OpeningBalance"].to_numpy()
+            + liquidity_monthly["WorkingCapitalFacilityOpening"].to_numpy()
+        ),
+        closing_debt=debt_balance,
+        contractual_maturity=debt.contractual_maturity,
+    )
+    liquidity_annual = _annualize_liquidity(liquidity_monthly)
 
     shares = _product_revenue_shares(commercial)
     component_capex, component_dep = _component_capex_and_depreciation(
@@ -1096,7 +1728,7 @@ def compute_financials(
     component_weight = component_capex.cumsum().div(
         component_capex.cumsum().sum(axis=1).replace(0.0, np.nan), axis=0
     ).fillna(0.0)
-    component_interest = component_weight.mul(cash_interest, axis=0)
+    component_interest = component_weight.mul(total_cash_interest, axis=0)
     component_principal = component_weight.mul(principal, axis=0)
     component_delta_nwc = shares.mul(delta_nwc, axis=0)
     direct_product_costs = {
@@ -1198,8 +1830,12 @@ def compute_financials(
     )
 
     annual_cashflow = _annual_sum(cashflow_monthly.drop(columns=["DSCR"]))
-    min_dscr_by_year = cashflow_monthly.groupby(cashflow_monthly.index.year)["DSCR"].min()
-    annual_cashflow["MinDSCR"] = min_dscr_by_year
+    annual_cashflow["DSCR"] = np.divide(
+        annual_cashflow["CFADS"],
+        annual_cashflow["DebtService"],
+        out=np.full(len(annual_cashflow), np.nan),
+        where=annual_cashflow["DebtService"].to_numpy() > 1e-9,
+    )
     annual_balance = _annual_last(balance_monthly)
 
     debt_error = debt.monthly["ClosingBalance"].to_numpy() - (
@@ -1222,8 +1858,16 @@ def compute_financials(
             reconciliation["EBITDADifference"].abs().max(),
         )
     )
-    active_dscr = dscr[np.isfinite(dscr)]
-    minimum_dscr = float(np.min(active_dscr)) if len(active_dscr) else None
+    active_monthly_dscr = monthly_dscr[np.isfinite(monthly_dscr)]
+    covenant_dscr = covenant_schedule["DSCR"].dropna().to_numpy(dtype=float)
+    active_llcr = covenant_schedule["LLCR"].dropna().to_numpy(dtype=float)
+    active_plcr = covenant_schedule["PLCR"].dropna().to_numpy(dtype=float)
+    minimum_dscr = float(np.min(covenant_dscr)) if len(covenant_dscr) else None
+    minimum_monthly_dscr = (
+        float(np.min(active_monthly_dscr)) if len(active_monthly_dscr) else None
+    )
+    minimum_llcr = float(np.min(active_llcr)) if len(active_llcr) else None
+    minimum_plcr = float(np.min(active_plcr)) if len(active_plcr) else None
     dscr_target = float(
         np.max(parameter_series(inputs, "other_assumptions", "minimum_dscr_target", dates))
     )
@@ -1294,99 +1938,244 @@ def compute_financials(
     farm_share_tolerance = 0.05
 
 
+    cod = effective_cod_date(inputs)
+    pre_cod = np.asarray(dates < cod)
+    pre_cod_processing = float(
+        np.max(np.abs(sourcing.monthly.loc[pre_cod, "TotalCaneTonnes"]))
+        if pre_cod.any()
+        else 0.0
+    )
+    pre_cod_revenue = float(
+        np.max(np.abs(revenue[pre_cod])) if pre_cod.any() else 0.0
+    )
+    pre_cod_depreciation = float(
+        np.max(np.abs(depreciation[pre_cod])) if pre_cod.any() else 0.0
+    )
+    max_funding_shortfall = float(
+        liquidity_monthly["FundingShortfall"].max()
+    )
+    cash_headroom = (
+        liquidity_monthly["EndingCash"]
+        - liquidity_monthly["MinimumCashTarget"]
+    )
+    minimum_cash_headroom = float(cash_headroom.min())
+    max_dsra_gap = float(
+        (
+            liquidity_monthly["DSRATarget"]
+            - liquidity_monthly["DSRABalance"]
+        ).clip(lower=0.0).max()
+    )
+    max_maintenance_gap = float(
+        (
+            liquidity_monthly["MaintenanceReserveTarget"]
+            - liquidity_monthly["MaintenanceReserveBalance"]
+        ).clip(lower=0.0).max()
+    )
+    max_facility_excess = float(
+        (
+            liquidity_monthly["WorkingCapitalFacilityClosing"]
+            - inputs.liquidity.working_capital_facility_limit
+        ).clip(lower=0.0).max()
+    )
+    llcr_target = inputs.financing.minimum_llcr_target
+    plcr_target = inputs.financing.minimum_plcr_target
+    contingency_requirement = total_capex * inputs.construction.contingency_rate
+
     checks = pd.DataFrame(
         [
             {
+                "Category": "Integrity",
                 "Check": "Cultivated land is within arable/cultivable land",
                 "Actual": cultivated_excess,
                 "Tolerance": land_tolerance,
                 "Status": "OK" if cultivated_excess <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Arable/cultivable land is within total land",
                 "Actual": arable_excess,
                 "Tolerance": land_tolerance,
                 "Status": "OK" if arable_excess <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Irrigated land is within cultivated land",
                 "Actual": irrigated_cultivated_excess,
                 "Tolerance": land_tolerance,
-                "Status": (
-                    "OK"
-                    if irrigated_cultivated_excess <= land_tolerance
-                    else "FAIL"
-                ),
+                "Status": "OK" if irrigated_cultivated_excess <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Irrigated land is within irrigation capacity",
                 "Actual": irrigated_capacity_excess,
                 "Tolerance": land_tolerance,
-                "Status": (
-                    "OK"
-                    if irrigated_capacity_excess <= land_tolerance
-                    else "FAIL"
-                ),
+                "Status": "OK" if irrigated_capacity_excess <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Farm cane processed is within harvested cane available",
                 "Actual": farm_cane_excess,
                 "Tolerance": land_tolerance,
                 "Status": "OK" if farm_cane_excess <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Purchased cane reconciles the feedstock shortage",
                 "Actual": purchase_reconciliation_error,
                 "Tolerance": land_tolerance,
-                "Status": (
-                    "OK"
-                    if purchase_reconciliation_error <= land_tolerance
-                    else "FAIL"
-                ),
+                "Status": "OK" if purchase_reconciliation_error <= land_tolerance else "FAIL",
             },
             {
+                "Category": "Target",
                 "Check": "Actual farm share meets the scenario target",
                 "Actual": actual_farm_share,
                 "Tolerance": farm_share_target,
                 "Status": "OK" if farm_share_gap <= farm_share_tolerance else "WARN",
             },
             {
+                "Category": "Integrity",
                 "Check": "Bagasse routing sums to raw bagasse",
                 "Actual": float(np.max(np.abs(bagasse_routing_error))),
                 "Tolerance": tolerance,
                 "Status": "OK" if np.max(np.abs(bagasse_routing_error)) <= tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Debt roll-forward",
                 "Actual": float(np.max(np.abs(debt_error))),
                 "Tolerance": tolerance,
                 "Status": "OK" if np.max(np.abs(debt_error)) <= tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Balance sheet balances",
                 "Actual": max_balance_error,
                 "Tolerance": tolerance,
                 "Status": "OK" if max_balance_error <= tolerance else "FAIL",
             },
             {
+                "Category": "Integrity",
                 "Check": "Component consolidation reconciles",
                 "Actual": max_reconciliation_error,
                 "Tolerance": tolerance,
                 "Status": "OK" if max_reconciliation_error <= tolerance else "FAIL",
             },
             {
+                "Category": "Bankability",
+                "Check": "No processing before effective COD",
+                "Actual": pre_cod_processing,
+                "Tolerance": tolerance,
+                "Status": "OK" if pre_cod_processing <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "No revenue before effective COD",
+                "Actual": pre_cod_revenue,
+                "Tolerance": tolerance,
+                "Status": "OK" if pre_cod_revenue <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "No depreciation before effective COD",
+                "Actual": pre_cod_depreciation,
+                "Tolerance": tolerance,
+                "Status": "OK" if pre_cod_depreciation <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
                 "Check": "Debt repays by model end",
                 "Actual": float(debt_balance[-1]),
                 "Tolerance": tolerance,
                 "Status": "OK" if debt_balance[-1] <= tolerance else "FAIL",
             },
             {
-                "Check": "Minimum DSCR meets target",
+                "Category": "Bankability",
+                "Check": "Projection covers debt maturity plus tail",
+                "Actual": int(debt.model_horizon_covers_tail),
+                "Tolerance": 1,
+                "Status": "OK" if debt.model_horizon_covers_tail else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Minimum covenant-period DSCR meets target",
                 "Actual": minimum_dscr,
                 "Tolerance": dscr_target,
-                "Status": "OK" if minimum_dscr is None or minimum_dscr >= dscr_target else "WARN",
+                "Status": "OK" if minimum_dscr is not None and minimum_dscr >= dscr_target else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Minimum LLCR meets target",
+                "Actual": minimum_llcr,
+                "Tolerance": llcr_target,
+                "Status": "OK" if minimum_llcr is not None and minimum_llcr >= llcr_target else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Minimum PLCR meets target",
+                "Actual": minimum_plcr,
+                "Tolerance": plcr_target,
+                "Status": "OK" if minimum_plcr is not None and minimum_plcr >= plcr_target else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "No unresolved funding shortfall",
+                "Actual": max_funding_shortfall,
+                "Tolerance": tolerance,
+                "Status": "OK" if max_funding_shortfall <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Minimum unrestricted cash is maintained",
+                "Actual": minimum_cash_headroom,
+                "Tolerance": 0.0,
+                "Status": "OK" if minimum_cash_headroom >= -tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "DSRA is fully funded",
+                "Actual": max_dsra_gap,
+                "Tolerance": tolerance,
+                "Status": "OK" if max_dsra_gap <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Maintenance reserve is fully funded",
+                "Actual": max_maintenance_gap,
+                "Tolerance": tolerance,
+                "Status": "OK" if max_maintenance_gap <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Working-capital facility remains within limit",
+                "Actual": max_facility_excess,
+                "Tolerance": tolerance,
+                "Status": "OK" if max_facility_excess <= tolerance else "FAIL",
+            },
+            {
+                "Category": "Bankability",
+                "Check": "Construction contingency is budgeted",
+                "Actual": contingency_requirement,
+                "Tolerance": 0.0,
+                "Status": "OK" if contingency_requirement > 0.0 else "FAIL",
             },
         ]
+    )
+    calculation_status = (
+        "CHECK"
+        if (
+            (checks["Category"] == "Integrity")
+            & (checks["Status"] == "FAIL")
+        ).any()
+        else "OK"
+    )
+    bankability_status = (
+        "FAIL"
+        if calculation_status != "OK"
+        or (
+            (checks["Category"] == "Bankability")
+            & (checks["Status"] == "FAIL")
+        ).any()
+        else "PASS"
     )
 
     final_year_fcf = float(annual_cashflow.iloc[-1]["ProjectFCF"])
@@ -1402,9 +2191,14 @@ def compute_financials(
     project_returns = project_fcf.copy()
     equity_returns = equity_fcf.copy()
     project_returns[-1] += terminal_value
-    equity_returns[-1] += max(0.0, terminal_value - debt_balance[-1])
+    equity_returns[-1] += max(
+        0.0, terminal_value + cash[-1] + restricted_cash[-1] - debt_balance[-1]
+    )
     metrics: dict[str, Any] = {
         "scenario": scenario,
+        "scheduled_cod": inputs.construction.scheduled_cod,
+        "effective_cod": cod.strftime("%Y-%m"),
+        "construction_delay_months": inputs.construction.construction_delay_months,
         "farm_share": actual_farm_share,
         "farm_share_target": farm_share_target,
         "farm_share_gap": farm_share_gap,
@@ -1429,22 +2223,54 @@ def compute_financials(
             plan_monthly["PlannedIrrigatedHa"].max()
         ),
         "total_capex": total_capex,
+        "construction_contingency_requirement": contingency_requirement,
         "project_npv": _npv(project_returns, inputs.global_assumptions.discount_rate),
         "project_irr": _annualized_irr(project_returns),
+        "project_npv_without_terminal": _npv(
+            project_fcf, inputs.global_assumptions.discount_rate
+        ),
+        "project_irr_without_terminal": _annualized_irr(project_fcf),
         "equity_npv": _npv(equity_returns, inputs.global_assumptions.discount_rate),
         "equity_irr": _annualized_irr(equity_returns),
         "payback_years": _payback(project_fcf),
+        "covenant_period": inputs.financing.covenant_period,
         "min_dscr": minimum_dscr,
-        "average_dscr": float(np.mean(active_dscr)) if len(active_dscr) else None,
+        "minimum_monthly_dscr": minimum_monthly_dscr,
+        "average_dscr": (
+            float(np.mean(covenant_dscr)) if len(covenant_dscr) else None
+        ),
+        "min_llcr": minimum_llcr,
+        "min_plcr": minimum_plcr,
         "ending_debt": float(debt_balance[-1]),
+        "ending_term_debt": float(term_debt_balance[-1]),
+        "ending_working_capital_facility": float(liquidity_debt_balance[-1]),
         "senior_debt_draw": float(debt.summary.iloc[0]["InitialDraw"]),
         "additional_debt_draw": float(
             debt.summary.iloc[1:]["InitialDraw"].sum()
         ),
         "total_debt_draw": float(debt.summary["InitialDraw"].sum()),
+        "total_liquidity_facility_draw": float(
+            liquidity_monthly["WorkingCapitalFacilityDraw"].sum()
+        ),
         "total_equity_contribution": float(equity_contribution.sum()),
+        "total_equity_commitment": float(
+            equity_contribution.sum() + contingency_requirement
+        ),
+        "minimum_cash_balance": float(cash[np.asarray(dates >= cod)].min()),
+        "minimum_cash_headroom": minimum_cash_headroom,
+        "maximum_funding_shortfall": max_funding_shortfall,
+        "peak_dsra": float(liquidity_monthly["DSRABalance"].max()),
+        "peak_maintenance_reserve": float(
+            liquidity_monthly["MaintenanceReserveBalance"].max()
+        ),
         "terminal_value": terminal_value,
-        "model_status": "CHECK" if (checks["Status"] == "FAIL").any() else "OK",
+        "calculation_status": calculation_status,
+        "bankability_status": bankability_status,
+        "model_status": (
+            "CHECK"
+            if calculation_status != "OK"
+            else ("OK" if bankability_status == "PASS" else "BANKABILITY FAIL")
+        ),
     }
     metrics["investor_npv"] = metrics["equity_npv"] * inputs.global_assumptions.investor_share
     metrics["owner_npv"] = metrics["equity_npv"] * (
@@ -1461,6 +2287,9 @@ def compute_financials(
         component_monthly=component_monthly,
         component_annual=component_annual,
         reconciliation=reconciliation,
+        covenant_schedule=covenant_schedule,
+        liquidity_monthly=liquidity_monthly,
+        liquidity_annual=liquidity_annual,
         checks=checks,
         metrics=metrics,
     )

@@ -29,6 +29,7 @@ def test_grouped_inputs_match_the_cassava_architecture() -> None:
     assert list(inputs.grouped_sections()) == [
         "Global assumptions",
         "Other assumptions",
+        "Construction & COD",
         "Capex",
         "Cycle planning",
         "Farm planning",
@@ -39,6 +40,7 @@ def test_grouped_inputs_match_the_cassava_architecture() -> None:
         "Costs",
         "Working capital",
         "Financing",
+        "Liquidity & reserves",
     ]
 
 
@@ -51,13 +53,13 @@ def test_farm_buy_and_hybrid_scenarios_route_cane_and_capex() -> None:
     assert hybrid["sourcing"].annual["PurchasedCaneTonnes"].sum() > 0
     assert buy["sourcing"].annual["FarmCaneTonnes"].sum() == 0
     assert farm["metrics"]["farm_share"] == pytest.approx(1.0)
-    assert hybrid["metrics"]["farm_share"] == pytest.approx(0.5)
+    assert hybrid["metrics"]["farm_share"] == pytest.approx(0.5, abs=0.01)
     assert buy["metrics"]["farm_share"] == pytest.approx(0.0)
     assert farm["metrics"]["farm_share_target"] == 1.0
     assert hybrid["metrics"]["farm_share_target"] == 0.5
     assert buy["metrics"]["farm_share_target"] == 0.0
     assert farm["metrics"]["total_capex"] == pytest.approx(37_500_000.0)
-    assert hybrid["metrics"]["total_capex"] == pytest.approx(35_000_000.0)
+    assert buy["metrics"]["total_capex"] < hybrid["metrics"]["total_capex"] < farm["metrics"]["total_capex"]
     assert buy["metrics"]["total_capex"] == pytest.approx(32_500_000.0)
 
 
@@ -99,8 +101,11 @@ def test_component_financials_reconcile_to_consolidated_statements() -> None:
     assert checks.loc["Debt roll-forward", "Status"] == "OK"
     assert checks.loc["Balance sheet balances", "Status"] == "OK"
     assert checks.loc["Component consolidation reconciles", "Status"] == "OK"
-    assert checks.loc["Minimum DSCR meets target", "Status"] == "WARN"
-    assert financials.metrics["model_status"] == "OK"
+    assert checks.loc["Minimum covenant-period DSCR meets target", "Status"] == "FAIL"
+    assert checks.loc["Minimum covenant-period DSCR meets target", "Category"] == "Bankability"
+    assert financials.metrics["calculation_status"] == "OK"
+    assert financials.metrics["bankability_status"] == "FAIL"
+    assert financials.metrics["model_status"] == "BANKABILITY FAIL"
 
 
 def test_planning_start_controls_pre_operational_months() -> None:

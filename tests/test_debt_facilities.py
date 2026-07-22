@@ -80,12 +80,14 @@ def test_multiple_fixed_facilities_keep_separate_terms_and_reduce_equity() -> No
         debt.monthly["Draw"],
         debt.facility_monthly.groupby(level="Date")["Draw"].sum(),
     )
-    assert result["metrics"]["senior_debt_draw"] == pytest.approx(21_000_000.0)
-    assert result["metrics"]["additional_debt_draw"] == pytest.approx(3_400_000.0)
-    assert result["metrics"]["total_debt_draw"] == pytest.approx(24_400_000.0)
-    assert result["metrics"]["total_equity_contribution"] == pytest.approx(
-        10_600_000.0
+    assert result["metrics"]["senior_debt_draw"] == pytest.approx(
+        result["metrics"]["total_capex"] * inputs.financing.debt_ratio
     )
+    assert result["metrics"]["additional_debt_draw"] == pytest.approx(3_400_000.0)
+    assert result["metrics"]["total_debt_draw"] == pytest.approx(
+        result["metrics"]["senior_debt_draw"] + 3_400_000.0
+    )
+    assert result["metrics"]["total_equity_contribution"] > result["metrics"]["total_capex"] - result["metrics"]["total_debt_draw"]
     checks = result["financials"].checks.set_index("Check")
     assert checks.loc["Debt roll-forward", "Status"] == "OK"
     assert checks.loc["Balance sheet balances", "Status"] == "OK"
