@@ -100,6 +100,40 @@ class CyclePlanningAssumptions(BaseModel):
     replant_share_per_cycle: float = Field(default=0.20, ge=0.0, le=1.0)
 
 
+class FarmPlanningAssumptions(BaseModel):
+    """Physical land envelope and annual cultivation deployment assumptions."""
+
+    total_land_hectares: float = Field(default=1_000.0, gt=0.0)
+    arable_land_hectares: float = Field(default=800.0, gt=0.0)
+    planned_cultivated_hectares: float = Field(default=700.0, ge=0.0)
+    irrigation_capacity_hectares: float = Field(default=600.0, ge=0.0)
+    planned_irrigated_hectares: float = Field(default=500.0, ge=0.0)
+    hectares_harvested: float = Field(default=632.122979, ge=0.0)
+
+
+def validate_farm_planning_values(values: dict[str, Any]) -> list[str]:
+    """Return the shared land-capacity validation messages for one annual plan."""
+
+    total_land = float(values["total_land_hectares"])
+    arable_land = float(values["arable_land_hectares"])
+    cultivated = float(values["planned_cultivated_hectares"])
+    irrigation_capacity = float(values["irrigation_capacity_hectares"])
+    irrigated = float(values["planned_irrigated_hectares"])
+    harvested = float(values["hectares_harvested"])
+    errors: list[str] = []
+    if arable_land > total_land:
+        errors.append("Arable/cultivable land cannot exceed total land.")
+    if cultivated > arable_land:
+        errors.append("Planned cultivated hectares cannot exceed arable/cultivable land.")
+    if irrigated > cultivated:
+        errors.append("Planned irrigated hectares cannot exceed planned cultivated hectares.")
+    if irrigated > irrigation_capacity:
+        errors.append("Planned irrigated hectares cannot exceed irrigation capacity.")
+    if harvested > cultivated:
+        errors.append("Hectares harvested cannot exceed planned cultivated hectares.")
+    return errors
+
+
 class FarmingAssumptions(BaseModel):
     sugarcane_yield_tonnes_per_hectare: float = Field(default=70.0, gt=0.0)
     harvest_recovery: float = Field(default=0.98, gt=0.0, le=1.0)
@@ -189,6 +223,7 @@ class SugarcaneBioethanolInputs(BaseModel):
     other_assumptions: OtherAssumptions = Field(default_factory=OtherAssumptions)
     capex: CapexAssumptions = Field(default_factory=CapexAssumptions)
     cycle_planning: CyclePlanningAssumptions = Field(default_factory=CyclePlanningAssumptions)
+    farm_planning: FarmPlanningAssumptions = Field(default_factory=FarmPlanningAssumptions)
     farming: FarmingAssumptions = Field(default_factory=FarmingAssumptions)
     sourcing: SourcingAssumptions = Field(default_factory=SourcingAssumptions)
     processing_routing: ProcessingRoutingAssumptions = Field(default_factory=ProcessingRoutingAssumptions)
@@ -205,6 +240,7 @@ class SugarcaneBioethanolInputs(BaseModel):
                 ("Other assumptions", self.other_assumptions),
                 ("Capex", self.capex),
                 ("Cycle planning", self.cycle_planning),
+                ("Farm planning", self.farm_planning),
                 ("Farming", self.farming),
                 ("Sourcing", self.sourcing),
                 ("Processing & production routing", self.processing_routing),

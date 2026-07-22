@@ -16,6 +16,7 @@ The refactored model follows the Cassava Ethanol separation of concerns:
 - Other assumptions
 - Capex
 - Cycle planning
+- Farm planning
 - Farming
 - Sourcing
 - Processing and production routing
@@ -26,11 +27,22 @@ The refactored model follows the Cassava Ethanol separation of concerns:
 
 ## Scenario behavior
 
-| Scenario | Farm share | Purchased share | Farm CAPEX |
-|---|---:|---:|---:|
-| FARM_ONLY | 100% | 0% | 100% |
-| BUY_ONLY | 0% | 100% | 0% |
-| HYBRID | User-defined | Residual | Scaled by farm share |
+| Scenario | Own-farm cane | Purchased cane | Farm-share input | Farm CAPEX |
+|---|---:|---:|---:|---:|
+| FARM_ONLY | Land-plan constrained | 0% | 100% target | 100% |
+| BUY_ONLY | 0% | Full requirement | 0% target | 0% |
+| HYBRID | Land-plan constrained | Residual requirement | Target/check | Scaled by actual farm share |
+
+## Farm planning
+
+The `Farm Planning` driver schedule has one effective row per projection year. It owns the physical land envelope and annual hectare deployment: total land, arable/cultivable land, planned cultivated area, irrigation capacity, planned irrigated area, and hectares harvested. Rain-fed hectares and fallow/reserve land are calculated from the land envelope. Hectares replanted are calculated from the harvested area and the separate Cycle Planning replant-share assumptions.
+
+Own-farm cane availability is calculated as:
+
+`hectares harvested x cane yield x harvest recovery`
+
+Farm cane processed cannot exceed either harvested cane availability or the plant's cane requirement. HYBRID and BUY_ONLY automatically purchase the residual requirement; FARM_ONLY records any feedstock shortfall as processing underutilization. The model checks all land-capacity and feedstock reconciliations in both the input validator and the model-check output.
+
 
 ## Processing routes
 

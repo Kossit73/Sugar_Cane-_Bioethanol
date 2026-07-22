@@ -7,6 +7,8 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from .inputs import validate_farm_planning_values
+
 
 SCHEDULE_DEFINITIONS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
     [
@@ -37,6 +39,21 @@ SCHEDULE_DEFINITIONS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     "harvest_window_months",
                     "ratoon_cycles",
                     "replant_share_per_cycle",
+                ],
+            },
+        ),
+        (
+            "farm_planning",
+            {
+                "label": "Farm Planning",
+                "section": "farm_planning",
+                "fields": [
+                    "total_land_hectares",
+                    "arable_land_hectares",
+                    "planned_cultivated_hectares",
+                    "irrigation_capacity_hectares",
+                    "planned_irrigated_hectares",
+                    "hectares_harvested",
                 ],
             },
         ),
@@ -267,6 +284,11 @@ def validate_driver_schedules(inputs: Any) -> list[str]:
             ):
                 errors.append(
                     f"{config['label']} row {row_number}: establishment and harvest windows exceed the crop cycle."
+                )
+            if key == "farm_planning":
+                errors.extend(
+                    f"{config['label']} row {row_number}: {message}"
+                    for message in validate_farm_planning_values(candidate)
                 )
             if key == "processing_routing":
                 bagasse_share = sum(float(candidate[field]) for field in (

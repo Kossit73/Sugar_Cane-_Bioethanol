@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from .driver_schedules import SCHEDULE_DEFINITIONS
+from .driver_schedules import SCHEDULE_DEFINITIONS, schedule_rows
 from .inputs import SugarcaneBioethanolInputs, input_values
 
 
@@ -44,7 +44,8 @@ def build_excel_report(
         payload = input_values(inputs)
         for section, values in payload.items():
             if section == "yearly_schedules":
-                for schedule_key, rows in values.items():
+                for schedule_key in SCHEDULE_DEFINITIONS:
+                    rows = schedule_rows(inputs, schedule_key)
                     label = SCHEDULE_DEFINITIONS.get(schedule_key, {}).get(
                         "label", schedule_key.replace("_", " ").title()
                     )

@@ -71,6 +71,8 @@ def _table_bundle(build: dict[str, Any], comparison: pd.DataFrame) -> dict[str, 
         "Scenario Comparison": comparison,
         "Cycle Planning Monthly": build["cycle_plan"].monthly,
         "Cycle Planning Annual": build["cycle_plan"].annual,
+        "Farm Planning Monthly": build["farm_plan"].monthly,
+        "Farm Planning Annual": build["farm_plan"].annual,
         "Farming Monthly": build["farming"].monthly,
         "Farming Annual": build["farming"].annual,
         "Sourcing Monthly": build["sourcing"].monthly,
@@ -125,7 +127,7 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
     "global_assumptions": [
         ("start_year", "Start year", 1, "%d", int),
         ("end_year", "End year", 1, "%d", int),
-        ("hybrid_farm_share", "Hybrid farm share", 0.05, "%.2f", float),
+        ("hybrid_farm_share", "Hybrid farm share target", 0.05, "%.2f", float),
         ("corporate_tax_rate", "Corporate tax rate", 0.01, "%.2f", float),
         ("discount_rate", "Discount rate", 0.01, "%.2f", float),
         ("terminal_growth_rate", "Terminal growth rate", 0.01, "%.2f", float),
@@ -146,6 +148,14 @@ _NUMBER_SPECS: dict[str, list[tuple[str, str, float, str, Callable[[Any], Any]]]
         ("harvest_window_months", "Harvest window (months)", 1, "%d", int),
         ("ratoon_cycles", "Ratoon cycles", 1, "%d", int),
         ("replant_share_per_cycle", "Replant share per cycle", 0.05, "%.2f", float),
+    ],
+    "farm_planning": [
+        ("total_land_hectares", "Total land (ha)", 100.0, "%.1f", float),
+        ("arable_land_hectares", "Arable/cultivable land (ha)", 100.0, "%.1f", float),
+        ("planned_cultivated_hectares", "Planned cultivated area (ha)", 50.0, "%.1f", float),
+        ("irrigation_capacity_hectares", "Irrigation capacity (ha)", 50.0, "%.1f", float),
+        ("planned_irrigated_hectares", "Planned irrigated area (ha)", 50.0, "%.1f", float),
+        ("hectares_harvested", "Hectares harvested", 50.0, "%.1f", float),
     ],
     "farming": [
         ("sugarcane_yield_tonnes_per_hectare", "Cane yield (t/ha)", 1.0, "%.1f", float),
@@ -238,7 +248,7 @@ def _number_grid(st, section: str, values: dict[str, Any]) -> dict[str, Any]:
 class SugarcaneBioethanolPlugin:
     slug = "sugar-cane-bioethanol"
     name = "Sugar Cane Bioethanol Financial Model"
-    version = "2.1.0"
+    version = "2.2.0"
     description = (
         "Integrated farm-to-market Sugar Cane model with Cassava-style modular "
         "assumptions, operating schedules, component economics, and consolidated statements."
@@ -249,6 +259,7 @@ class SugarcaneBioethanolPlugin:
     features = [
         "FARM_ONLY, BUY_ONLY, and HYBRID sourcing",
         "Five-product processing and production routing",
+        "Annual land, cultivation, and irrigation planning",
         "Six component financial views",
         "Consolidated three-statement model",
         "Multiple fixed-amount debt facilities",
@@ -309,6 +320,13 @@ class SugarcaneBioethanolPlugin:
                 )
             with st.expander("Cycle planning"):
                 cycle_values = _number_grid(st, "cycle_planning", payload["cycle_planning"])
+            with st.expander("Farm planning"):
+                farm_plan_values = _number_grid(
+                    st, "farm_planning", payload["farm_planning"]
+                )
+                st.caption(
+                    "Rain-fed area, fallow/reserve land, and replanted hectares are calculated."
+                )
             with st.expander("Farming"):
                 farming_values = _number_grid(st, "farming", payload["farming"])
             with st.expander("Sourcing"):
@@ -407,6 +425,7 @@ class SugarcaneBioethanolPlugin:
                     "global_assumptions": global_values,
                     "other_assumptions": other_values,
                     "cycle_planning": cycle_values,
+                    "farm_planning": farm_plan_values,
                     "farming": farming_values,
                     "sourcing": sourcing_values,
                     "processing_routing": routing_values,
@@ -474,6 +493,12 @@ class SugarcaneBioethanolPlugin:
             st.subheader("Processing and production routing")
             st.dataframe(
                 pd.DataFrame(result.production_routing),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.subheader("Annual farm planning")
+            st.dataframe(
+                result._tables["Farm Planning Annual"].reset_index(),
                 use_container_width=True,
                 hide_index=True,
             )

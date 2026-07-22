@@ -80,7 +80,7 @@ def _annual_last(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def _scenario_farm_share(inputs: SugarcaneBioethanolInputs, scenario: str) -> float:
+def _scenario_farm_share_target(inputs: SugarcaneBioethanolInputs, scenario: str) -> float:
     scenario_name = scenario.upper()
     if scenario_name == "FARM_ONLY":
         return 1.0
@@ -189,13 +189,102 @@ def compute_cycle_plan(inputs: SugarcaneBioethanolInputs) -> ScheduleOutput:
     return ScheduleOutput(monthly=monthly, annual=annual)
 
 
+def compute_farm_planning_schedule(
+    inputs: SugarcaneBioethanolInputs,
+    cycle_plan: ScheduleOutput,
+) -> ScheduleOutput:
+    """Build the land-led annual plan and its calculated monthly deployment."""
+
+    dates = cycle_plan.monthly.index
+
+    def values(field: str) -> np.ndarray:
+        return parameter_series(inputs, "farm_planning", field, dates)
+
+    total_land = values("total_land_hectares")
+    arable_land = values("arable_land_hectares")
+    cultivated = values("planned_cultivated_hectares")
+    irrigation_capacity = values("irrigation_capacity_hectares")
+    irrigated = values("planned_irrigated_hectares")
+    annual_harvested = values("hectares_harvested")
+    active = cycle_plan.monthly["Phase"].ne("Pre-operational").to_numpy()
+    active_counts = (
+        pd.Series(active.astype(float), index=dates)
+        .groupby(dates.year)
+        .transform("sum")
+        .to_numpy()
+    )
+    harvest_weights = np.divide(
+        active.astype(float),
+        active_counts,
+        out=np.zeros(len(dates), dtype=float),
+        where=active_counts > 0,
+    )
+    hectares_harvested = annual_harvested * harvest_weights
+
+    replant_events = cycle_plan.monthly["ReplantShare"].to_numpy(dtype=float)
+    hectares_replanted = np.zeros(len(dates), dtype=float)
+    for year in sorted(set(dates.year)):
+        year_mask = np.asarray(dates.year == year)
+        event_total = float(replant_events[year_mask].sum())
+        if event_total <= 0.0:
+            continue
+        planned_replant = min(
+            float(cultivated[year_mask][-1]),
+            float(annual_harvested[year_mask][-1]) * event_total,
+        )
+        hectares_replanted[year_mask] = (
+            planned_replant * replant_events[year_mask] / event_total
+        )
+
+    cane_yield = parameter_series(
+        inputs, "farming", "sugarcane_yield_tonnes_per_hectare", dates
+    )
+    harvest_recovery = parameter_series(inputs, "farming", "harvest_recovery", dates)
+    monthly = pd.DataFrame(
+        {
+            "TotalLandHa": total_land,
+            "ArableCultivableLandHa": arable_land,
+            "PlannedCultivatedHa": cultivated,
+            "IrrigationCapacityHa": irrigation_capacity,
+            "PlannedIrrigatedHa": irrigated,
+            "RainFedHa": np.maximum(cultivated - irrigated, 0.0),
+            "FallowReserveHa": np.maximum(arable_land - cultivated, 0.0),
+            "HectaresHarvested": hectares_harvested,
+            "HectaresReplanted": hectares_replanted,
+            "FarmCaneAvailableTonnes": (
+                hectares_harvested * cane_yield * harvest_recovery
+            ),
+        },
+        index=dates,
+    )
+    stock_columns = [
+        "TotalLandHa",
+        "ArableCultivableLandHa",
+        "PlannedCultivatedHa",
+        "IrrigationCapacityHa",
+        "PlannedIrrigatedHa",
+        "RainFedHa",
+        "FallowReserveHa",
+    ]
+    flow_columns = [
+        "HectaresHarvested",
+        "HectaresReplanted",
+        "FarmCaneAvailableTonnes",
+    ]
+    annual = monthly[stock_columns].groupby(dates.year).last()
+    annual[flow_columns] = monthly[flow_columns].groupby(dates.year).sum()
+    annual.index.name = "Year"
+    return ScheduleOutput(monthly=monthly, annual=annual)
+
+
 def compute_farming_schedule(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
     cycle_plan: ScheduleOutput,
+    farm_plan: ScheduleOutput,
 ) -> ScheduleOutput:
     dates = cycle_plan.monthly.index
-    farm_share = _scenario_farm_share(inputs, scenario)
+    farm_share_target = _scenario_farm_share_target(inputs, scenario)
     cost_rates = parameter_series(
         inputs, "other_assumptions", "cost_inflation_rate", dates
     )
@@ -206,36 +295,75 @@ def compute_farming_schedule(
     availability = parameter_series(
         inputs, "other_assumptions", "plant_availability", dates
     )
-    cane_yield = parameter_series(
-        inputs, "farming", "sugarcane_yield_tonnes_per_hectare", dates
-    )
-    harvest_recovery = parameter_series(inputs, "farming", "harvest_recovery", dates)
     farm_opex = parameter_series(inputs, "farming", "farm_opex_per_tonne", dates)
     annual_overhead = parameter_series(inputs, "farming", "farm_overhead_per_year", dates)
     base_transfer_price = parameter_series(
         inputs, "farming", "internal_transfer_price_per_tonne", dates
     )
-    total_cane = capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
-    farm_cane = total_cane * farm_share
-    harvested_area = farm_cane / np.maximum(1e-9, cane_yield * harvest_recovery)
-    farm_cost = farm_cane * farm_opex * cost_factor
-    farm_overhead = annual_overhead / 12.0 * cost_factor * (1.0 if farm_share > 0 else 0.0)
+    processing_target = (
+        capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
+    )
+    farm_available = farm_plan.monthly["FarmCaneAvailableTonnes"].to_numpy()
+    farm_operating = (
+        scenario.upper() != "BUY_ONLY"
+    ) & cycle_plan.monthly["Phase"].ne("Pre-operational").to_numpy()
+    farm_available = np.where(farm_operating, farm_available, 0.0)
+    farm_cane_processed = np.minimum(farm_available, processing_target)
+    unused_farm_cane = np.maximum(farm_available - farm_cane_processed, 0.0)
+    farm_cost = farm_available * farm_opex * cost_factor
+    farm_overhead = annual_overhead / 12.0 * cost_factor * farm_operating.astype(float)
     transfer_price = base_transfer_price * cost_factor
     monthly = pd.DataFrame(
         {
-            "FarmShare": farm_share,
-            "FarmCaneTonnes": farm_cane,
-            "FarmAreaHarvestedHa": harvested_area,
-            "FarmAreaReplantedHa": harvested_area * cycle_plan.monthly["ReplantShare"].to_numpy(),
+            "FarmShareTarget": farm_share_target,
+            "ProcessingCaneTargetTonnes": processing_target,
+            "FarmCaneAvailableTonnes": farm_available,
+            "FarmCaneProcessedTonnes": farm_cane_processed,
+            "FarmCaneTonnes": farm_cane_processed,
+            "UnusedFarmCaneTonnes": unused_farm_cane,
+            "FarmAreaHarvestedHa": np.where(
+                farm_operating,
+                farm_plan.monthly["HectaresHarvested"].to_numpy(),
+                0.0,
+            ),
+            "FarmAreaReplantedHa": np.where(
+                farm_operating,
+                farm_plan.monthly["HectaresReplanted"].to_numpy(),
+                0.0,
+            ),
             "FarmDirectCost": farm_cost,
             "FarmOverhead": farm_overhead,
             "FarmOperatingCost": farm_cost + farm_overhead,
             "InternalTransferPrice": transfer_price,
-            "InternalCaneRevenue": farm_cane * transfer_price,
+            "InternalCaneRevenue": farm_cane_processed * transfer_price,
         },
         index=dates,
     )
-    return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
+    monthly["FarmShareOfProcessingTarget"] = np.divide(
+        farm_cane_processed,
+        processing_target,
+        out=np.zeros(len(dates), dtype=float),
+        where=processing_target > 0,
+    )
+    rate_columns = {
+        "FarmShareTarget",
+        "FarmShareOfProcessingTarget",
+        "InternalTransferPrice",
+    }
+    flow_columns = [column for column in monthly.columns if column not in rate_columns]
+    annual = monthly[flow_columns].groupby(dates.year).sum()
+    annual["FarmShareTarget"] = monthly["FarmShareTarget"].groupby(dates.year).last()
+    annual["FarmShareOfProcessingTarget"] = np.divide(
+        annual["FarmCaneProcessedTonnes"],
+        annual["ProcessingCaneTargetTonnes"],
+        out=np.zeros(len(annual), dtype=float),
+        where=annual["ProcessingCaneTargetTonnes"].to_numpy() > 0,
+    )
+    annual["InternalTransferPrice"] = (
+        monthly["InternalTransferPrice"].groupby(dates.year).mean()
+    )
+    annual.index.name = "Year"
+    return ScheduleOutput(monthly=monthly, annual=annual)
 
 
 def compute_sourcing_schedule(
@@ -251,8 +379,17 @@ def compute_sourcing_schedule(
     availability = parameter_series(
         inputs, "other_assumptions", "plant_availability", dates
     )
-    total_cane = capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
-    purchased_cane = np.maximum(0.0, total_cane - farming.monthly["FarmCaneTonnes"].to_numpy())
+    processing_target = (
+        capacity * availability * cycle_plan.monthly["RampFactor"].to_numpy() / 12.0
+    )
+    farm_cane_processed = farming.monthly["FarmCaneProcessedTonnes"].to_numpy()
+    if scenario.upper() == "FARM_ONLY":
+        purchased_cane = np.zeros(len(dates), dtype=float)
+    else:
+        purchased_cane = np.maximum(0.0, processing_target - farm_cane_processed)
+    total_cane = farm_cane_processed + purchased_cane
+    feedstock_shortfall = np.maximum(processing_target - total_cane, 0.0)
+    farm_share_target = _scenario_farm_share_target(inputs, scenario)
     supplier_loss = parameter_series(inputs, "sourcing", "supplier_loss_rate", dates)
     supplier_gross = purchased_cane / np.maximum(1e-9, 1.0 - supplier_loss)
     cost_rates = parameter_series(
@@ -277,9 +414,21 @@ def compute_sourcing_schedule(
     farm_transfer = farming.monthly["InternalCaneRevenue"].to_numpy()
     monthly = pd.DataFrame(
         {
-            "ScenarioFarmShare": _scenario_farm_share(inputs, scenario),
+            "FarmShareTarget": farm_share_target,
+            "ActualFarmShare": np.divide(
+                farm_cane_processed,
+                total_cane,
+                out=np.zeros(len(dates), dtype=float),
+                where=total_cane > 0,
+            ),
+            "ProcessingCaneTargetTonnes": processing_target,
             "TotalCaneTonnes": total_cane,
-            "FarmCaneTonnes": farming.monthly["FarmCaneTonnes"].to_numpy(),
+            "FeedstockShortfallTonnes": feedstock_shortfall,
+            "FarmCaneAvailableTonnes": farming.monthly[
+                "FarmCaneAvailableTonnes"
+            ].to_numpy(),
+            "FarmCaneProcessedTonnes": farm_cane_processed,
+            "FarmCaneTonnes": farm_cane_processed,
             "PurchasedCaneTonnes": purchased_cane,
             "SupplierGrossTonnes": supplier_gross,
             "EffectivePurchasePrice": purchase_price,
@@ -290,7 +439,21 @@ def compute_sourcing_schedule(
         },
         index=dates,
     )
-    return ScheduleOutput(monthly=monthly, annual=_annual_sum(monthly))
+    rate_columns = {"FarmShareTarget", "ActualFarmShare", "EffectivePurchasePrice"}
+    flow_columns = [column for column in monthly.columns if column not in rate_columns]
+    annual = monthly[flow_columns].groupby(dates.year).sum()
+    annual["FarmShareTarget"] = monthly["FarmShareTarget"].groupby(dates.year).last()
+    annual["ActualFarmShare"] = np.divide(
+        annual["FarmCaneProcessedTonnes"],
+        annual["TotalCaneTonnes"],
+        out=np.zeros(len(annual), dtype=float),
+        where=annual["TotalCaneTonnes"].to_numpy() > 0,
+    )
+    annual["EffectivePurchasePrice"] = (
+        monthly["EffectivePurchasePrice"].groupby(dates.year).mean()
+    )
+    annual.index.name = "Year"
+    return ScheduleOutput(monthly=monthly, annual=annual)
 
 
 def compute_processing_routing(
@@ -458,16 +621,25 @@ def compute_cost_schedule(
 def compute_capex_schedule(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
+    sourcing: ScheduleOutput,
 ) -> CapexOutput:
     dates = build_timeline(inputs)
-    farm_share = _scenario_farm_share(inputs, scenario)
+    total_processed_cane = float(sourcing.monthly["TotalCaneTonnes"].sum())
+    farm_capex_share = (
+        float(sourcing.monthly["FarmCaneProcessedTonnes"].sum())
+        / total_processed_cane
+        if total_processed_cane > 0.0
+        else 0.0
+    )
     components = sorted({item.component for item in inputs.capex.items} | {"Shared Processing"})
     capex_by_component = {component: np.zeros(len(dates)) for component in components}
     depreciation_by_component = {component: np.zeros(len(dates)) for component in components}
     rows: list[dict[str, Any]] = []
 
     for item in inputs.capex.items:
-        amount = float(item.amount) * (farm_share if item.is_farm_capex else 1.0)
+        amount = float(item.amount) * (
+            farm_capex_share if item.is_farm_capex else 1.0
+        )
         start = pd.Period(item.start_month, freq="M").to_timestamp()
         if start < dates[0]:
             start = dates[0]
@@ -796,6 +968,7 @@ def compute_financials(
     inputs: SugarcaneBioethanolInputs,
     scenario: str,
     farming: ScheduleOutput,
+    farm_plan: ScheduleOutput,
     sourcing: ScheduleOutput,
     processing: ScheduleOutput,
     commercial: ScheduleOutput,
@@ -1054,9 +1227,129 @@ def compute_financials(
     dscr_target = float(
         np.max(parameter_series(inputs, "other_assumptions", "minimum_dscr_target", dates))
     )
+    plan_monthly = farm_plan.monthly
+    cultivated_excess = float(
+        np.max(
+            np.maximum(
+                plan_monthly["PlannedCultivatedHa"].to_numpy()
+                - plan_monthly["ArableCultivableLandHa"].to_numpy(),
+                0.0,
+            )
+        )
+    )
+    arable_excess = float(
+        np.max(
+            np.maximum(
+                plan_monthly["ArableCultivableLandHa"].to_numpy()
+                - plan_monthly["TotalLandHa"].to_numpy(),
+                0.0,
+            )
+        )
+    )
+    irrigated_cultivated_excess = float(
+        np.max(
+            np.maximum(
+                plan_monthly["PlannedIrrigatedHa"].to_numpy()
+                - plan_monthly["PlannedCultivatedHa"].to_numpy(),
+                0.0,
+            )
+        )
+    )
+    irrigated_capacity_excess = float(
+        np.max(
+            np.maximum(
+                plan_monthly["PlannedIrrigatedHa"].to_numpy()
+                - plan_monthly["IrrigationCapacityHa"].to_numpy(),
+                0.0,
+            )
+        )
+    )
+    farm_cane_processed = farming.monthly["FarmCaneProcessedTonnes"].to_numpy()
+    farm_cane_available = farming.monthly["FarmCaneAvailableTonnes"].to_numpy()
+    farm_cane_excess = float(
+        np.max(np.maximum(farm_cane_processed - farm_cane_available, 0.0))
+    )
+    processing_target = sourcing.monthly["ProcessingCaneTargetTonnes"].to_numpy()
+    expected_purchases = (
+        np.zeros(len(dates), dtype=float)
+        if scenario.upper() == "FARM_ONLY"
+        else np.maximum(processing_target - farm_cane_processed, 0.0)
+    )
+    purchase_reconciliation_error = float(
+        np.max(
+            np.abs(
+                sourcing.monthly["PurchasedCaneTonnes"].to_numpy()
+                - expected_purchases
+            )
+        )
+    )
+    total_processed_cane = float(sourcing.monthly["TotalCaneTonnes"].sum())
+    total_farm_cane = float(farming.monthly["FarmCaneProcessedTonnes"].sum())
+    actual_farm_share = (
+        total_farm_cane / total_processed_cane if total_processed_cane > 0 else 0.0
+    )
+    farm_share_target = _scenario_farm_share_target(inputs, scenario)
+    farm_share_gap = abs(actual_farm_share - farm_share_target)
+    land_tolerance = 1e-6
+    farm_share_tolerance = 0.05
+
 
     checks = pd.DataFrame(
         [
+            {
+                "Check": "Cultivated land is within arable/cultivable land",
+                "Actual": cultivated_excess,
+                "Tolerance": land_tolerance,
+                "Status": "OK" if cultivated_excess <= land_tolerance else "FAIL",
+            },
+            {
+                "Check": "Arable/cultivable land is within total land",
+                "Actual": arable_excess,
+                "Tolerance": land_tolerance,
+                "Status": "OK" if arable_excess <= land_tolerance else "FAIL",
+            },
+            {
+                "Check": "Irrigated land is within cultivated land",
+                "Actual": irrigated_cultivated_excess,
+                "Tolerance": land_tolerance,
+                "Status": (
+                    "OK"
+                    if irrigated_cultivated_excess <= land_tolerance
+                    else "FAIL"
+                ),
+            },
+            {
+                "Check": "Irrigated land is within irrigation capacity",
+                "Actual": irrigated_capacity_excess,
+                "Tolerance": land_tolerance,
+                "Status": (
+                    "OK"
+                    if irrigated_capacity_excess <= land_tolerance
+                    else "FAIL"
+                ),
+            },
+            {
+                "Check": "Farm cane processed is within harvested cane available",
+                "Actual": farm_cane_excess,
+                "Tolerance": land_tolerance,
+                "Status": "OK" if farm_cane_excess <= land_tolerance else "FAIL",
+            },
+            {
+                "Check": "Purchased cane reconciles the feedstock shortage",
+                "Actual": purchase_reconciliation_error,
+                "Tolerance": land_tolerance,
+                "Status": (
+                    "OK"
+                    if purchase_reconciliation_error <= land_tolerance
+                    else "FAIL"
+                ),
+            },
+            {
+                "Check": "Actual farm share meets the scenario target",
+                "Actual": actual_farm_share,
+                "Tolerance": farm_share_target,
+                "Status": "OK" if farm_share_gap <= farm_share_tolerance else "WARN",
+            },
             {
                 "Check": "Bagasse routing sums to raw bagasse",
                 "Actual": float(np.max(np.abs(bagasse_routing_error))),
@@ -1112,7 +1405,29 @@ def compute_financials(
     equity_returns[-1] += max(0.0, terminal_value - debt_balance[-1])
     metrics: dict[str, Any] = {
         "scenario": scenario,
-        "farm_share": _scenario_farm_share(inputs, scenario),
+        "farm_share": actual_farm_share,
+        "farm_share_target": farm_share_target,
+        "farm_share_gap": farm_share_gap,
+        "total_farm_cane_available": float(
+            farming.monthly["FarmCaneAvailableTonnes"].sum()
+        ),
+        "total_farm_cane_processed": total_farm_cane,
+        "total_purchased_cane": float(
+            sourcing.monthly["PurchasedCaneTonnes"].sum()
+        ),
+        "total_unused_farm_cane": float(
+            farming.monthly["UnusedFarmCaneTonnes"].sum()
+        ),
+        "total_land_hectares": float(plan_monthly["TotalLandHa"].max()),
+        "arable_land_hectares": float(
+            plan_monthly["ArableCultivableLandHa"].max()
+        ),
+        "planned_cultivated_hectares": float(
+            plan_monthly["PlannedCultivatedHa"].max()
+        ),
+        "planned_irrigated_hectares": float(
+            plan_monthly["PlannedIrrigatedHa"].max()
+        ),
         "total_capex": total_capex,
         "project_npv": _npv(project_returns, inputs.global_assumptions.discount_rate),
         "project_irr": _annualized_irr(project_returns),
