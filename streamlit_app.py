@@ -11,10 +11,20 @@ Run with:
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import importlib
 import math
 import re
+import zipfile
 import sys
+import concurrent.futures
+import ast
+import urllib.parse
+import urllib.request
+import datetime
+import time
+from dataclasses import dataclass
 from collections import OrderedDict
 from contextlib import contextmanager
 from io import BytesIO
@@ -28,7 +38,7 @@ from pandas.testing import assert_frame_equal
 
 from dependencies import ensure_package, get_package_error
 
-MATPLOTLIB_INSTALL_ERROR: Optional[str]
+MATPLOTLIB_INSTALL_ERROR: Optional[str] = None
 if ensure_package("matplotlib"):
     try:  # pragma: no cover - optional dependency
         import matplotlib.dates as mdates
@@ -43,6 +53,226 @@ else:
     mdates = None
 
 _MATPLOTLIB_WARNING_SHOWN = False
+
+
+CHAT_PROVIDER_DEFAULTS: Dict[str, Dict[str, object]] = {
+    "OpenAI": {"base_url": "https://api.openai.com/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Anthropic": {"base_url": "https://api.anthropic.com/v1/messages", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "Google Gemini": {"base_url": "", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Mistral": {"base_url": "https://api.mistral.ai/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "Cohere": {"base_url": "https://api.cohere.com/v2/chat", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "DeepSeek": {"base_url": "https://api.deepseek.com/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": False},
+    "xAI": {"base_url": "https://api.x.ai/v1/chat/completions", "supports_reasoning": True, "supports_tools": True, "supports_web_search": True},
+    "Llama-compatible": {"base_url": "http://localhost:8000/v1/chat/completions", "supports_reasoning": False, "supports_tools": False, "supports_web_search": False},
+}
+
+CHAT_EVAL_PROMPTS: List[Dict[str, str]] = [
+    {"prompt": "Estimate DSCR sensitivity if revenue drops by 10%.", "expected_tool": "tool_calc"},
+    {"prompt": "Compare lender cases by Project_NPV and explain the difference.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Aggregate revenue by product and summarize concentration risk.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Should we prioritize IRR or DSCR for this lender discussion?", "expected_tool": "none"},
+    {"prompt": "Benchmark ethanol price assumptions against market references.", "expected_tool": "web"},
+    {"prompt": "What are the key assumptions behind the current NPV?", "expected_tool": "none"},
+    {"prompt": "Run a quick check on capex shock impact using a simple formula.", "expected_tool": "tool_calc"},
+    {"prompt": "Explain why DSCR falls in downside cases.", "expected_tool": "none"},
+    {"prompt": "Compare reserve account implications across lender cases.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Summarize top risks and practical mitigations.", "expected_tool": "none"},
+    {"prompt": "Aggregate monthly production by product and identify weak spots.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Check if current assumptions are conservative versus industry norms.", "expected_tool": "web"},
+    {"prompt": "Which KPI should govern covenant negotiations?", "expected_tool": "none"},
+    {"prompt": "Calculate breakeven change for a 5% opex increase.", "expected_tool": "tool_calc"},
+    {"prompt": "Compare Project_IRR across available lender cases.", "expected_tool": "tool_scenario_compare"},
+    {"prompt": "Provide a recommendation with caveats for debt structuring.", "expected_tool": "none"},
+    {"prompt": "Benchmark inflation assumptions with external references.", "expected_tool": "web"},
+    {"prompt": "Aggregate cash waterfall components and flag dominant drains.", "expected_tool": "tool_dataframe_aggregate"},
+    {"prompt": "Evaluate causality between capex delays and covenant stress.", "expected_tool": "none"},
+    {"prompt": "Give a concise action plan for improving both NPV and DSCR.", "expected_tool": "none"},
+]
+
+INSTITUTION_WHITELIST: Tuple[Tuple[str, str], ...] = (
+    ("iea.org", "International Energy Agency"),
+    ("worldbank.org", "World Bank"),
+    ("imf.org", "International Monetary Fund"),
+    ("oecd.org", "OECD"),
+    ("ifc.org", "International Finance Corporation"),
+    ("reuters.com", "Reuters"),
+    ("bloomberg.com", "Bloomberg"),
+    ("fao.org", "FAO"),
+    ("un.org", "United Nations"),
+    ("gov", "Government source"),
+    ("edu", "Academic source"),
+)
+
+BENCHMARK_METRIC_DEFINITIONS: Dict[str, Tuple[str, ...]] = {
+    "Project_IRR": ("internal rate of return", "irr", "equity irr", "project irr"),
+    "DSCR_min": ("debt service coverage ratio", "dscr", "coverage ratio"),
+    "Project_NPV": ("net present value", "npv", "discounted cash flow"),
+}
+
+
+@dataclass
+class ChatProviderSettings:
+    provider_name: str
+    model_name: str
+    api_key: str
+    base_url: str
+    temperature: float
+    max_tokens: int
+    reasoning_mode: str
+    use_tools: bool
+    use_web_search: bool
+
+
+class BaseChatAdapter:
+    """Shared provider adapter interface."""
+
+    provider_name: str = "base"
+
+    def __init__(self, settings: ChatProviderSettings):
+        self.settings = settings
+
+    def supports_tools(self) -> bool:
+        return _chat_supports(self.settings.provider_name, "supports_tools")
+
+    def supports_reasoning(self) -> bool:
+        return _chat_supports(self.settings.provider_name, "supports_reasoning")
+
+    def _request_with_retries(self, url: str, payload: Mapping[str, object], headers: Mapping[str, str]) -> Dict[str, object]:
+        """Issue HTTP request with retry/backoff and basic rate-limit handling."""
+
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=dict(headers),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                message = str(exc).lower()
+                is_retryable = "429" in message or "rate" in message or "timed out" in message or "temporarily" in message
+                if attempt == max_attempts - 1 or not is_retryable:
+                    raise
+                time.sleep(0.6 * (2 ** attempt))
+        return {}
+
+    def _capability_check(self) -> Optional[str]:
+        model_name = self.settings.model_name.lower()
+        if "reasoning" in model_name and not self.supports_reasoning():
+            return f"Selected model '{self.settings.model_name}' may not support reasoning mode on {self.settings.provider_name}."
+        return None
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        raise NotImplementedError
+
+    def stream(self, messages: List[Dict[str, str]]) -> Iterable[str]:
+        text = self.generate(messages)
+        yield text
+
+
+class OpenAIAdapter(BaseChatAdapter):
+    provider_name = "OpenAI"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.reasoning_mode and self.supports_reasoning():
+            payload["reasoning"] = {"effort": self.settings.reasoning_mode}
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class AnthropicAdapter(BaseChatAdapter):
+    provider_name = "Anthropic"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        system_msgs = [m.get("content", "") for m in messages if m.get("role") == "system"]
+        non_system = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages if m.get("role") != "system"]
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": non_system,
+            "max_tokens": int(self.settings.max_tokens),
+            "temperature": float(self.settings.temperature),
+        }
+        if system_msgs:
+            payload["system"] = "\n\n".join(system_msgs)
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {
+                "Content-Type": "application/json",
+                "x-api-key": self.settings.api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class GeminiAdapter(BaseChatAdapter):
+    provider_name = "Google Gemini"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        # Gemini native endpoint shape varies by SDK/version; this adapter assumes
+        # an OpenAI-compatible gateway/base_url for portability in this app.
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
+
+
+class GenericOpenAICompatibleAdapter(BaseChatAdapter):
+    provider_name = "generic"
+
+    def generate(self, messages: List[Dict[str, str]]) -> str:
+        warning = self._capability_check()
+        payload: Dict[str, object] = {
+            "model": self.settings.model_name,
+            "messages": messages,
+            "temperature": float(self.settings.temperature),
+            "max_tokens": int(self.settings.max_tokens),
+        }
+        if self.settings.reasoning_mode and self.supports_reasoning():
+            payload["reasoning"] = {"effort": self.settings.reasoning_mode}
+        data = self._request_with_retries(
+            self.settings.base_url,
+            payload,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {self.settings.api_key}"},
+        )
+        content = _extract_text_from_provider_payload(data)
+        if warning and content:
+            return f"{warning}\n\n{content}"
+        return content
 
 
 def _streamlit_runtime_exists() -> bool:
@@ -94,6 +324,20 @@ def _update_editor_state(table_name: str, tables: "InputTables") -> None:
     st.session_state.pop(f"editor_{table_name}", None)
 
 
+def _sync_table_mutation_state(table_name: str, tables: "InputTables") -> None:
+    """Keep editor/default/cache state coherent after table mutations."""
+
+    _update_editor_state(table_name, tables)
+    # Clear derived caches so downstream pages (scenarios/downloads) recompute
+    # from the latest edited inputs.
+    st.session_state.pop("scenario_payload_cache", None)
+    st.session_state.pop("excel_bytes_map", None)
+    # Close default row editor if active table changed/reset.
+    edit_state = st.session_state.get(DEFAULT_EDIT_STATE_KEY)
+    if isinstance(edit_state, Mapping) and edit_state.get("table") == table_name:
+        st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
+
+
 def _total_capex_from_inputs(tables: "InputTables") -> float:
     """Return the aggregate CAPEX amount from the current input schedule."""
 
@@ -116,6 +360,944 @@ def _option_index(options: Sequence[str], value: str, default: int = 0) -> int:
         return options.index(value)
     except ValueError:
         return default if 0 <= default < len(options) else 0
+
+
+def _float_option_values(start: float, stop: float, step: float, digits: int = 6) -> List[float]:
+    """Return an inclusive list of float options suitable for dropdown widgets."""
+
+    if step <= 0:
+        return [round(start, digits)]
+    count = int(round((stop - start) / step))
+    if count < 0:
+        return [round(start, digits)]
+    values = [round(start + idx * step, digits) for idx in range(count + 1)]
+    if values and values[-1] < round(stop, digits):
+        values.append(round(stop, digits))
+    return values
+
+
+def _chat_supports(provider_name: str, capability: str) -> bool:
+    defaults = CHAT_PROVIDER_DEFAULTS.get(provider_name, {})
+    return bool(defaults.get(capability, False))
+
+
+def _run_sandbox(code: str) -> Dict[str, object]:
+    """Execute controlled Python snippets in a restricted sandbox namespace."""
+
+    risky_tokens = [
+        "__",
+        "import ",
+        "open(",
+        "exec(",
+        "eval(",
+        "os.",
+        "sys.",
+        "subprocess",
+        "socket",
+        "shutil",
+        "pathlib",
+        "requests",
+        "urllib",
+        "globals(",
+        "locals(",
+    ]
+    lowered = code.lower()
+    denied = [token for token in risky_tokens if token in lowered]
+    if denied:
+        return {"used": True, "ok": False, "error": f"Blocked by sandbox denial list: {', '.join(denied)}"}
+    if len(code) > 4000:
+        return {"used": True, "ok": False, "error": "Code exceeds sandbox size limit (4000 chars)."}
+
+    safe_builtins = {
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "sum": sum,
+        "len": len,
+        "range": range,
+        "round": round,
+        "sorted": sorted,
+    }
+    restricted_globals = {"__builtins__": safe_builtins, "math": math, "np": np, "pd": pd}
+
+    def _execute() -> Dict[str, object]:
+        restricted_locals: Dict[str, object] = {}
+        exec(code, restricted_globals, restricted_locals)
+        output = restricted_locals.get("result")
+        output_text = str(output)
+        if len(output_text) > 1200:
+            output_text = output_text[:1200] + "... [truncated]"
+        return {"used": True, "ok": True, "result": output_text, "locals": list(restricted_locals.keys())}
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(_execute).result(timeout=2.0)
+    except concurrent.futures.TimeoutError:
+        return {"used": True, "ok": False, "error": "Sandbox execution timed out (2s)."}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_calc(expression: str) -> Dict[str, object]:
+    """Safely evaluate arithmetic-style expressions."""
+
+    expr = expression.strip()
+    if not expr:
+        return {"used": True, "ok": False, "error": "No expression provided."}
+    if len(expr) > 500:
+        return {"used": True, "ok": False, "error": "Expression too long."}
+    blocked_tokens = ["__", "import", "open(", "exec(", "eval(", "lambda", "os.", "sys.", "subprocess"]
+    if any(token in expr.lower() for token in blocked_tokens):
+        return {"used": True, "ok": False, "error": "Expression blocked by security policy."}
+    try:
+        node = ast.parse(expr, mode="eval")
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Constant,
+            ast.Num,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Pow,
+            ast.Mod,
+            ast.FloorDiv,
+            ast.USub,
+            ast.UAdd,
+            ast.Load,
+            ast.Call,
+            ast.Name,
+        )
+        allowed_names = {"abs": abs, "round": round, "min": min, "max": max}
+        for child in ast.walk(node):
+            if not isinstance(child, allowed_nodes):
+                return {"used": True, "ok": False, "error": f"Unsupported expression element: {type(child).__name__}"}
+            if isinstance(child, ast.Name) and child.id not in allowed_names:
+                return {"used": True, "ok": False, "error": f"Unknown identifier: {child.id}"}
+        result = eval(compile(node, "<tool_calc>", "eval"), {"__builtins__": {}}, allowed_names)
+        return {"used": True, "ok": True, "result": str(result)}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_dataframe_aggregate(model_results: Mapping[str, object], table_name: str, group_by: str, metric: str, agg: str) -> Dict[str, object]:
+    """Aggregate a model output DataFrame with basic guardrails."""
+
+    table = model_results.get(table_name)
+    if not isinstance(table, pd.DataFrame) or table.empty:
+        return {"used": True, "ok": False, "error": f"Table '{table_name}' is unavailable or empty."}
+    if group_by and group_by not in table.columns:
+        return {"used": True, "ok": False, "error": f"Group-by column '{group_by}' not found."}
+    if metric not in table.columns:
+        return {"used": True, "ok": False, "error": f"Metric column '{metric}' not found."}
+    agg_funcs = {"sum": "sum", "mean": "mean", "min": "min", "max": "max", "median": "median"}
+    agg_func = agg_funcs.get(agg, "sum")
+    try:
+        if group_by:
+            out = table.groupby(group_by, dropna=False)[metric].agg(agg_func).reset_index()
+        else:
+            out = pd.DataFrame([{metric: getattr(pd.to_numeric(table[metric], errors="coerce"), agg_func)()}])
+        preview = out.head(20).to_dict(orient="records")
+        return {"used": True, "ok": True, "result": preview}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _tool_scenario_compare(model_results: Mapping[str, object], metric_name: str, top_n: int = 10) -> Dict[str, object]:
+    """Compare base metrics with lender-case metrics when available."""
+
+    base_metrics = model_results.get("metrics", {})
+    lender_df = model_results.get("lender_case_results")
+    if not isinstance(lender_df, pd.DataFrame) or lender_df.empty:
+        return {"used": True, "ok": False, "error": "No lender_case_results found for scenario comparison."}
+    if metric_name not in lender_df.columns:
+        return {"used": True, "ok": False, "error": f"Metric '{metric_name}' not found in lender_case_results."}
+    try:
+        comp = lender_df[["case_name", metric_name]].copy()
+        base_value = base_metrics.get(metric_name) if isinstance(base_metrics, Mapping) else None
+        comp["base_value"] = base_value
+        comp["delta_vs_base"] = pd.to_numeric(comp[metric_name], errors="coerce") - (float(base_value) if isinstance(base_value, (int, float, np.floating)) else 0.0)
+        comp = comp.head(max(1, min(int(top_n), 50)))
+        return {"used": True, "ok": True, "result": comp.to_dict(orient="records")}
+    except Exception as exc:
+        return {"used": True, "ok": False, "error": str(exc)}
+
+
+def _web_comparison_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
+    """Perform lightweight web lookup and evidence enrichment for comparative references."""
+
+    if not query.strip():
+        return []
+    encoded = urllib.parse.urlencode({"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+    url = f"https://api.duckduckgo.com/?{encoded}"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    results: List[Dict[str, str]] = []
+    for item in payload.get("RelatedTopics", []):
+        if isinstance(item, dict) and item.get("Text") and item.get("FirstURL"):
+            title = str(item.get("Text"))
+            url = str(item.get("FirstURL"))
+            results.append({"title": title, "url": url})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _extract_comparable_metrics(text: str) -> Dict[str, str]:
+    """Extract rough comparable fields (date, region, value) from source text."""
+
+    lowered = text.lower()
+    year_match = re.search(r"\b(20\d{2}|19\d{2})\b", text)
+    date_value = year_match.group(0) if year_match else ""
+    value_match = re.search(r"(\$?\d[\d,]*(?:\.\d+)?%?)", text)
+    metric_value = value_match.group(1) if value_match else ""
+    region = ""
+    for candidate in ("global", "us", "usa", "europe", "asia", "brazil", "india", "china", "africa", "latin america"):
+        if candidate in lowered:
+            region = candidate.upper() if len(candidate) <= 3 else candidate.title()
+            break
+    return {"date": date_value, "region": region, "value": metric_value}
+
+
+def _match_whitelisted_institution(url: str) -> Tuple[str, bool]:
+    lowered = url.lower()
+    for domain, label in INSTITUTION_WHITELIST:
+        if domain in lowered:
+            return label, True
+    return "Unclassified source", False
+
+
+def _fetch_source_text(url: str, max_chars: int = 6000) -> str:
+    """Fetch lightweight source text snippet for parsing benchmark signals."""
+
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StreamlitBot/1.0)"},
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            raw = response.read(max_chars * 2).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    text = re.sub(r"<script.*?>.*?</script>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _normalize_benchmark_value(raw_value: str) -> Optional[float]:
+    token = raw_value.replace(",", "").strip()
+    if not token:
+        return None
+    try:
+        if token.endswith("%"):
+            return float(token[:-1]) / 100.0
+        if token.startswith("$"):
+            return float(token[1:])
+        return float(token)
+    except Exception:
+        return None
+
+
+def _parse_benchmark_definition_alignment(text: str, query: str) -> Dict[str, object]:
+    """Parse metric mentions and score alignment to known benchmark definitions."""
+
+    combined = f"{query} {text}".lower()
+    best_metric = ""
+    best_score = 0.0
+    for metric_name, phrases in BENCHMARK_METRIC_DEFINITIONS.items():
+        hits = sum(1 for phrase in phrases if phrase in combined)
+        score = min(1.0, hits / max(1, len(phrases)))
+        if score > best_score:
+            best_score = score
+            best_metric = metric_name
+    return {"metric": best_metric, "definition_alignment_score": round(best_score, 2)}
+
+
+def _score_credibility(url: str, title: str) -> Tuple[float, str]:
+    """Return heuristic credibility score with rationale."""
+
+    score = 0.4
+    reasons: List[str] = []
+    trusted_domains = ("gov", "edu", "org", "iea.org", "worldbank.org", "oecd.org", "reuters.com", "bloomberg.com")
+    lowered_url = url.lower()
+    lowered_title = title.lower()
+    institution_label, is_whitelisted = _match_whitelisted_institution(url)
+    if is_whitelisted:
+        score += 0.35
+        reasons.append(f"whitelisted institution: {institution_label}")
+    elif any(domain in lowered_url for domain in trusted_domains):
+        score += 0.2
+        reasons.append("trusted-like domain pattern")
+    if any(keyword in lowered_title for keyword in ("report", "index", "statistics", "official", "benchmark")):
+        score += 0.15
+        reasons.append("benchmark-like content")
+    if re.search(r"\b20\d{2}\b", title):
+        score += 0.1
+        reasons.append("contains explicit year")
+    score = max(0.0, min(score, 1.0))
+    reason_text = ", ".join(reasons) if reasons else "generic web reference"
+    return score, reason_text
+
+
+def _build_evidence_pipeline(
+    query: str,
+    model_metrics: Mapping[str, object],
+    top_n: int = 5,
+) -> List[Dict[str, object]]:
+    """Retrieve sources and enrich them into comparable evidence rows."""
+
+    raw_sources = _web_comparison_search(query, limit=max(top_n * 2, top_n))
+    current_year = datetime.datetime.utcnow().year
+    evidence_rows: List[Dict[str, object]] = []
+    metric_snapshot = {
+        "Project_NPV": model_metrics.get("Project_NPV"),
+        "Project_IRR": model_metrics.get("Project_IRR"),
+        "DSCR_min": model_metrics.get("DSCR_min"),
+    }
+    whitelisted_rows: List[Dict[str, object]] = []
+    non_whitelisted_rows: List[Dict[str, object]] = []
+    for src in raw_sources:
+        title = str(src.get("title", ""))
+        url = str(src.get("url", ""))
+        source_text = _fetch_source_text(url)
+        parse_source = f"{title} {source_text}".strip()
+        extracted = _extract_comparable_metrics(parse_source)
+        normalized_value = _normalize_benchmark_value(extracted.get("value", ""))
+        alignment = _parse_benchmark_definition_alignment(parse_source, query)
+        score, why = _score_credibility(url, title)
+        institution_label, is_whitelisted = _match_whitelisted_institution(url)
+        year_value = extracted.get("date", "")
+        recency = "unknown"
+        if year_value.isdigit():
+            delta = current_year - int(year_value)
+            recency = "current (<=1y)" if delta <= 1 else f"{delta} years old"
+        confidence = round(min(1.0, score * 0.6 + float(alignment.get("definition_alignment_score", 0.0)) * 0.4), 2)
+        row = {
+            "source_title": title,
+            "source_url": url,
+            "institution": institution_label,
+            "whitelisted_institution": is_whitelisted,
+            "extracted_date": extracted.get("date", ""),
+            "extracted_region": extracted.get("region", ""),
+            "benchmark_metric": alignment.get("metric", ""),
+            "extracted_value": extracted.get("value", ""),
+            "normalized_benchmark_value": normalized_value,
+            "definition_alignment_score": alignment.get("definition_alignment_score", 0.0),
+            "credibility_score": round(score, 2),
+            "confidence_score": confidence,
+            "why_used": why if why else "Relevant to query and benchmark extraction",
+            "date_recency": recency,
+            "model_Project_NPV": metric_snapshot.get("Project_NPV"),
+            "model_Project_IRR": metric_snapshot.get("Project_IRR"),
+            "model_DSCR_min": metric_snapshot.get("DSCR_min"),
+        }
+        if is_whitelisted:
+            whitelisted_rows.append(row)
+        else:
+            non_whitelisted_rows.append(row)
+
+    evidence_rows = (whitelisted_rows + non_whitelisted_rows)[:top_n]
+    return evidence_rows
+
+
+def _call_chat_provider(settings: ChatProviderSettings, messages: List[Dict[str, str]]) -> str:
+    """Send chat request through provider adapters with shared interface."""
+
+    if not settings.api_key.strip():
+        return ""
+    if not settings.base_url.strip():
+        return ""
+    try:
+        adapter = _create_provider_adapter(settings)
+        return adapter.generate(messages).strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_provider_payload(data: Mapping[str, object]) -> str:
+    """Extract assistant text from common provider response payload shapes."""
+
+    if not isinstance(data, Mapping):
+        return ""
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], Mapping) else {}
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            blocks: List[str] = []
+            for block in content:
+                if isinstance(block, Mapping):
+                    text = block.get("text")
+                    if isinstance(text, str) and text.strip():
+                        blocks.append(text.strip())
+            if blocks:
+                return "\n\n".join(blocks)
+    content_blocks = data.get("content")
+    if isinstance(content_blocks, list):
+        blocks: List[str] = []
+        for block in content_blocks:
+            if isinstance(block, Mapping):
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    blocks.append(text.strip())
+        if blocks:
+            return "\n\n".join(blocks)
+    output = data.get("output_text")
+    if isinstance(output, str) and output.strip():
+        return output
+    return ""
+
+
+def _create_provider_adapter(settings: ChatProviderSettings) -> BaseChatAdapter:
+    """Factory for provider adapters."""
+
+    if settings.provider_name == "OpenAI":
+        return OpenAIAdapter(settings)
+    if settings.provider_name == "Anthropic":
+        return AnthropicAdapter(settings)
+    if settings.provider_name == "Google Gemini":
+        return GeminiAdapter(settings)
+    return GenericOpenAICompatibleAdapter(settings)
+
+
+def _build_chatbot_fallback_reply(
+    user_prompt: str,
+    metrics: Mapping[str, object],
+    sandbox_output: Mapping[str, object],
+    web_sources: Sequence[Mapping[str, str]],
+) -> str:
+    """Return a prose-first fallback reply when provider calls are unavailable."""
+
+    npv = metrics.get("Project_NPV")
+    irr = metrics.get("Project_IRR")
+    dscr = metrics.get("DSCR_min")
+    metric_fragments: List[str] = []
+    if isinstance(npv, (int, float, np.floating)):
+        metric_fragments.append(f"project NPV is about {float(npv):,.2f}")
+    if isinstance(irr, (int, float, np.floating)):
+        metric_fragments.append(f"project IRR is roughly {float(irr) * 100:.2f}%")
+    if isinstance(dscr, (int, float, np.floating)):
+        metric_fragments.append(f"minimum DSCR is around {float(dscr):.2f}")
+    metric_sentence = "I checked the loaded model context and " + ", ".join(metric_fragments) + "." if metric_fragments else ""
+
+    sandbox_sentence = ""
+    if sandbox_output.get("used"):
+        if sandbox_output.get("ok"):
+            sandbox_sentence = f"I also executed your sandbox snippet successfully and obtained: {sandbox_output.get('result')}."
+        else:
+            sandbox_sentence = f"I attempted the sandbox snippet, but it returned an error: {sandbox_output.get('error')}."
+
+    web_sentence = ""
+    if web_sources:
+        web_sentence = (
+            f"For external comparison, I found {len(web_sources)} web references that can be used to benchmark assumptions."
+        )
+
+    return (
+        "Here is a practical interpretation of your request: "
+        f"{user_prompt.strip()}.\n\n"
+        f"{metric_sentence} {sandbox_sentence} {web_sentence}\n\n"
+        "Recommendation: if you want a tighter answer, share the exact KPI you want to optimize "
+        "(for example NPV, DSCR, or payback) and I will provide a targeted scenario-based response."
+    ).strip()
+
+
+def _build_lightweight_plan(
+    user_prompt: str,
+    prior_plans: Sequence[Mapping[str, object]],
+    sandbox_enabled: bool,
+    web_enabled: bool,
+) -> Dict[str, object]:
+    """Generate a lightweight per-turn plan that can be reused by follow-up turns."""
+
+    prompt = user_prompt.strip()
+    prompt_lower = prompt.lower()
+    prior_objective = ""
+    for item in reversed(prior_plans):
+        prior_objective = str(item.get("objective", "")).strip()
+        if prior_objective:
+            break
+
+    objective = prompt
+    if not objective and prior_objective:
+        objective = prior_objective
+    if not objective:
+        objective = "Provide a reasoned analytical response to the user's request."
+
+    sandbox_needed = sandbox_enabled and any(
+        token in prompt_lower
+        for token in (
+            "calculate",
+            "calc",
+            "simulate",
+            "simulation",
+            "python",
+            "code",
+            "table",
+            "dataframe",
+            "model this",
+        )
+    )
+    web_needed = web_enabled and any(
+        token in prompt_lower
+        for token in (
+            "benchmark",
+            "compare",
+            "market",
+            "industry",
+            "latest",
+            "current",
+            "reference",
+            "best practice",
+        )
+    )
+
+    return {
+        "objective": objective,
+        "clarification": "Objective set from current prompt; falls back to prior turn objective when needed.",
+        "sandbox_needed": sandbox_needed,
+        "web_needed": web_needed,
+        "execution": "Run selected tools, then synthesize a concise prose answer with interpretation and recommendation.",
+    }
+
+
+def _update_conversation_summary(history: Sequence[Mapping[str, object]], existing_summary: str) -> str:
+    """Maintain a rolling summary every five user turns."""
+
+    user_turns = [item for item in history if str(item.get("role", "")).lower() == "user"]
+    if not user_turns:
+        return existing_summary
+    if len(user_turns) % 5 != 0 and existing_summary.strip():
+        return existing_summary
+
+    recent = history[-10:]
+    summary_lines: List[str] = []
+    for item in recent:
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip().replace("\n", " ")
+        if not content:
+            continue
+        clipped = content[:180] + ("..." if len(content) > 180 else "")
+        summary_lines.append(f"{role}: {clipped}")
+    return " | ".join(summary_lines)
+
+
+def _update_fact_memory(
+    user_prompt: str,
+    assistant_text: str,
+    metrics: Mapping[str, object],
+    existing_facts: Mapping[str, object],
+) -> Dict[str, object]:
+    """Update persistent fact memory with assumptions, KPIs, constraints, and decisions."""
+
+    facts = dict(existing_facts)
+    text_blob = f"{user_prompt}\n{assistant_text}".lower()
+    constraints = set(str(x) for x in facts.get("constraints", []))
+    assumptions = set(str(x) for x in facts.get("assumptions", []))
+    decisions = list(facts.get("decisions", [])) if isinstance(facts.get("decisions"), list) else []
+
+    if "assume" in text_blob or "assumption" in text_blob:
+        assumptions.add(user_prompt.strip()[:200])
+    for keyword in ("must", "limit", "cannot", "constraint", "target", "threshold"):
+        if keyword in text_blob:
+            constraints.add(keyword)
+    for keyword in ("recommend", "should", "decision", "choose", "select"):
+        if keyword in text_blob:
+            decision_note = assistant_text.strip()[:220]
+            if decision_note:
+                decisions.append(decision_note)
+            break
+
+    kpi_keys = ["Project_NPV", "Project_IRR", "Equity_IRR", "DSCR_min", "Payback_Year"]
+    kpis = {k: metrics.get(k) for k in kpi_keys if k in metrics}
+
+    facts["assumptions"] = sorted(x for x in assumptions if x)
+    facts["constraints"] = sorted(x for x in constraints if x)
+    facts["decisions"] = decisions[-10:]
+    facts["kpis"] = kpis
+    return facts
+
+
+def _reasoning_checklist(
+    response_text: str,
+    user_prompt: str,
+    plan: Mapping[str, object],
+    sandbox_output: Mapping[str, object],
+    web_sources: Sequence[Mapping[str, str]],
+) -> Dict[str, bool]:
+    """Assess answer quality against internal reasoning checklist criteria."""
+
+    text = response_text.lower()
+    prompt = user_prompt.lower()
+    assumptions = any(token in text for token in ("assumption", "assume", "assuming"))
+    requested_tools = bool(plan.get("sandbox_needed")) or bool(plan.get("web_needed"))
+    tool_used = bool(sandbox_output.get("used")) or bool(web_sources)
+    used_requested_data_tools = (not requested_tools) or tool_used
+    if any(token in prompt for token in ("calculate", "aggregate", "compare")) and not tool_used:
+        used_requested_data_tools = False
+    causality = any(token in text for token in ("because", "therefore", "due to", "driven by", "leads to"))
+    recommendation = any(token in text for token in ("recommend", "should", "action", "next step"))
+    caveat = any(token in text for token in ("caveat", "risk", "however", "uncertain", "limitation"))
+    return {
+        "stated_assumptions": assumptions,
+        "used_requested_data_tools": used_requested_data_tools,
+        "explained_causality": causality,
+        "recommendation_and_caveat": recommendation and caveat,
+    }
+
+
+def _enforce_reasoning_checklist(
+    response_text: str,
+    checklist: Mapping[str, bool],
+    plan: Mapping[str, object],
+) -> str:
+    """Append missing checklist sections so final answer is complete."""
+
+    additions: List[str] = []
+    if not checklist.get("stated_assumptions", False):
+        additions.append("Assumption: This guidance assumes current model inputs and base-case KPI definitions remain unchanged.")
+    if not checklist.get("used_requested_data_tools", False):
+        additions.append(
+            f"Tool/Data note: Requested tool usage may be incomplete for this turn. Planned tool path was sandbox={plan.get('sandbox_needed')} web={plan.get('web_needed')}."
+        )
+    if not checklist.get("explained_causality", False):
+        additions.append("Causality: The recommendation is driven by how operating cash flow affects debt service coverage and valuation metrics.")
+    if not checklist.get("recommendation_and_caveat", False):
+        additions.append("Recommendation + caveat: Prioritize DSCR resilience first, but note outcomes remain sensitive to price and capex uncertainty.")
+    if not additions:
+        return response_text
+    return response_text.strip() + "\n\n" + "\n".join(f"- {line}" for line in additions)
+
+
+def _run_offline_chat_evaluation(model_results: Mapping[str, object]) -> pd.DataFrame:
+    """Run offline heuristic evaluation set for chatbot quality checks."""
+
+    rows: List[Dict[str, object]] = []
+    metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
+    for case in CHAT_EVAL_PROMPTS:
+        prompt = case["prompt"]
+        expected_tool = case["expected_tool"]
+        start = time.perf_counter()
+        synthetic_plan = {
+            "sandbox_needed": expected_tool in {"tool_calc", "tool_dataframe_aggregate", "tool_scenario_compare"},
+            "web_needed": expected_tool == "web",
+        }
+        synthetic_sandbox = {"used": synthetic_plan["sandbox_needed"], "ok": True, "result": "synthetic"}
+        synthetic_web = [{"title": "Synthetic reference", "url": "https://example.com"}] if synthetic_plan["web_needed"] else []
+        response = _build_chatbot_fallback_reply(prompt, metrics, synthetic_sandbox, synthetic_web)
+        checklist = _reasoning_checklist(response, prompt, synthetic_plan, synthetic_sandbox, synthetic_web)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        token_estimate = max(1, int(len(response) / 4))
+        rows.append(
+            {
+                "prompt": prompt,
+                "expected_tool": expected_tool,
+                "factual_grounding": float(checklist["stated_assumptions"]),
+                "coherence": 1.0 if len(response.split()) >= 25 else 0.5,
+                "tool_use_correctness": 1.0 if ((expected_tool == "none") or checklist["used_requested_data_tools"]) else 0.0,
+                "latency_ms": round(elapsed_ms, 2),
+                "cost_tokens_estimate": token_estimate,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_chatbot_tab(model_results: Mapping[str, object]) -> None:
+    st.subheader("Intelligent Analytical Chatbot")
+    st.caption(
+        "Reasoning-first assistant with conversation memory, optional sandbox execution, "
+        "selective web comparison, and multi-provider LLM settings."
+    )
+
+    history = st.session_state.setdefault("chat_history", [])
+    plans = st.session_state.setdefault("chat_plans", [])
+    conversation_summary = st.session_state.setdefault("chat_summary", "")
+    fact_memory = st.session_state.setdefault(
+        "chat_fact_memory",
+        {"assumptions": [], "constraints": [], "decisions": [], "kpis": {}},
+    )
+    provider_options = list(CHAT_PROVIDER_DEFAULTS.keys())
+    selected_provider = st.selectbox("Provider", provider_options, key="chat_provider")
+    defaults = CHAT_PROVIDER_DEFAULTS[selected_provider]
+
+    col1, col2, col3 = st.columns(3)
+    model_name = col1.text_input("Model name", value=st.session_state.get("chat_model_name", "gpt-4.1-mini"), key="chat_model_name")
+    api_key = col2.text_input("API key", value=st.session_state.get("chat_api_key", ""), type="password", key="chat_api_key")
+    base_url = col3.text_input("Base URL", value=st.session_state.get("chat_base_url", str(defaults.get("base_url", ""))), key="chat_base_url")
+    col4, col5, col6 = st.columns(3)
+    temperature = col4.number_input("Temperature", min_value=0.0, max_value=2.0, value=float(st.session_state.get("chat_temperature", 0.2)), step=0.1, key="chat_temperature")
+    max_tokens = int(col5.number_input("Max tokens", min_value=64, max_value=8192, value=int(st.session_state.get("chat_max_tokens", 1200)), step=64, key="chat_max_tokens"))
+    reasoning_mode = col6.selectbox("Reasoning mode", ["", "low", "medium", "high"], index=2, key="chat_reasoning_mode")
+
+    st.write(
+        f"Capabilities: reasoning={_chat_supports(selected_provider, 'supports_reasoning')}, "
+        f"tools={_chat_supports(selected_provider, 'supports_tools')}, "
+        f"web={_chat_supports(selected_provider, 'supports_web_search')}"
+    )
+
+    with st.expander("Conversation history", expanded=False):
+        if history:
+            for item in history:
+                st.markdown(f"**{item.get('role', 'assistant').title()}:** {item.get('content', '')}")
+        else:
+            st.info("No messages yet.")
+        if st.button("Clear history", key="clear_chat_history"):
+            st.session_state["chat_history"] = []
+            st.session_state["chat_plans"] = []
+            st.session_state["chat_summary"] = ""
+            st.session_state["chat_fact_memory"] = {"assumptions": [], "constraints": [], "decisions": [], "kpis": {}}
+            _safe_rerun()
+
+    with st.expander("Planner memory", expanded=False):
+        if plans:
+            for idx, plan in enumerate(plans[-5:], start=max(1, len(plans) - 4)):
+                st.markdown(
+                    f"**Turn {idx} objective:** {plan.get('objective', '')}\n\n"
+                    f"- Sandbox needed: {plan.get('sandbox_needed')}\n"
+                    f"- Web needed: {plan.get('web_needed')}\n"
+                    f"- Execution: {plan.get('execution', '')}"
+                )
+        else:
+            st.caption("No saved plans yet.")
+    with st.expander("Conversation summary & fact memory", expanded=False):
+        st.write(f"Summary: {conversation_summary or 'No summary yet.'}")
+        st.markdown("**Fact memory**")
+        st.write(f"Assumptions: {', '.join(map(str, fact_memory.get('assumptions', []))) or 'None'}")
+        st.write(f"Constraints: {', '.join(map(str, fact_memory.get('constraints', []))) or 'None'}")
+        st.write(f"Recent decisions: {' | '.join(map(str, fact_memory.get('decisions', []))) or 'None'}")
+        st.write(f"Tracked KPIs: {fact_memory.get('kpis', {})}")
+
+    use_sandbox = st.checkbox("Use sandbox execution for intermediate calculations", value=True, key="chat_use_sandbox")
+    use_web = st.checkbox("Use web search for comparative analysis", value=True, key="chat_use_web")
+    st.markdown("#### Structured tools")
+    tool_choice = st.selectbox(
+        "Select tool",
+        ["none", "tool_calc(expression)", "tool_dataframe_aggregate(...)", "tool_scenario_compare(...)"],
+        key="chat_tool_choice",
+    )
+    calc_expression = st.text_input(
+        "tool_calc expression",
+        value=st.session_state.get("chat_calc_expression", ""),
+        key="chat_calc_expression",
+    )
+    aggregate_table = st.selectbox(
+        "tool_dataframe_aggregate table",
+        ["revenue", "production_monthly", "price_curves", "cash_waterfall", "credit_metrics_yearly", "lender_case_results"],
+        key="chat_aggregate_table",
+    )
+    aggregate_group = st.text_input("Group by column (optional)", value=st.session_state.get("chat_aggregate_group", ""), key="chat_aggregate_group")
+    aggregate_metric = st.text_input("Metric column", value=st.session_state.get("chat_aggregate_metric", "revenue"), key="chat_aggregate_metric")
+    aggregate_fn = st.selectbox("Aggregation", ["sum", "mean", "min", "max", "median"], key="chat_aggregate_fn")
+    scenario_metric = st.text_input("tool_scenario_compare metric", value=st.session_state.get("chat_scenario_metric", "Project_NPV"), key="chat_scenario_metric")
+    scenario_top_n = int(st.number_input("Top N scenario rows", min_value=1, max_value=50, value=10, step=1, key="chat_scenario_top_n"))
+
+    advanced_mode = st.checkbox("Advanced mode: run raw Python sandbox code", value=False, key="chat_advanced_mode")
+    sandbox_code = ""
+    if advanced_mode:
+        sandbox_code = st.text_area(
+            "Sandbox code (advanced). Set `result = ...` to expose output.",
+            value=st.session_state.get("chat_sandbox_code", ""),
+            height=120,
+            key="chat_sandbox_code",
+        )
+    user_prompt = st.text_area("Ask the assistant", height=140, key="chat_prompt")
+
+    if st.button("Send", key="chat_send"):
+        if not user_prompt.strip():
+            st.warning("Enter a prompt to continue.")
+            return
+
+        settings = ChatProviderSettings(
+            provider_name=selected_provider,
+            model_name=model_name.strip() or "gpt-4.1-mini",
+            api_key=api_key,
+            base_url=base_url.strip(),
+            temperature=float(temperature),
+            max_tokens=max_tokens,
+            reasoning_mode=reasoning_mode,
+            use_tools=bool(use_sandbox),
+            use_web_search=bool(use_web),
+        )
+        plan = _build_lightweight_plan(
+            user_prompt=user_prompt,
+            prior_plans=plans,
+            sandbox_enabled=settings.use_tools,
+            web_enabled=settings.use_web_search and _chat_supports(selected_provider, "supports_web_search"),
+        )
+        if tool_choice != "none":
+            plan["sandbox_needed"] = True
+        plans.append(plan)
+        st.session_state["chat_plans"] = plans
+
+        sandbox_output: Dict[str, object] = {"used": False}
+        if bool(plan.get("sandbox_needed")):
+            if tool_choice == "tool_calc(expression)":
+                sandbox_output = _tool_calc(calc_expression)
+            elif tool_choice == "tool_dataframe_aggregate(...)":
+                sandbox_output = _tool_dataframe_aggregate(
+                    model_results=model_results,
+                    table_name=aggregate_table,
+                    group_by=aggregate_group.strip(),
+                    metric=aggregate_metric.strip(),
+                    agg=aggregate_fn,
+                )
+            elif tool_choice == "tool_scenario_compare(...)":
+                sandbox_output = _tool_scenario_compare(
+                    model_results=model_results,
+                    metric_name=scenario_metric.strip(),
+                    top_n=scenario_top_n,
+                )
+            elif advanced_mode and sandbox_code.strip():
+                sandbox_output = _run_sandbox(sandbox_code)
+
+        web_sources: List[Dict[str, str]] = []
+        evidence_rows: List[Dict[str, object]] = []
+        if bool(plan.get("web_needed")):
+            evidence_rows = _build_evidence_pipeline(
+                query=user_prompt,
+                model_metrics=model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {},
+                top_n=5,
+            )
+            web_sources = [{"title": str(row.get("source_title", "")), "url": str(row.get("source_url", ""))} for row in evidence_rows]
+
+        compact_metrics = model_results.get("metrics", {}) if isinstance(model_results.get("metrics", {}), Mapping) else {}
+        system_prompt = (
+            "You are an intelligent analytical assistant. Respond with sections: "
+            "Direct answer, Internal reasoning summary, Sandbox output usage, External comparison, "
+            "Interpretation, Recommendation, Sources. Keep answers concise and actionable."
+        )
+        metric_lines = ", ".join(
+            f"{key}={value}"
+            for key, value in compact_metrics.items()
+            if key in {"Project_NPV", "Project_IRR", "Equity_IRR", "DSCR_min", "Payback_Year"}
+        )
+        web_lines = "; ".join(f"{src.get('title', '')} ({src.get('url', '')})" for src in web_sources)
+        sandbox_line = (
+            f"used={sandbox_output.get('used')}, ok={sandbox_output.get('ok')}, result={sandbox_output.get('result')}, "
+            f"error={sandbox_output.get('error')}"
+        )
+        context_blob = (
+            f"Model metrics: {metric_lines or 'none'}\n"
+            f"Sandbox summary: {sandbox_line}\n"
+            f"Web references: {web_lines or 'none'}\n"
+            f"Evidence summary rows: {evidence_rows[:3] if evidence_rows else 'none'}"
+        )
+        llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        memory_prefix = (
+            f"Conversation summary: {conversation_summary or 'none'}\n"
+            f"Fact memory: assumptions={fact_memory.get('assumptions', [])}, "
+            f"constraints={fact_memory.get('constraints', [])}, "
+            f"decisions={fact_memory.get('decisions', [])}, "
+            f"kpis={fact_memory.get('kpis', {})}"
+        )
+        llm_messages.append({"role": "system", "content": memory_prefix})
+        llm_messages.extend([{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in history[-8:]])
+        llm_messages.append(
+            {
+                "role": "user",
+                "content": f"User prompt:\n{user_prompt}\n\nContext:\n{context_blob}",
+            }
+        )
+        assistant_text = _call_chat_provider(settings, llm_messages)
+        if not assistant_text.strip():
+            assistant_text = _build_chatbot_fallback_reply(
+                user_prompt=user_prompt,
+                metrics=compact_metrics,
+                sandbox_output=sandbox_output,
+                web_sources=web_sources,
+            )
+        checklist = _reasoning_checklist(
+            response_text=assistant_text,
+            user_prompt=user_prompt,
+            plan=plan,
+            sandbox_output=sandbox_output,
+            web_sources=web_sources,
+        )
+        assistant_text = _enforce_reasoning_checklist(assistant_text, checklist, plan)
+
+        history.append({"role": "user", "content": user_prompt})
+        history.append({"role": "assistant", "content": assistant_text})
+        st.session_state["chat_history"] = history
+        st.session_state["chat_summary"] = _update_conversation_summary(history, conversation_summary)
+        st.session_state["chat_fact_memory"] = _update_fact_memory(
+            user_prompt=user_prompt,
+            assistant_text=assistant_text,
+            metrics=compact_metrics,
+            existing_facts=fact_memory,
+        )
+
+        st.markdown("### Direct answer")
+        st.write(assistant_text)
+        st.markdown("### Planner step")
+        st.write(
+            f"Objective: {plan.get('objective')}\n\n"
+            f"Clarification: {plan.get('clarification')}\n\n"
+            f"Sandbox needed: {plan.get('sandbox_needed')} | Web needed: {plan.get('web_needed')}\n\n"
+            f"Execution plan: {plan.get('execution')}"
+        )
+        st.markdown("### Internal reasoning checklist")
+        st.write(
+            f"Stated assumptions: {checklist.get('stated_assumptions')}\n\n"
+            f"Used requested data/tools: {checklist.get('used_requested_data_tools')}\n\n"
+            f"Explained causality: {checklist.get('explained_causality')}\n\n"
+            f"Recommendation + caveat: {checklist.get('recommendation_and_caveat')}"
+        )
+        st.markdown("### Internal reasoning")
+        st.info("Reasoning summary is embedded in the assistant response.")
+        st.markdown("### Sandbox output")
+        if sandbox_output.get("used"):
+            if sandbox_output.get("ok"):
+                st.write(
+                    f"The sandbox ran successfully. Result: {sandbox_output.get('result')}. "
+                    f"Variables produced: {', '.join(map(str, sandbox_output.get('locals', [])))}."
+                )
+            else:
+                st.write(f"The sandbox run failed with error: {sandbox_output.get('error')}.")
+        else:
+            st.caption("Sandbox execution was not used for this turn.")
+        st.markdown("### External comparison via web search")
+        if evidence_rows:
+            evidence_df = pd.DataFrame(evidence_rows)
+            st.dataframe(evidence_df, use_container_width=True)
+        else:
+            st.caption("No web comparison data was collected.")
+        st.markdown("### Interpretation")
+        st.caption("Use the response to validate assumptions against model metrics and external references.")
+        st.markdown("### Recommendation")
+        st.caption("Iterate with tighter prompts, explicit assumptions, and optional sandbox scripts for reproducible steps.")
+        st.markdown("### Sources")
+        for src in web_sources:
+            st.markdown(f"- [{src['title']}]({src['url']})")
+
+    with st.expander("Offline evaluation set (quality diagnostics)", expanded=False):
+        st.caption("Runs a 20-prompt offline heuristic evaluation across grounding, coherence, tool-use correctness, latency, and token-cost estimate.")
+        if st.button("Run offline evaluation", key="chat_run_eval"):
+            eval_df = _run_offline_chat_evaluation(model_results)
+            st.dataframe(eval_df, use_container_width=True)
+            if not eval_df.empty:
+                summary = pd.DataFrame(
+                    [
+                        {
+                            "avg_factual_grounding": float(eval_df["factual_grounding"].mean()),
+                            "avg_coherence": float(eval_df["coherence"].mean()),
+                            "avg_tool_use_correctness": float(eval_df["tool_use_correctness"].mean()),
+                            "avg_latency_ms": float(eval_df["latency_ms"].mean()),
+                            "avg_cost_tokens_estimate": float(eval_df["cost_tokens_estimate"].mean()),
+                        }
+                    ]
+                )
+                st.dataframe(summary, use_container_width=True)
 
 
 @contextmanager
@@ -365,10 +1547,141 @@ DEFAULT_EDIT_STATE_KEY = "default_edit_state"
 _FACTORY_DEFAULT_FRAMES_CACHE: Optional[Dict[str, pd.DataFrame]] = None
 
 
+def _inject_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --sugar-ink: #172033;
+            --sugar-muted: #5f6f85;
+            --sugar-brand: #15803d;
+            --sugar-gold: #b7791f;
+            --sugar-panel: rgba(255, 255, 255, 0.9);
+        }
+        .block-container {
+            padding-top: 1.35rem;
+            padding-bottom: 3rem;
+            max-width: 1450px;
+        }
+        .sugar-hero {
+            margin-bottom: 1rem;
+            padding: 1.6rem 1.75rem;
+            border-radius: 24px;
+            border: 1px solid rgba(21, 128, 61, 0.16);
+            background:
+                linear-gradient(135deg, rgba(240, 253, 244, 0.98), rgba(255, 255, 255, 0.94)),
+                radial-gradient(circle at top right, rgba(183, 121, 31, 0.12), transparent 32%);
+            box-shadow: 0 18px 42px rgba(15, 23, 42, 0.07);
+        }
+        .sugar-kicker {
+            margin: 0 0 0.4rem;
+            color: var(--sugar-brand);
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.14em;
+            text-transform: uppercase;
+        }
+        .sugar-title {
+            margin: 0;
+            color: var(--sugar-ink);
+            font-size: clamp(2rem, 2.7vw, 3rem);
+            font-weight: 800;
+            line-height: 1.05;
+        }
+        .sugar-copy {
+            max-width: 60rem;
+            margin: 0.65rem 0 0;
+            color: var(--sugar-muted);
+            font-size: 0.98rem;
+            line-height: 1.55;
+        }
+        .sugar-workflow {
+            border: 1px solid rgba(21, 128, 61, 0.12);
+            border-radius: 8px;
+            background: var(--sugar-panel);
+            color: var(--sugar-muted);
+            margin: 0 0 1rem;
+            padding: 0.85rem 1rem;
+        }
+        .sugar-workflow strong {
+            color: var(--sugar-ink);
+        }
+        div[data-baseweb="tab-list"] {
+            gap: 0.45rem;
+            margin-bottom: 0.9rem;
+        }
+        div[data-baseweb="tab-list"] button {
+            min-height: 2.8rem;
+            border-radius: 999px;
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            background: rgba(255, 255, 255, 0.78);
+            color: var(--sugar-muted);
+            padding: 0.2rem 0.9rem;
+        }
+        div[data-baseweb="tab-list"] button[aria-selected="true"] {
+            background: linear-gradient(135deg, #15803d, #b7791f);
+            border-color: transparent;
+            color: #ffffff;
+            box-shadow: 0 10px 22px rgba(21, 128, 61, 0.15);
+        }
+        div[data-testid="stMetric"] {
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 0.65rem 0.75rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_model_hero() -> None:
+    st.markdown(
+        """
+        <section class="sugar-hero">
+            <p class="sugar-kicker">Bioethanol project finance</p>
+            <h1 class="sugar-title">Sugar Cane Bioethanol</h1>
+            <p class="sugar-copy">
+                Model the full cane-to-product value stack across ethanol, sugar,
+                electricity, animal feed, financing, lender cases, sensitivities,
+                and scenario comparisons.
+            </p>
+        </section>
+        <div class="sugar-workflow">
+            <strong>Workflow</strong><br>
+            Use Model Controls for high-level drivers, refine canonical input tables,
+            then review statements, production economics, sensitivities, and AI-assisted checks.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_dataframe(df: pd.DataFrame, title: str, key: str) -> None:
     """Render a dataframe without exposing download controls."""
     st.subheader(title)
     st.dataframe(df, use_container_width=True, key=f"df_{key}")
+
+
+def _ensure_statement_columns(statement_key: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Guarantee key financial columns exist so statement views stay complete."""
+
+    required: Dict[str, List[str]] = {
+        "pnl": ["DirectCosts", "StaffCosts", "OtherOpexCosts", "Interest"],
+        "cashflow": ["CFO", "CFI", "CFF"],
+        "balancesheet": ["Inventory", "PPE_Gross", "Debt", "AccountsPayable", "TotalLiabilities"],
+    }
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    columns = required.get(statement_key, [])
+    if not columns:
+        return df
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = 0.0
+    return out
 
 
 def _ensure_matplotlib() -> bool:
@@ -405,7 +1718,6 @@ def _friendly_label(label: str) -> str:
 
 def _render_horizon_timeline_chart(
     horizon: Mapping[str, object],
-    production_horizon: Mapping[str, object],
 ) -> None:
     try:
         proj_start = pd.Timestamp(
@@ -418,12 +1730,8 @@ def _render_horizon_timeline_chart(
         st.info("Projection horizon is incomplete; add start and end years to view the timeline.")
         return
 
-    try:
-        prod_start = pd.Timestamp(year=int(production_horizon.get("start_year", proj_start.year)), month=1, day=1)
-        prod_end = pd.Timestamp(year=int(production_horizon.get("end_year", proj_end.year)), month=12, day=31)
-    except Exception:
-        prod_start = proj_start
-        prod_end = proj_end
+    prod_start = proj_start
+    prod_end = proj_end
 
     bars = [
         ("Projection horizon", proj_start, proj_end, "#1f77b4"),
@@ -1043,6 +2351,9 @@ def _scenario_overrides_from_table(scenario_df: pd.DataFrame) -> Dict[str, Dict[
                 pass
         if production_override:
             override["production"] = production_override
+        increment_profile = str(row.get("increment_profile", "")).strip()
+        if increment_profile:
+            override["increment_profile"] = increment_profile
         if override:
             overrides[name] = override
 
@@ -1106,25 +2417,215 @@ def _generate_excel_bytes(
     buffer = BytesIO()
     engine = resolve_excel_engine()
     sheets: OrderedDict[str, pd.DataFrame] = OrderedDict()
+    chart_builders: OrderedDict[str, Callable[[], Optional["plt.Figure"]]] = OrderedDict()
+
+    def _to_sheet_name(name: str) -> str:
+        clean = re.sub(r"[:\\\\/?*\\[\\]]", "_", name).strip()
+        return clean[:31] if len(clean) > 31 else clean
+
+    def _make_line_figure(df: pd.DataFrame, x_col: str, value_cols: Sequence[str], title: str, ylabel: str = "Value") -> Optional["plt.Figure"]:
+        if plt is None or not isinstance(df, pd.DataFrame) or df.empty or x_col not in df.columns:
+            return None
+        cols = [c for c in value_cols if c in df.columns]
+        if not cols:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for col in cols:
+            ax.plot(df[x_col], pd.to_numeric(df[col], errors="coerce"), label=_friendly_label(col))
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        return fig
+
+    def _make_bar_figure(df: pd.DataFrame, category_col: str, value_cols: Sequence[str], title: str, ylabel: str = "Value") -> Optional["plt.Figure"]:
+        if plt is None or not isinstance(df, pd.DataFrame) or df.empty or category_col not in df.columns:
+            return None
+        cols = [c for c in value_cols if c in df.columns]
+        if not cols:
+            return None
+        fig, ax = plt.subplots(figsize=(9, 4))
+        plot_df = df[[category_col, *cols]].copy().set_index(category_col)
+        plot_df = plot_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        plot_df.plot(kind="bar", ax=ax)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        fig.tight_layout()
+        return fig
 
     dashboard = results.get("dashboard") if isinstance(results, Mapping) else None
+    metrics = results.get("metrics", {}) if isinstance(results, Mapping) else {}
+    statements_monthly = results.get("statements_monthly", {}) if isinstance(results, Mapping) else {}
+    statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+
+    summary_rows = [
+        {"Metric": k, "Value": v}
+        for k, v in (metrics.items() if isinstance(metrics, Mapping) else [])
+    ]
+    if summary_rows:
+        sheets["Summary"] = pd.DataFrame(summary_rows)
     if isinstance(dashboard, Mapping):
         snapshot = dashboard.get("assumptions_snapshot")
         if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
-            sheets["Summary"] = snapshot
-        overview = dashboard.get("overview_metrics")
-        if isinstance(overview, pd.DataFrame) and not overview.empty:
-            sheets["Metrics"] = overview
-        annual_prod = dashboard.get("annual_production")
-        if isinstance(annual_prod, pd.DataFrame) and not annual_prod.empty:
-            sheets["Production"] = annual_prod
+            sheets["Summary_Assumptions"] = snapshot
+    if "Summary" in sheets:
+        chart_builders[_to_sheet_name("Summary_Plots")] = lambda: _make_bar_figure(
+            sheets["Summary"].head(10), "Metric", ["Value"], "Summary KPI snapshot"
+        )
 
-    statements_annual = results.get("statements_annual") if isinstance(results, Mapping) else None
+    financial_sheet = []
     if isinstance(statements_annual, Mapping):
         for key in ("pnl", "cashflow", "balancesheet"):
             df = statements_annual.get(key)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                sheets[f"Annual_{key}"] = df
+                sheets[f"Financial_{key}"] = df
+                financial_sheet.append((key, df))
+    if financial_sheet:
+        def _financial_fig() -> Optional["plt.Figure"]:
+            if plt is None:
+                return None
+            key, df = financial_sheet[0]
+            x_col = "year" if "year" in df.columns else "date"
+            value_cols = [c for c in df.columns if c not in {x_col}][:4]
+            return _make_line_figure(df, x_col, value_cols, f"Financial Statements ({key.upper()})", "Amount")
+        chart_builders[_to_sheet_name("Financial_Statements_Plots")] = _financial_fig
+
+    prod_df = results.get("production_monthly") if isinstance(results, Mapping) else None
+    price_df = results.get("price_curves") if isinstance(results, Mapping) else None
+    revenue_df = results.get("revenue") if isinstance(results, Mapping) else None
+    if isinstance(prod_df, pd.DataFrame) and not prod_df.empty:
+        sheets["Production_Pricing_Prod"] = prod_df
+    if isinstance(price_df, pd.DataFrame) and not price_df.empty:
+        sheets["Production_Pricing_Price"] = price_df
+    if isinstance(revenue_df, pd.DataFrame) and not revenue_df.empty:
+        sheets["Production_Pricing_Revenue"] = revenue_df
+
+    def _prod_price_fig() -> Optional["plt.Figure"]:
+        if plt is None:
+            return None
+        if isinstance(price_df, pd.DataFrame) and not price_df.empty and {"date", "product", "price"}.issubset(price_df.columns):
+            pivot = price_df.pivot_table(index="date", columns="product", values="price", aggfunc="mean").reset_index()
+            return _make_line_figure(pivot, "date", [c for c in pivot.columns if c != "date"], "Production & Pricing - Price curves", "Price")
+        if isinstance(prod_df, pd.DataFrame) and not prod_df.empty and {"date", "product", "volume"}.issubset(prod_df.columns):
+            pivot = prod_df.pivot_table(index="date", columns="product", values="volume", aggfunc="sum").reset_index()
+            return _make_line_figure(pivot, "date", [c for c in pivot.columns if c != "date"], "Production & Pricing - Volume", "Volume")
+        return None
+    chart_builders[_to_sheet_name("Production_Pricing_Plots")] = _prod_price_fig
+
+    if isinstance(dashboard, Mapping):
+        dashboard_sheet_map: OrderedDict[str, str] = OrderedDict(
+            [
+                ("Dashboard_Annual_Production", "annual_production"),
+                ("Dashboard_Annual_Cashflow", "annual_cashflow"),
+                ("Dashboard_DSCR_Trend", "dscr_trend"),
+                ("Dashboard_Debt_Service", "debt_service_summary"),
+                ("Dashboard_Working_Capital", "working_capital_trend"),
+                ("Dashboard_Cost_Structure", "cost_structure_annual"),
+                ("Dashboard_Labour_Summary", "labour_summary"),
+                ("Dashboard_Break_Even", "break_even_per_product"),
+                ("Dashboard_Cumulative_CF", "cumulative_cashflows"),
+                ("Dashboard_Revenue_vs_Prod", "revenue_vs_production"),
+            ]
+        )
+        for sheet_name, dashboard_key in dashboard_sheet_map.items():
+            df = dashboard.get(dashboard_key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                sheets[sheet_name] = df
+
+        annual_production_df = dashboard.get("annual_production")
+        if isinstance(annual_production_df, pd.DataFrame) and not annual_production_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Annual_Production_Plots")] = lambda: _make_bar_figure(
+                annual_production_df, "year", [c for c in annual_production_df.columns if c != "year"], "Annual production by product", "Volume"
+            )
+
+        annual_cashflow_df = dashboard.get("annual_cashflow")
+        if isinstance(annual_cashflow_df, pd.DataFrame) and not annual_cashflow_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Annual_Cashflow_Plots")] = lambda: _make_bar_figure(
+                annual_cashflow_df, "year", [c for c in ("NetCashFlow", "CFO") if c in annual_cashflow_df.columns], "Annual cash flow", "Amount"
+            )
+
+        dscr_df = dashboard.get("dscr_trend")
+        if isinstance(dscr_df, pd.DataFrame) and not dscr_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_DSCR_Trend_Plots")] = lambda: _make_line_figure(
+                dscr_df, "date", [c for c in ("DSCR", "CFADS", "debt_service") if c in dscr_df.columns], "DSCR and debt service trend", "Value"
+            )
+
+        debt_service_df = dashboard.get("debt_service_summary")
+        if isinstance(debt_service_df, pd.DataFrame) and not debt_service_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Debt_Service_Plots")] = lambda: _make_bar_figure(
+                debt_service_df, "year", [c for c in ("interest", "principal", "draw") if c in debt_service_df.columns], "Debt service summary", "Amount"
+            )
+
+        wc_df = dashboard.get("working_capital_trend")
+        if isinstance(wc_df, pd.DataFrame) and not wc_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Working_Capital_Plots")] = lambda: _make_line_figure(
+                wc_df, "date", [c for c in ("accounts_receivable", "inventory", "accounts_payable") if c in wc_df.columns], "Working capital components", "Amount"
+            )
+
+        cost_df = dashboard.get("cost_structure_annual")
+        if isinstance(cost_df, pd.DataFrame) and not cost_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Cost_Structure_Plots")] = lambda: _make_bar_figure(
+                cost_df, "year", [c for c in cost_df.columns if c != "year"], "Annual cost structure", "Amount"
+            )
+
+        labour_df = dashboard.get("labour_summary")
+        if isinstance(labour_df, pd.DataFrame) and not labour_df.empty and {"date", "dept", "total_cost"}.issubset(labour_df.columns):
+            def _labour_fig() -> Optional["plt.Figure"]:
+                labour_plot = labour_df.groupby(["date", "dept"])["total_cost"].sum().unstack(fill_value=0.0).reset_index()
+                return _make_line_figure(labour_plot, "date", [c for c in labour_plot.columns if c != "date"], "Labour cost by department", "Amount")
+            chart_builders[_to_sheet_name("Dashboard_Labour_Plots")] = _labour_fig
+
+        break_even_df = dashboard.get("break_even_per_product")
+        if isinstance(break_even_df, pd.DataFrame) and not break_even_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Break_Even_Plots")] = lambda: _make_bar_figure(
+                break_even_df, "product", [c for c in ("actual_volume", "break_even_units") if c in break_even_df.columns], "Actual vs break-even volume", "Units"
+            )
+
+        cumulative_cf_df = dashboard.get("cumulative_cashflows")
+        if isinstance(cumulative_cf_df, pd.DataFrame) and not cumulative_cf_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Cumulative_CF_Plots")] = lambda: _make_line_figure(
+                cumulative_cf_df, "date", [c for c in ("project_cumulative", "equity_cumulative") if c in cumulative_cf_df.columns], "Cumulative cash flows", "Amount"
+            )
+
+        rev_prod_df = dashboard.get("revenue_vs_production")
+        if isinstance(rev_prod_df, pd.DataFrame) and not rev_prod_df.empty:
+            chart_builders[_to_sheet_name("Dashboard_Revenue_vs_Prod_Plots")] = lambda: _make_line_figure(
+                rev_prod_df, "volume", [c for c in ("revenue", "average_price") if c in rev_prod_df.columns], "Revenue vs production", "Value"
+            )
+
+    # Sensitivity page content
+    sens_df = results.get("sensitivities") if isinstance(results, Mapping) else None
+    if not isinstance(sens_df, pd.DataFrame) or sens_df.empty:
+        try:
+            if isinstance(cfg, Mapping):
+                sens_df = sensitivity_tornado(cfg, {"metrics": results.get("metrics", {})}, lambda c: run_full_model(c), None)
+        except Exception:
+            sens_df = pd.DataFrame()
+    if isinstance(sens_df, pd.DataFrame) and not sens_df.empty:
+        sheets["Sensitivities"] = sens_df
+        chart_builders[_to_sheet_name("Sensitivities_Plots")] = lambda: _make_bar_figure(
+            sens_df.head(12), "driver" if "driver" in sens_df.columns else sens_df.columns[0], ["delta"] if "delta" in sens_df.columns else [sens_df.columns[-1]], "Sensitivity tornado (top drivers)"
+        )
+
+    for label, key in (
+        ("IFRS_SoPL_OCI_Monthly", "sopl_oci_monthly"),
+        ("IFRS_SoPL_OCI_Annual", "sopl_oci_annual"),
+        ("IFRS_SoFP_Monthly", "sofp_monthly"),
+        ("IFRS_SoFP_Annual", "sofp_annual"),
+        ("IFRS_SoCE_Monthly", "socie_monthly"),
+        ("IFRS_SoCE_Annual", "socie_annual"),
+        ("IFRS_SCF_Indirect_Monthly", "scf_indirect_monthly"),
+        ("IFRS_SCF_Indirect_Annual", "scf_indirect_annual"),
+        ("IFRS_Note_PPE", "ifrs_note_ppe_rollforward"),
+        ("IFRS_Note_Debt_Maturity", "ifrs_note_debt_maturity"),
+        ("IFRS_Note_WC_Bridge", "ifrs_note_wc_bridge"),
+        ("IFRS_Note_Deferred_Tax", "ifrs_note_deferred_tax"),
+        ("IFRS_Note_Lease", "ifrs_note_lease"),
+        ("IFRS_Note_Hedge_Reserve", "ifrs_note_hedge_reserve"),
+    ):
+        df = results.get(key) if isinstance(results, Mapping) else None
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            sheets[label] = df
 
     for label, key in (("CAPEX", "capex"), ("Debt", "debt_schedule"), ("WorkingCapital", "working_capital")):
         df = results.get(key) if isinstance(results, Mapping) else None
@@ -1151,7 +2652,37 @@ def _generate_excel_bytes(
     else:
         with pd.ExcelWriter(buffer, engine=engine) as writer:
             for sheet_name, df in sheets.items():
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                df.to_excel(writer, sheet_name=_to_sheet_name(sheet_name), index=False)
+            # Add chart sheets where supported.
+            if plt is not None:
+                for raw_sheet_name, fig_builder in chart_builders.items():
+                    fig = None
+                    try:
+                        fig = fig_builder()
+                    except Exception:
+                        fig = None
+                    if fig is None:
+                        continue
+                    image_stream = BytesIO()
+                    fig.savefig(image_stream, format="png", dpi=140, bbox_inches="tight")
+                    image_stream.seek(0)
+                    plt.close(fig)
+                    sheet_name = _to_sheet_name(raw_sheet_name)
+                    if engine == "xlsxwriter":
+                        worksheet = writer.book.add_worksheet(sheet_name)
+                        writer.sheets[sheet_name] = worksheet
+                        worksheet.write(0, 0, f"{sheet_name} ({scenario_name})")
+                        worksheet.insert_image(2, 0, "chart.png", {"image_data": image_stream})
+                    elif engine == "openpyxl":
+                        ws = writer.book.create_sheet(title=sheet_name)
+                        ws["A1"] = f"{sheet_name} ({scenario_name})"
+                        try:
+                            from openpyxl.drawing.image import Image as OpenPyxlImage
+                            image_stream.seek(0)
+                            img = OpenPyxlImage(image_stream)
+                            ws.add_image(img, "A3")
+                        except Exception:
+                            ws["A3"] = "Chart image embedding unavailable (install pillow)."
 
     buffer.seek(0)
     return buffer.read()
@@ -1715,7 +3246,7 @@ def _render_default_edit_modal(table_name: str, label: str, schema, tables: "Inp
             except Exception as exc:
                 st.error(f"Default saved but unable to update table: {exc}")
             else:
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 st.session_state.pop(DEFAULT_EDIT_STATE_KEY, None)
                 st.session_state[f"default_feedback_{table_name}"] = "Default row updated and applied."
                 _safe_rerun()
@@ -1756,12 +3287,32 @@ def _sync_tables_from_state(tables: InputTables) -> Dict[str, str]:
                 tables.set_table(table_name, value)
             except Exception as exc:  # pragma: no cover - validation feedback for UI edits
                 errors[table_name] = str(exc)
+
+    # Keep production horizon fused with projection horizon whenever start/end
+    # years are edited from any table editor entry point (not only Model Controls).
+    try:
+        proj_df = tables.ensure_table("projection_horizon")
+        if isinstance(proj_df, pd.DataFrame) and not proj_df.empty:
+            row = proj_df.iloc[0]
+            start_year = int(row.get("start_year", DEFAULTS["horizon"]["start_year"]))
+            end_year = int(row.get("end_year", DEFAULTS["horizon"]["end_year"]))
+            prod_target = pd.DataFrame([{"start_year": start_year, "end_year": end_year}])
+            current_prod = tables.ensure_table("production_horizon")
+            current_tuple = None
+            if isinstance(current_prod, pd.DataFrame) and not current_prod.empty:
+                cur_row = current_prod.iloc[0]
+                current_tuple = (int(cur_row.get("start_year", start_year)), int(cur_row.get("end_year", end_year)))
+            target_tuple = (start_year, end_year)
+            if current_tuple != target_tuple:
+                tables.set_table("production_horizon", prod_target)
+                _sync_table_mutation_state("production_horizon", tables)
+    except Exception as exc:  # pragma: no cover - defensive sync guard
+        errors["production_horizon"] = str(exc)
     return errors
 
 
 LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
     ("Projection Horizon", "projection_horizon", "Define the calendar start and end of the modeling period."),
-    ("Production Horizon", "production_horizon", "Limit operating volumes to the active production window."),
     ("Global Inputs", "global_inputs", "Corporate tax, discount rate, and ownership split."),
     (
         "Working Capital Assumptions",
@@ -1774,6 +3325,7 @@ LANDING_TABLES: List[Tuple[str, str, Optional[str]]] = [
         "Detailed plant and farm investment lines with depreciation lives and VAT timing.",
     ),
     ("Product Pricing Inputs", "revenue_params", "Product pricing, escalation, and indexation."),
+    ("Yearly Increment Factors", "yearly_increments", "Apply annual increment percentages and propagate them across price, opex, debt, capex, working capital, and tax."),
     (
         "Production Volumes (Annual)",
         "production_annual",
@@ -1870,6 +3422,21 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
     """Update time-indexed tables in the UI after horizon edits."""
 
     errors: List[str] = []
+    prod_horizon_cfg = cfg.get("production_horizon", {})
+    if isinstance(prod_horizon_cfg, Mapping):
+        try:
+            prod_df = pd.DataFrame(
+                [
+                    {
+                        "start_year": int(prod_horizon_cfg.get("start_year", cfg.get("projection_horizon", {}).get("start_year", DEFAULTS["horizon"]["start_year"]))),
+                        "end_year": int(prod_horizon_cfg.get("end_year", cfg.get("projection_horizon", {}).get("end_year", DEFAULTS["horizon"]["end_year"]))),
+                    }
+                ]
+            )
+            tables.set_table("production_horizon", prod_df)
+            _update_editor_state("production_horizon", tables)
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"production_horizon: {exc}")
     for table in HORIZON_SYNC_TABLES:
         df = cfg.get(table)
         if not isinstance(df, pd.DataFrame):
@@ -1883,6 +3450,179 @@ def _sync_tables_to_horizon(tables: InputTables, cfg: Dict[str, object]) -> None
             cfg[table] = tables.ensure_table(table).copy()
     for message in errors:
         st.warning(f"Unable to align {message}")
+
+
+def _horizon_sync_preview_diff(
+    tables: "InputTables",
+    current_cfg: Mapping[str, object],
+    proposed_horizon: Mapping[str, int],
+) -> pd.DataFrame:
+    """Return row-count/date-span impacts for horizon synchronization."""
+
+    preview_cfg = copy.deepcopy(dict(current_cfg))
+    preview_cfg["projection_horizon"] = {
+        "start_year": int(proposed_horizon["start_year"]),
+        "end_year": int(proposed_horizon["end_year"]),
+        "start_month": int(proposed_horizon["start_month"]),
+        "frequency": preview_cfg.get("projection_horizon", {}).get("frequency", "M"),
+    }
+    preview_cfg["production_horizon"] = {
+        "start_year": int(proposed_horizon["start_year"]),
+        "end_year": int(proposed_horizon["end_year"]),
+    }
+    preview_cfg = align_with_projection_horizon(preview_cfg)
+
+    def _span(df: pd.DataFrame) -> str:
+        if not isinstance(df, pd.DataFrame) or df.empty or "date" not in df.columns:
+            return "-"
+        dates = pd.to_datetime(df["date"], errors="coerce").dropna()
+        if dates.empty:
+            return "-"
+        return f"{dates.min().date()} → {dates.max().date()}"
+
+    rows: List[Dict[str, object]] = []
+    for table_name in HORIZON_SYNC_TABLES:
+        before_df = tables.ensure_table(table_name).copy()
+        after_df = preview_cfg.get(table_name) if isinstance(preview_cfg.get(table_name), pd.DataFrame) else pd.DataFrame()
+        before_rows = len(before_df.index) if isinstance(before_df, pd.DataFrame) else 0
+        after_rows = len(after_df.index) if isinstance(after_df, pd.DataFrame) else 0
+        rows.append(
+            {
+                "table": table_name,
+                "rows_before": int(before_rows),
+                "rows_after": int(after_rows),
+                "delta_rows": int(after_rows - before_rows),
+                "date_span_before": _span(before_df),
+                "date_span_after": _span(after_df),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _build_run_pack_bundle(
+    base_cfg: Mapping[str, object],
+    base_results: Mapping[str, object],
+    scenario_overrides: Mapping[str, Dict[str, object]],
+) -> bytes:
+    """Generate a zip bundle with model outputs, scenario metrics, lender cases, and Excel workbooks."""
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        metrics = base_results.get("metrics", {}) if isinstance(base_results, Mapping) else {}
+        if isinstance(metrics, Mapping) and metrics:
+            zf.writestr("base_metrics.csv", pd.DataFrame([metrics]).to_csv(index=False))
+
+        lender_cases = base_results.get("lender_case_results") if isinstance(base_results, Mapping) else None
+        if isinstance(lender_cases, pd.DataFrame) and not lender_cases.empty:
+            zf.writestr("lender_case_results.csv", lender_cases.to_csv(index=False))
+
+        if scenario_overrides:
+            scenario_df = run_scenarios(base_cfg, lambda c: run_full_model(c), scenario_overrides)
+            if isinstance(scenario_df, pd.DataFrame) and not scenario_df.empty:
+                zf.writestr("scenario_comparison.csv", scenario_df.to_csv(index=False))
+
+        scenario_names = [BASE_SCENARIO_LABEL, *list(scenario_overrides.keys())]
+        for scenario_name in scenario_names:
+            cfg_payload, results_payload = _ensure_scenario_payload(
+                scenario_name,
+                dict(base_cfg),
+                base_results,
+                scenario_overrides,
+            )
+            excel_bytes = _generate_excel_bytes(cfg_payload, results_payload, scenario_name)
+            safe_name = normalize_key(scenario_name) or "base"
+            zf.writestr(f"excel/Sugarcane_Financial_Model_{safe_name}.xlsx", excel_bytes)
+
+    buffer.seek(0)
+    return buffer.read()
+
+
+def _apply_master_assumptions_automation(tables: InputTables, cfg: Dict[str, object]) -> None:
+    """Auto-populate key operating tables from master production assumptions."""
+
+    projection = cfg.get("projection_horizon", {})
+    start_year = int(projection.get("start_year", DEFAULTS["horizon"]["start_year"]))
+    end_year = int(projection.get("end_year", DEFAULTS["horizon"]["end_year"]))
+    start_month = int(projection.get("start_month", DEFAULTS["horizon"].get("start_month", 1)))
+    months = pd.date_range(f"{start_year}-{start_month:02d}-01", f"{end_year}-12-01", freq="MS")
+
+    production_cfg = cfg.get("production", {})
+    annual_feedstock = float(production_cfg.get("annual_feedstock_ton", DEFAULTS["production"]["annual_feedstock_ton"]))
+    availability = float(production_cfg.get("plant_availability", DEFAULTS["production"]["plant_availability"]))
+    loss_factor = float(production_cfg.get("loss_factor", DEFAULTS["production"]["loss_factor"]))
+    scenario = str(production_cfg.get("feedstock_scenario", "HYBRID")).strip().upper()
+    farm_share = float(production_cfg.get("farm_share", 0.5))
+    if scenario == "FARM_ONLY":
+        farm_share = 1.0
+    elif scenario == "BUY_ONLY":
+        farm_share = 0.0
+    farm_share = max(0.0, min(1.0, farm_share))
+    purchase_share = max(0.0, 1.0 - farm_share)
+
+    conversion_map = {
+        "ethanol": DEFAULTS["production"]["ethanol_litre_per_ton"],
+        "sugar": DEFAULTS["production"]["sugar_ton_per_ton_cane"],
+        "electricity": DEFAULTS["production"]["electricity_mwh_per_ton_cane"],
+        "animal_feed": DEFAULTS["production"]["animal_feed_ton_per_ton_cane"],
+    }
+    annual_rows: List[Dict[str, object]] = []
+    for product in PRODUCTS:
+        annual_rows.append(
+            {
+                "product": product,
+                "annual_volume": annual_feedstock * conversion_map.get(product, 0.0) * availability * (1 - loss_factor),
+                "availability": availability,
+                "loss_factor": loss_factor,
+                "startup_ramp": "0.7;0.9;1.0",
+                "boe_conversion": np.nan,
+                "sugarcane_yield_ton_per_ha": float(production_cfg.get("sugarcane_yield_ton_per_ha", DEFAULTS["production"]["sugarcane_yield_ton_per_ha"])),
+                "farm_area_ha": annual_feedstock / max(float(production_cfg.get("sugarcane_yield_ton_per_ha", DEFAULTS["production"]["sugarcane_yield_ton_per_ha"])), 1e-9),
+            }
+        )
+    production_annual = pd.DataFrame(annual_rows)
+    tables.set_table("production_annual", production_annual)
+    _update_editor_state("production_annual", tables)
+
+    monthly_rows: List[Dict[str, object]] = []
+    for row in annual_rows:
+        monthly_volume = float(row["annual_volume"]) / 12.0
+        for dt in months:
+            monthly_rows.append(
+                {
+                    "date": dt.strftime("%Y-%m"),
+                    "product": row["product"],
+                    "volume": monthly_volume,
+                    "availability_override": np.nan,
+                    "maintenance_downtime": np.nan,
+                    "loss_override": np.nan,
+                }
+            )
+    production_monthly = pd.DataFrame(monthly_rows)
+    tables.set_table("production_monthly", production_monthly)
+    _update_editor_state("production_monthly", tables)
+
+    base_currency = str(cfg.get("global_inputs", {}).get("base_currency", DEFAULTS["global"]["base_currency"]))
+    purchase_price = float(cfg.get("opex", {}).get("purchase_price_per_ton", DEFAULTS["opex"]["purchase_price_per_ton"]))
+    monthly_purchase_qty = annual_feedstock * purchase_share / 12.0
+    direct_cost_rows = [
+        {
+            "date": dt.strftime("%Y-%m"),
+            "cost_type": "feedstock purchase",
+            "product_link": "sugarcane",
+            "unit_price": purchase_price,
+            "quantity": monthly_purchase_qty,
+            "amount": purchase_price * monthly_purchase_qty,
+            "currency": base_currency,
+        }
+        for dt in months
+    ]
+    direct_costs = pd.DataFrame(direct_cost_rows)
+    tables.set_table("direct_costs_monthly", direct_costs)
+    _update_editor_state("direct_costs_monthly", tables)
+
+    st.success(
+        "Automation applied: regenerated production annual/monthly tables and synced monthly feedstock purchase rows."
+    )
 
 
 def _auto_step(value: float) -> float:
@@ -2354,7 +4094,7 @@ def _render_table_editor(
                         st.session_state.pop(f"add_row_{table_name}_{col_name}", None)
                     if share_amount_key is not None:
                         st.session_state.pop(share_amount_key, None)
-                    _update_editor_state(table_name, tables)
+                    _sync_table_mutation_state(table_name, tables)
                     _safe_rerun()
 
     if not df.empty:
@@ -2370,7 +4110,7 @@ def _render_table_editor(
             except Exception as exc:  # pragma: no cover - defensive feedback
                 st.error(f"Unable to remove row: {exc}")
             df = tables.ensure_table(table_name).copy()
-            _update_editor_state(table_name, tables)
+            _sync_table_mutation_state(table_name, tables)
             _safe_rerun()
     state_key = _editor_state_key(table_name)
     # Clear any legacy widget state that may have been set by previous builds
@@ -2481,7 +4221,7 @@ def _render_table_editor(
             except Exception as exc:
                 st.error(f"Unable to update table: {exc}")
             else:
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
 
     current_df = tables.ensure_table(table_name).copy()
@@ -2498,7 +4238,7 @@ def _render_table_editor(
                 st.error(f"Unable to reset table: {exc}")
             else:
                 st.session_state[feedback_key] = "Table reset to stored defaults."
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
         if action_cols[1].button("Save current as defaults", key=f"save_defaults_{table_name}"):
             try:
@@ -2507,6 +4247,7 @@ def _render_table_editor(
                 st.error(f"Unable to save defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Stored defaults updated from current table."
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
         if action_cols[2].button("Restore factory defaults", key=f"factory_defaults_{table_name}"):
             try:
@@ -2516,7 +4257,7 @@ def _render_table_editor(
                 st.error(f"Unable to restore factory defaults: {exc}")
             else:
                 st.session_state[feedback_key] = "Factory defaults restored and applied."
-                _update_editor_state(table_name, tables)
+                _sync_table_mutation_state(table_name, tables)
                 _safe_rerun()
 
         defaults_df = _get_default_table(table_name)
@@ -2529,67 +4270,66 @@ def _render_table_editor(
     st.divider()
 
 
+
+def _fingerprint_model_config(value: object) -> str:
+    """Return a stable digest for nested model config objects and dataframes."""
+
+    def normalise(item: object) -> object:
+        if isinstance(item, pd.DataFrame):
+            return {
+                "columns": [str(column) for column in item.columns],
+                "records": [
+                    {str(key): normalise(cell) for key, cell in row.items()}
+                    for row in item.to_dict("records")
+                ],
+            }
+        if isinstance(item, pd.Series):
+            return [normalise(cell) for cell in item.tolist()]
+        if isinstance(item, Mapping):
+            return {str(key): normalise(item[key]) for key in sorted(item, key=str)}
+        if isinstance(item, (list, tuple, set)):
+            return [normalise(cell) for cell in item]
+        if isinstance(item, (np.integer, np.floating, np.bool_)):
+            return item.item()
+        if isinstance(item, (datetime.date, datetime.datetime, pd.Timestamp)):
+            return item.isoformat()
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        return repr(item)
+
+    payload = json.dumps(normalise(value), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _activate_sugar_model_run(cfg: Mapping[str, object], fingerprint: str) -> tuple[dict, bool]:
+    cache = st.session_state.setdefault("sugar_model_result_cache", {})
+    bundle = cache.get(fingerprint)
+    cache_hit = isinstance(bundle, dict)
+    if not cache_hit:
+        run_cfg = copy.deepcopy(dict(cfg))
+        bundle = {
+            "fingerprint": fingerprint,
+            "config": run_cfg,
+            "results": run_full_model(run_cfg),
+        }
+        cache[fingerprint] = bundle
+    st.session_state["sugar_active_result"] = bundle
+    st.session_state["sugar_last_run_fingerprint"] = fingerprint
+    st.session_state["sugar_model_results_stale"] = False
+    st.session_state.pop("scenario_payload_cache", None)
+    st.session_state.pop("run_pack_bytes", None)
+    return bundle, cache_hit
+
 def main() -> None:
     try:
         if _streamlit_runtime_exists():
-            st.set_page_config(title="Sugarcane Bioethanol Finance Model", layout="wide")
+            st.set_page_config(page_title="Sugarcane Bioethanol Finance Model", layout="wide")
     except (StreamlitAPIException, RuntimeError, Exception):  # pragma: no cover - defensive guard
         # Some Streamlit versions raise a generic Exception when page config is invoked
         # outside a live runtime; swallow and continue so local execution still works.
         pass
 
-    # Ensure the hero title has sufficient breathing room while keeping the layout
-    # nearly full-width on large monitors.
-    st.markdown(
-        """
-        <style>
-        html, body, .stApp {
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-            overflow-x: hidden !important;
-        }
-        [data-testid="stAppViewContainer"] {
-            margin: 0 !important;
-            padding: 3.5rem 0 2.5rem !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        [data-testid="stAppViewContainer"] > .main {
-            margin: 0 auto !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        [data-testid="stAppViewContainer"] .main .block-container,
-        .block-container {
-            margin: 0 auto !important;
-            width: 100% !important;
-            max-width: none !important;
-            padding-left: clamp(20px, 3vw, 48px) !important;
-            padding-right: clamp(20px, 3vw, 48px) !important;
-        }
-        [data-testid="stVerticalBlock"],
-        [data-testid="stHorizontalBlock"] {
-            margin-left: 0 !important;
-            margin-right: 0 !important;
-            padding-left: 0 !important;
-            padding-right: 0 !important;
-            width: 100% !important;
-            max-width: 100% !important;
-        }
-        h1, h1 span, .stMarkdown h1 {
-            font-size: clamp(2.2rem, 3vw, 2.8rem) !important;
-            line-height: 1.2 !important;
-            margin-top: 0 !important;
-            margin-bottom: 1.2rem !important;
-            white-space: normal !important;
-            overflow-wrap: anywhere !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    _inject_app_theme()
 
     if MATPLOTLIB_INSTALL_ERROR and plt is None:
         st.info(
@@ -2607,60 +4347,52 @@ def main() -> None:
         )
         st.stop()
 
-    st.title("Sugarcane Bioethanol Project Finance Model")
-    st.markdown(
-        "Use this Streamlit interface to explore the integrated bioethanol, sugar, "
-        "electricity, and animal feed project finance model. Adjust critical drivers "
-        "in the control tabs above and review the resulting statements, dashboards, "
-        "sensitivities, and scenarios."
-    )
+    _render_model_hero()
 
-    page_tabs_container = st.container()
-    (
-        model_controls_tab,
-        landing_tab,
-        summary_tab,
-        financial_tab,
-        production_tab,
-        sensitivity_tab,
-        scenario_tab,
-    ) = page_tabs_container.tabs(
-        [
-            "Model Controls",
-            "Input & Assumptions",
-            "Summary",
-            "Financial Statements",
-            "Production & Pricing",
-            "Sensitivities",
-            "Scenarios",
-        ]
+    workspace_sections = [
+        "Model Controls",
+        "Input & Assumptions",
+        "Summary",
+        "Financial Statements",
+        "Production & Pricing",
+        "Sensitivities",
+        "AI Chatbot",
+    ]
+    active_section = st.radio(
+        "Workspace section",
+        workspace_sections,
+        horizontal=True,
+        key="sugar_active_workspace_section",
+        label_visibility="collapsed",
     )
+    run_controls = st.empty()
 
     tables = _get_tables()
     sync_errors = _sync_tables_from_state(tables)
     assumptions: Dict[str, object] = {}
     cfg = build_config(assumptions, tables)
-    st.session_state.pop("scenario_payload_cache", None)
 
     horizon = cfg["projection_horizon"]
-    production_horizon = cfg.get(
-        "production_horizon",
-        {"start_year": horizon["start_year"], "end_year": horizon["end_year"]},
-    )
+    production_horizon = {"start_year": horizon["start_year"], "end_year": horizon["end_year"]}
 
-    with model_controls_tab:
+    if active_section == "Model Controls":
         st.subheader("Model Controls")
-        control_tabs = st.tabs(
-            [
-                "Projection",
-                "Financial",
-                "Production",
-                "Pricing",
-                "Risk & Scenarios",
-            ]
+        control_sections = [
+            "Projection",
+            "Financial",
+            "Production",
+            "Pricing",
+            "Risk & Scenarios",
+        ]
+        active_control_section = st.radio(
+            "Control section",
+            control_sections,
+            horizontal=True,
+            key="sugar_active_control_section",
+            label_visibility="collapsed",
         )
 
-        with control_tabs[0]:
+        if active_control_section == "Projection":
             st.markdown("### Projection horizon")
             start_year = st.number_input("Start year", value=int(horizon["start_year"]), step=1)
             end_year = st.number_input(
@@ -2675,53 +4407,40 @@ def main() -> None:
                 max_value=12,
                 value=int(horizon.get("start_month", 1)),
             )
-            horizon.update(
-                {
-                    "start_year": int(start_year),
-                    "end_year": int(end_year),
-                    "start_month": int(start_month),
-                }
+            proposed_horizon = {
+                "start_year": int(start_year),
+                "end_year": int(end_year),
+                "start_month": int(start_month),
+            }
+            changed = any(
+                int(horizon.get(key, proposed_horizon[key])) != int(proposed_horizon[key])
+                for key in ("start_year", "end_year", "start_month")
             )
-            st.markdown("### Production horizon")
-            prod_start_default = int(production_horizon.get("start_year", start_year))
-            prod_start_default = max(prod_start_default, int(start_year))
-            prod_start_default = min(prod_start_default, int(end_year))
-            prod_start_year = st.number_input(
-                "Production start year",
-                value=prod_start_default,
-                min_value=int(start_year),
-                max_value=int(end_year),
-                step=1,
-            )
-            prod_end_default = int(production_horizon.get("end_year", end_year))
-            prod_end_default = max(prod_end_default, int(prod_start_year))
-            prod_end_default = min(prod_end_default, int(end_year))
-            prod_end_year = st.number_input(
-                "Production end year",
-                value=prod_end_default,
-                min_value=int(prod_start_year),
-                max_value=int(end_year),
-                step=1,
-            )
-            if prod_end_year < prod_start_year:
-                st.warning("Production end year adjusted to be no earlier than the start year.")
-                prod_end_year = prod_start_year
-            production_horizon.update({"start_year": int(prod_start_year), "end_year": int(prod_end_year)})
-            cfg["production_horizon"] = production_horizon
-            st.caption("Production volumes are set to zero outside the defined production horizon.")
-            try:
-                tables.set_table("projection_horizon", pd.DataFrame([horizon]))
-                _update_editor_state("projection_horizon", tables)
-                tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
-                _update_editor_state("production_horizon", tables)
-            except Exception as exc:
-                st.warning(f"Projection inputs not saved due to validation error: {exc}")
+            st.caption("Production horizon is automatically aligned to the projection horizon.")
+            if changed:
+                with st.expander("Horizon sync preview", expanded=True):
+                    preview_df = _horizon_sync_preview_diff(tables, cfg, proposed_horizon)
+                    _render_dataframe(preview_df, "Horizon synchronization impacts", key="horizon_sync_preview")
+                if st.button("Apply horizon changes", key="apply_horizon_changes"):
+                    horizon.update(proposed_horizon)
+                    production_horizon.update({"start_year": int(start_year), "end_year": int(end_year)})
+                    cfg["production_horizon"] = production_horizon
+                    try:
+                        tables.set_table("projection_horizon", pd.DataFrame([horizon]))
+                        _update_editor_state("projection_horizon", tables)
+                        tables.set_table("production_horizon", pd.DataFrame([production_horizon]))
+                        _update_editor_state("production_horizon", tables)
+                    except Exception as exc:
+                        st.warning(f"Projection inputs not saved due to validation error: {exc}")
+                    else:
+                        cfg = align_with_projection_horizon(cfg)
+                        _sync_tables_to_horizon(tables, cfg)
+                        st.success("Horizon changes applied.")
             else:
-                cfg = align_with_projection_horizon(cfg)
-                _sync_tables_to_horizon(tables, cfg)
+                cfg["production_horizon"] = production_horizon
 
         global_inputs = cfg["global_inputs"]
-        with control_tabs[1]:
+        if active_control_section == "Financial":
             st.markdown("### Financial assumptions")
             discount_rate = st.number_input(
                 "Discount rate (WACC)",
@@ -2739,12 +4458,13 @@ def main() -> None:
                 step=0.01,
                 format="%.4f",
             )
-            investor_share = st.slider(
+            investor_options = _float_option_values(0.0, 1.0, 0.05, digits=2)
+            investor_share_default = float(global_inputs.get("investor_share", 0.6))
+            investor_share = st.selectbox(
                 "Investor equity share",
-                min_value=0.0,
-                max_value=1.0,
-                value=float(global_inputs.get("investor_share", 0.6)),
-                step=0.05,
+                investor_options,
+                index=min(range(len(investor_options)), key=lambda idx: abs(investor_options[idx] - investor_share_default)),
+                format_func=lambda value: f"{value:.0%}",
             )
             global_inputs.update(
                 {
@@ -2764,7 +4484,7 @@ def main() -> None:
                 st.warning(f"Global inputs not saved due to validation error: {exc}")
 
         production_cfg = cfg.setdefault("production", {})
-        with control_tabs[2]:
+        if active_control_section == "Production":
             st.markdown("### Production assumptions")
             feedstock = st.number_input(
                 "Annual feedstock (t)",
@@ -2773,19 +4493,21 @@ def main() -> None:
                 step=10_000.0,
                 format="%.0f",
             )
-            availability = st.slider(
+            availability_options = _float_option_values(0.5, 1.0, 0.01, digits=2)
+            availability_default = float(production_cfg.get("plant_availability", 0.9))
+            availability = st.selectbox(
                 "Plant availability",
-                min_value=0.5,
-                max_value=1.0,
-                value=float(production_cfg.get("plant_availability", 0.9)),
-                step=0.01,
+                availability_options,
+                index=min(range(len(availability_options)), key=lambda idx: abs(availability_options[idx] - availability_default)),
+                format_func=lambda value: f"{value:.0%}",
             )
-            loss_factor = st.slider(
+            loss_factor_options = _float_option_values(0.0, 0.2, 0.005, digits=3)
+            loss_factor_default = float(production_cfg.get("loss_factor", 0.02))
+            loss_factor = st.selectbox(
                 "Process loss factor",
-                min_value=0.0,
-                max_value=0.2,
-                value=float(production_cfg.get("loss_factor", 0.02)),
-                step=0.005,
+                loss_factor_options,
+                index=min(range(len(loss_factor_options)), key=lambda idx: abs(loss_factor_options[idx] - loss_factor_default)),
+                format_func=lambda value: f"{value:.1%}",
             )
             production_cfg.update(
                 {
@@ -2801,17 +4523,23 @@ def main() -> None:
             )
             production_cfg["feedstock_scenario"] = scenario
             if scenario == "HYBRID":
-                farm_share = st.slider(
+                farm_share_options = _float_option_values(0.0, 1.0, 0.05, digits=2)
+                farm_share_default = float(production_cfg.get("farm_share", 0.5))
+                farm_share = st.selectbox(
                     "Hybrid farm share",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(production_cfg.get("farm_share", 0.5)),
-                    step=0.05,
+                    farm_share_options,
+                    index=min(range(len(farm_share_options)), key=lambda idx: abs(farm_share_options[idx] - farm_share_default)),
+                    format_func=lambda value: f"{value:.0%}",
                 )
                 production_cfg["farm_share"] = float(farm_share)
+            if st.button("Auto-sync operating tables", key="auto_sync_operating_tables"):
+                try:
+                    _apply_master_assumptions_automation(tables, cfg)
+                except Exception as exc:
+                    st.warning(f"Automation failed: {exc}")
 
         pricing_cfg = cfg.setdefault("prices", {})
-        with control_tabs[3]:
+        if active_control_section == "Pricing":
             st.markdown("### Product pricing")
             for product in PRODUCTS:
                 params = pricing_cfg.setdefault(product, {})
@@ -2867,7 +4595,7 @@ def main() -> None:
             else:
                 _update_editor_state("revenue_params", tables)
 
-        with control_tabs[4]:
+        if active_control_section == "Risk & Scenarios":
             st.markdown("### Risk and scenario options")
             risk_targets, risk_applies = _get_risk_select_options(tables)
             risk_column_config = {
@@ -2925,18 +4653,56 @@ def main() -> None:
             )
             _render_risk_schedule_preview(tables)
 
+    draft_fingerprint = _fingerprint_model_config(cfg)
+    active_bundle = st.session_state.get("sugar_active_result")
+    run_label = "Run Model" if not isinstance(active_bundle, dict) else "Recalculate"
+    with run_controls.container():
+        run_clicked = st.button(
+            run_label,
+            key="sugar_run_model",
+            type="primary",
+            use_container_width=True,
+        )
+    if run_clicked:
+        try:
+            with st.spinner("Running sugar cane bioethanol model..."):
+                active_bundle, cache_hit = _activate_sugar_model_run(cfg, draft_fingerprint)
+        except Exception as exc:  # pragma: no cover - runtime feedback for the UI
+            st.error(f"Model execution failed: {exc}")
+        else:
+            source = "cached results" if cache_hit else "a fresh calculation"
+            st.success(f"Model run activated from {source}.")
+
+    active_bundle = st.session_state.get("sugar_active_result")
+    active_fingerprint = (
+        str(active_bundle.get("fingerprint", ""))
+        if isinstance(active_bundle, dict)
+        else ""
+    )
+    results_stale = not isinstance(active_bundle, dict) or active_fingerprint != draft_fingerprint
+    st.session_state["sugar_model_results_stale"] = results_stale
+    if isinstance(active_bundle, dict) and results_stale:
+        st.warning(
+            "Draft inputs have changed. Outputs, analytics, and exports still use "
+            "the last completed run until you press Recalculate."
+        )
+    elif not isinstance(active_bundle, dict):
+        st.info("Draft inputs are ready. Press Run Model to generate results.")
+
+    if not isinstance(active_bundle, dict):
+        return
+
+    cfg = copy.deepcopy(active_bundle["config"])
+    results = active_bundle["results"]
+    analytics_cache = st.session_state.setdefault("sugar_analytics_cache", {}).setdefault(
+        active_fingerprint, {}
+    )
+    horizon = cfg["projection_horizon"]
     timeline = Timeline(
         int(horizon["start_year"]),
         int(horizon["end_year"]),
         int(horizon.get("start_month", 1)),
     )
-
-    with st.spinner("Running base model..."):
-        try:
-            results = run_full_model(cfg)
-        except Exception as exc:  # pragma: no cover - runtime feedback for the UI
-            st.error(f"Model execution failed: {exc}")
-            st.stop()
 
     metrics = results["metrics"]
     dashboard = results["dashboard"]
@@ -2955,7 +4721,7 @@ def main() -> None:
     scenario_options: List[str] = [BASE_SCENARIO_LABEL, *list(scenario_overrides.keys())]
 
 
-    with landing_tab:
+    if active_section == "Input & Assumptions":
         top_left, top_right = st.columns([3, 2])
         with top_left:
             st.subheader("Input & assumptions tables")
@@ -2980,24 +4746,14 @@ def main() -> None:
 
             download_container = st.container()
             excel_map: Dict[str, bytes] = st.session_state.setdefault("excel_bytes_map", {})
-            stale_keys = [key for key in excel_map if key not in scenario_options]
+            valid_export_keys = {f"{active_fingerprint}:{name}" for name in scenario_options}
+            stale_keys = [key for key in excel_map if key not in valid_export_keys]
             for key in stale_keys:
                 excel_map.pop(key, None)
             st.session_state.excel_bytes_map = excel_map
 
-            scenario_cfg_payload, scenario_results_payload = _ensure_scenario_payload(
-                selected_scenario,
-                cfg,
-                results,
-                scenario_overrides,
-            )
-            cfg_for_excel = copy.deepcopy(scenario_cfg_payload)
-            metadata = cfg_for_excel.setdefault("metadata", {}) if isinstance(cfg_for_excel, dict) else {}
-            if isinstance(metadata, dict):
-                metadata["scenario"] = selected_scenario
-            st.session_state.model_results = (cfg_for_excel, scenario_results_payload)
-
-            excel_bytes = excel_map.get(selected_scenario)
+            export_cache_key = f"{active_fingerprint}:{selected_scenario}"
+            excel_bytes = excel_map.get(export_cache_key)
 
             with download_container:
                 if not excel_bytes:
@@ -3007,16 +4763,34 @@ def main() -> None:
                     ):
                         with st.spinner("Preparing Excel workbook..."):
                             try:
+                                scenario_cfg_payload, scenario_results_payload = _ensure_scenario_payload(
+                                    selected_scenario,
+                                    cfg,
+                                    results,
+                                    scenario_overrides,
+                                )
+                                cfg_for_excel = copy.deepcopy(scenario_cfg_payload)
+                                metadata = (
+                                    cfg_for_excel.setdefault("metadata", {})
+                                    if isinstance(cfg_for_excel, dict)
+                                    else {}
+                                )
+                                if isinstance(metadata, dict):
+                                    metadata["scenario"] = selected_scenario
                                 excel_bytes = _generate_excel_bytes(
                                     cfg_for_excel,
                                     scenario_results_payload,
                                     selected_scenario,
                                 )
+                                st.session_state.model_results = (
+                                    cfg_for_excel,
+                                    scenario_results_payload,
+                                )
                             except RuntimeError as exc:
                                 st.error(str(exc))
                                 excel_bytes = None
                             else:
-                                excel_map[selected_scenario] = excel_bytes
+                                excel_map[export_cache_key] = excel_bytes
                                 st.session_state.excel_bytes_map = excel_map
                 if excel_bytes:
                     file_scenario = normalize_key(selected_scenario) or "base"
@@ -3031,14 +4805,39 @@ def main() -> None:
                         "Clear Prepared Excel",
                         key=f"clear_excel_{normalize_key(selected_scenario) or 'base'}",
                     ):
-                        excel_map.pop(selected_scenario, None)
+                        excel_map.pop(export_cache_key, None)
                         st.session_state.excel_bytes_map = excel_map
                         excel_bytes = None
                 if not excel_bytes:
                     st.info("Click 'Prepare Excel Model' to generate the workbook for download.")
 
+            st.markdown("#### One-click Run Pack")
+            pack_bytes = st.session_state.get("run_pack_bytes")
+            if st.button("Prepare Run Pack", key="prepare_run_pack"):
+                with st.spinner("Building run pack (base + scenarios + lender + excel bundle)..."):
+                    try:
+                        pack_bytes = _build_run_pack_bundle(cfg, results, scenario_overrides)
+                    except Exception as exc:
+                        st.error(f"Run pack generation failed: {exc}")
+                        pack_bytes = None
+                    else:
+                        st.session_state["run_pack_bytes"] = pack_bytes
+            if isinstance(pack_bytes, (bytes, bytearray)) and len(pack_bytes) > 0:
+                ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                st.download_button(
+                    "Download Run Pack (.zip)",
+                    data=pack_bytes,
+                    file_name=f"Sugarcane_RunPack_{ts}.zip",
+                    mime="application/zip",
+                    key="download_run_pack",
+                )
+                if st.button("Clear Run Pack", key="clear_run_pack"):
+                    st.session_state.pop("run_pack_bytes", None)
+            else:
+                st.caption("Includes base metrics, scenario comparison CSV, lender case CSV, and Excel files per scenario.")
+
         st.markdown("### Horizon overview")
-        _render_horizon_timeline_chart(horizon, production_horizon)
+        _render_horizon_timeline_chart(horizon)
 
         st.markdown("### Assumption-driven visuals")
         st.caption("Charts below reflect the current input schedules and help validate annualised assumptions.")
@@ -3157,7 +4956,7 @@ def main() -> None:
                 helper=helper,
             )
 
-    with summary_tab:
+    if active_section == "Summary":
         st.subheader("Headline metrics")
         for idx in range(0, len(metric_items), 3):
             cols = st.columns(3)
@@ -3245,12 +5044,32 @@ def main() -> None:
         ("Statement of Cash Flows", "cashflow"),
         ("Statement of Financial Position", "balancesheet"),
     ]
-    with financial_tab:
+    if active_section == "Financial Statements":
+        with st.expander("Where key operating/financing fields appear", expanded=False):
+            mapping_df = pd.DataFrame(
+                [
+                    {"Field": "DirectCosts", "Statement": "Income Statement (P&L)", "Column": "DirectCosts"},
+                    {"Field": "StaffCosts", "Statement": "Income Statement (P&L)", "Column": "StaffCosts"},
+                    {"Field": "Other Opex", "Statement": "Income Statement (P&L)", "Column": "OtherOpexCosts"},
+                    {"Field": "Interest", "Statement": "Income Statement (P&L)", "Column": "Interest"},
+                    {"Field": "CFI", "Statement": "Cash Flow", "Column": "CFI"},
+                    {"Field": "CFF", "Statement": "Cash Flow", "Column": "CFF"},
+                    {"Field": "Inventory", "Statement": "Balance Sheet", "Column": "Inventory"},
+                    {"Field": "PPE Gross", "Statement": "Balance Sheet", "Column": "PPE_Gross"},
+                    {"Field": "Debt", "Statement": "Balance Sheet", "Column": "Debt"},
+                    {"Field": "Accounts Payable", "Statement": "Balance Sheet", "Column": "AccountsPayable"},
+                    {"Field": "Total Liabilities", "Statement": "Balance Sheet", "Column": "TotalLiabilities"},
+                ]
+            )
+            st.dataframe(mapping_df, use_container_width=True)
+
         fs_tabs = st.tabs([label for label, _ in statement_configs])
         for tab, (label, key) in zip(fs_tabs, statement_configs):
             with tab:
                 monthly_df = results["statements_monthly"].get(key, pd.DataFrame())
                 annual_df = results["statements_annual"].get(key, pd.DataFrame())
+                monthly_df = _ensure_statement_columns(key, monthly_df)
+                annual_df = _ensure_statement_columns(key, annual_df)
                 safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
                 _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_{safe_key}")
                 _render_dataframe(annual_df, f"Annual {label}", key=f"annual_{safe_key}")
@@ -3264,7 +5083,34 @@ def main() -> None:
                 if key == "balancesheet" and isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty:
                     _render_balance_sheet_chart(monthly_df)
 
-    with production_tab:
+        with st.expander("IFRS primary statements (SPV + consolidation adjustments)", expanded=False):
+            ifrs_configs = [
+                ("Statement of Profit or Loss and OCI", "sopl_oci_monthly", "sopl_oci_annual"),
+                ("Statement of Financial Position", "sofp_monthly", "sofp_annual"),
+                ("Statement of Changes in Equity", "socie_monthly", "socie_annual"),
+                ("Statement of Cash Flows (Indirect method)", "scf_indirect_monthly", "scf_indirect_annual"),
+            ]
+            ifrs_tabs = st.tabs([label for label, _, _ in ifrs_configs])
+            for tab, (label, monthly_key, annual_key) in zip(ifrs_tabs, ifrs_configs):
+                with tab:
+                    monthly_df = results.get(monthly_key, pd.DataFrame())
+                    annual_df = results.get(annual_key, pd.DataFrame())
+                    safe_key = re.sub(r"[^a-z0-9]+", "_", label.lower())
+                    _render_dataframe(monthly_df, f"Monthly {label}", key=f"monthly_ifrs_{safe_key}")
+                    _render_dataframe(annual_df, f"Annual {label}", key=f"annual_ifrs_{safe_key}")
+            note_configs = [
+                ("PPE roll-forward note", "ifrs_note_ppe_rollforward"),
+                ("Debt maturity note", "ifrs_note_debt_maturity"),
+                ("Working capital bridge note", "ifrs_note_wc_bridge"),
+                ("Deferred tax note", "ifrs_note_deferred_tax"),
+                ("Lease note (IFRS 16)", "ifrs_note_lease"),
+                ("Hedge reserve note (IFRS 9)", "ifrs_note_hedge_reserve"),
+            ]
+            for title, key in note_configs:
+                note_df = results.get(key, pd.DataFrame())
+                _render_dataframe(note_df, title, key=f"ifrs_note_{key}")
+
+    if active_section == "Production & Pricing":
         prod_monthly = results["production_monthly"].copy()
         prod_monthly["date"] = pd.to_datetime(prod_monthly["date"])
         _render_dataframe(prod_monthly, "Monthly production", key="production_monthly")
@@ -3643,18 +5489,26 @@ def main() -> None:
                 key="break_even_overall_table",
             )
 
-    with sensitivity_tab:
+    if active_section == "Sensitivities":
         st.subheader("Advanced sensitivity analytics")
-        sensitivity_sections = st.tabs(
-            [
-                "Metaheuristic optimiser",
-                "Neural forecasts",
-                "Statistical forecasts",
-                "Decision tree",
-            ]
+        sensitivity_section_labels = [
+            "Metaheuristic optimiser",
+            "Neural forecasts",
+            "Statistical forecasts",
+            "Decision tree",
+            "Sensitivity tornado",
+            "Monte Carlo simulation",
+            "Scenario comparison",
+        ]
+        active_sensitivity_section = st.radio(
+            "Analytics section",
+            sensitivity_section_labels,
+            horizontal=True,
+            key="sugar_active_analytics_section",
+            label_visibility="collapsed",
         )
 
-        with sensitivity_sections[0]:
+        if active_sensitivity_section == "Metaheuristic optimiser":
             optimizer_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "variable": st.column_config.SelectboxColumn(
@@ -3725,7 +5579,7 @@ def main() -> None:
                             delta=_format_metric(best_row.get("delta_vs_base"), metric_kind),
                         )
 
-        with sensitivity_sections[1]:
+        if active_sensitivity_section == "Neural forecasts":
             neural_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "product": st.column_config.SelectboxColumn(
@@ -3783,7 +5637,7 @@ def main() -> None:
                             key=f"neural_{idx}",
                         )
 
-        with sensitivity_sections[2]:
+        if active_sensitivity_section == "Statistical forecasts":
             stat_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "series": st.column_config.SelectboxColumn(
@@ -3844,7 +5698,7 @@ def main() -> None:
                         f"Equipment failure risk proxy: {forecast_result.get('equipment_failure_risk', 0.0):.2%}"
                     )
 
-        with sensitivity_sections[3]:
+        if active_sensitivity_section == "Decision tree":
             decision_column_config = {
                 "enabled": st.column_config.CheckboxColumn("Enabled"),
                 "path_name": st.column_config.TextColumn("Path name"),
@@ -3902,16 +5756,7 @@ def main() -> None:
                         )
                         _render_decision_tree_chart(paths_df, selected_objective)
 
-
-    with scenario_tab:
-        st.markdown("### Scenario analytics workspace")
-        scenario_sections = st.tabs([
-            "Sensitivity tornado",
-            "Monte Carlo simulation",
-            "Scenario comparison",
-        ])
-
-        with scenario_sections[0]:
+        if active_sensitivity_section == "Sensitivity tornado":
             _render_table_editor(
                 tables,
                 "tornado_drivers",
@@ -3943,17 +5788,23 @@ def main() -> None:
                 if not drivers:
                     st.info("Enable at least one driver with a valid percentage change to run the tornado analysis.")
                 else:
-                    with st.spinner("Calculating sensitivity tornado..."):
-                        tornado_results = sensitivity_tornado(
-                            cfg,
-                            {"metrics": metrics},
-                            lambda c: run_full_model(c),
-                            drivers,
-                        )
-                    _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
-                    _render_tornado_chart(tornado_results)
+                    tornado_results = analytics_cache.get("tornado")
+                    if st.button("Run Sensitivity Tornado", key="run_sugar_tornado", type="primary"):
+                        with st.spinner("Calculating sensitivity tornado..."):
+                            tornado_results = sensitivity_tornado(
+                                cfg,
+                                {"metrics": metrics},
+                                lambda c: run_full_model(c),
+                                drivers,
+                            )
+                        analytics_cache["tornado"] = tornado_results
+                    if tornado_results is None:
+                        st.info("Press Run Sensitivity Tornado to generate this analysis.")
+                    else:
+                        _render_dataframe(tornado_results, "Tornado sensitivity", key="tornado")
+                        _render_tornado_chart(tornado_results)
 
-        with scenario_sections[1]:
+        if active_sensitivity_section == "Monte Carlo simulation":
             distribution_options = list(MONTE_CARLO_DISTRIBUTIONS)
             variable_label_map = dict(MONTE_CARLO_VARIABLE_LABELS)
             variable_options = list(variable_label_map.values())
@@ -4115,21 +5966,27 @@ def main() -> None:
                     random_seed = int(float(active_row.get("random_seed", 42)))
                 except (TypeError, ValueError):
                     random_seed = 42
-                with st.spinner("Running Monte Carlo simulation..."):
-                    monte_results = monte_carlo(
-                        cfg,
-                        lambda c: run_full_model(c),
-                        iterations=iterations,
-                        random_seed=random_seed,
+                monte_results = analytics_cache.get("monte_carlo")
+                if st.button("Run Monte Carlo Simulation", key="run_sugar_monte_carlo", type="primary"):
+                    with st.spinner("Running Monte Carlo simulation..."):
+                        monte_results = monte_carlo(
+                            cfg,
+                            lambda c: run_full_model(c),
+                            iterations=iterations,
+                            random_seed=random_seed,
+                        )
+                    analytics_cache["monte_carlo"] = monte_results
+                if monte_results is None:
+                    st.info("Press Run Monte Carlo Simulation to generate samples.")
+                else:
+                    percentiles = (
+                        monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"})
                     )
-                percentiles = (
-                    monte_results["percentiles"].reset_index().rename(columns={"index": "Percentile"})
-                )
-                _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
-                _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
-                _render_monte_carlo_histograms(monte_results["samples"])
+                    _render_dataframe(percentiles, "Monte Carlo percentiles", key="monte_percentiles")
+                    _render_dataframe(monte_results["samples"], "Monte Carlo samples", key="monte_samples")
+                    _render_monte_carlo_histograms(monte_results["samples"])
 
-        with scenario_sections[2]:
+        if active_sensitivity_section == "Scenario comparison":
             _render_table_editor(
                 tables,
                 "scenario_comparison",
@@ -4142,31 +5999,98 @@ def main() -> None:
             if not scenario_overrides_active:
                 st.info("Add scenario rows with overrides to compare against the base configuration.")
             else:
-                with st.spinner("Evaluating scenarios..."):
-                    scenario_df = run_scenarios(
-                        cfg,
-                        lambda c: run_full_model(c),
-                        scenario_overrides_active,
-                    )
-                base_metrics = pd.DataFrame([metrics]).assign(scenario=BASE_SCENARIO_LABEL)
-                scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
-                _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
-                scenario_results_map: Dict[str, Mapping[str, object]] = {}
-                for scenario_name in scenario_df["scenario"].dropna().astype(str).unique():
-                    cfg_payload, res_payload = _ensure_scenario_payload(
-                        scenario_name,
-                        cfg,
-                        results,
-                        scenario_overrides_active,
-                    )
-                    scenario_results_map[scenario_name] = res_payload
-                _render_scenario_metric_chart(scenario_df)
-                if scenario_results_map:
-                    _render_scenario_cashflow_stack(scenario_results_map)
-                    _render_scenario_dscr_chart(scenario_results_map)
-                    _render_scenario_scatter_chart(scenario_results_map)
+                scenario_artifact = analytics_cache.get("scenario_comparison")
+                if st.button("Run Scenario Comparison", key="run_sugar_scenarios", type="primary"):
+                    with st.spinner("Evaluating scenarios..."):
+                        scenario_df = run_scenarios(
+                            cfg,
+                            lambda c: run_full_model(c),
+                            scenario_overrides_active,
+                        )
+                        base_metrics = pd.DataFrame([metrics]).assign(scenario=BASE_SCENARIO_LABEL)
+                        scenario_df = pd.concat([base_metrics, scenario_df], ignore_index=True)
+                        scenario_results_map: Dict[str, Mapping[str, object]] = {}
+                        for scenario_name in scenario_df["scenario"].dropna().astype(str).unique():
+                            cfg_payload, res_payload = _ensure_scenario_payload(
+                                scenario_name,
+                                cfg,
+                                results,
+                                scenario_overrides_active,
+                            )
+                            scenario_results_map[scenario_name] = res_payload
+                        scenario_artifact = (scenario_df, scenario_results_map)
+                        analytics_cache["scenario_comparison"] = scenario_artifact
+                if scenario_artifact is None:
+                    st.info("Press Run Scenario Comparison to evaluate the configured cases.")
+                else:
+                    scenario_df, scenario_results_map = scenario_artifact
+                    _render_dataframe(scenario_df, "Scenario comparison", key="scenarios")
+                    _render_scenario_metric_chart(scenario_df)
+                    if scenario_results_map:
+                        _render_scenario_cashflow_stack(scenario_results_map)
+                        _render_scenario_dscr_chart(scenario_results_map)
+                        _render_scenario_scatter_chart(scenario_results_map)
 
-    st.success("Model run complete.")
+    if active_section == "AI Chatbot":
+        _render_chatbot_tab(results)
+
+    st.caption("Showing the last completed model run.")
+
+
+def get_state() -> dict:
+    """Snapshot user-editable tables/defaults for NumQuants saved cases."""
+    import streamlit as _st
+
+    state: dict = {}
+    tables = _st.session_state.get("input_tables")
+    if MODEL_IMPORT_ERROR is None and tables is not None:
+        state["input_tables"] = {
+            name: tables.ensure_table(name).copy()
+            for name in INPUT_SCHEMAS.keys()
+        }
+    default_store = _st.session_state.get(DEFAULT_TABLE_STORE_KEY)
+    if isinstance(default_store, dict):
+        state[DEFAULT_TABLE_STORE_KEY] = {
+            name: table.copy() if hasattr(table, "copy") else table
+            for name, table in default_store.items()
+        }
+    for key in (
+        "excel_download_selected",
+        "ai_chat_history",
+        "ai_provider_settings",
+    ):
+        if key in _st.session_state:
+            state[key] = _st.session_state[key]
+    return state
+
+
+def set_state(state: dict) -> None:
+    """Restore saved table/default state before ``main()`` initialises widgets."""
+    import streamlit as _st
+
+    if MODEL_IMPORT_ERROR is None and "input_tables" in state:
+        tables = InputTables()
+        for name, table in state["input_tables"].items():
+            frame = table if isinstance(table, pd.DataFrame) else pd.DataFrame(table)
+            tables.set_table(name, frame)
+        _st.session_state["input_tables"] = tables
+    if DEFAULT_TABLE_STORE_KEY in state and isinstance(state[DEFAULT_TABLE_STORE_KEY], dict):
+        _st.session_state[DEFAULT_TABLE_STORE_KEY] = state[DEFAULT_TABLE_STORE_KEY]
+    for key in (
+        "excel_download_selected",
+        "ai_chat_history",
+        "ai_provider_settings",
+    ):
+        if key in state:
+            _st.session_state[key] = state[key]
+
+
+# The Cassava-style modular application is authoritative. The legacy engine
+# remains importable for saved-case compatibility while all interactive traffic
+# is delegated through this compact entry point.
+from cassava_streamlit_app import get_state as get_state  # noqa: E402,F401
+from cassava_streamlit_app import main as main  # noqa: E402,F401
+from cassava_streamlit_app import set_state as set_state  # noqa: E402,F401
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation helper
